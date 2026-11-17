@@ -23,7 +23,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**Design written 2026-11-18; S0 (environment and LiteLLM verification) is next** (design §14).
+**S0 (environment and LiteLLM verification) done 2026-11-18; S1 (core: types, config, errors, ollama / openai backends) is next** (design §14).
 
 ## Rules
 
@@ -61,7 +61,7 @@ If a change must contradict the design, update the design in the same change and
 
 Python 3.12, uv, pydantic / pydantic-settings, OpenAI SDK (OpenAI-compatible endpoints: Ollama `/v1`,
 llm-gateway, LiteLLM Proxy, vendors), Anthropic SDK (extra `anthropic`), Typer (CLI), pytest, ruff, mypy.
-Ollama on the host (`127.0.0.1:11434`). LiteLLM Proxy in Docker (`127.0.0.1:4000`, design §7.2). llm-gateway on
+Ollama on the host (`127.0.0.1:11434`). LiteLLM Proxy in Docker (`127.0.0.1:4400`, design §7.2). llm-gateway on
 the host (`127.0.0.1:8787`, owner-only).
 
 ## Commands
@@ -76,7 +76,7 @@ docker compose -f deploy/litellm/compose.yaml up -d   # LiteLLM Proxy (from S0)
 ```
 
 Free checks before an opt-in run: `curl -s http://127.0.0.1:11434/api/tags` (Ollama),
-`curl -s http://127.0.0.1:4000/health/liveliness` (LiteLLM), `curl -s http://127.0.0.1:8787/healthz` (gateway).
+`curl -s http://127.0.0.1:4400/health/liveliness` (LiteLLM), `curl -s http://127.0.0.1:8787/healthz` (gateway).
 
 ## Workflow
 

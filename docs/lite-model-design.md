@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：设计（2026-11-18），S0 未开始。阶段与验收见 §14。
+状态：S0 完成（2026-11-18），S1 是下一步。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -55,7 +55,7 @@ app (lite-rag / lite-mem / llm-steward / later lite-cache)
        ├─ HTTP → Ollama /v1             local models
        ├─ HTTP → OpenAI / Anthropic     API billing
        ├─ HTTP → llm-gateway :8787      subscription profiles (claude-sub-opus / -haiku, gpt-sub), owner-only
-       └─ HTTP → LiteLLM Proxy :4000    unified aliases, auto router (optional)
+       └─ HTTP → LiteLLM Proxy :4400    unified aliases, auto router (optional)
                    └─ may forward to llm-gateway or vendors
 ```
 
@@ -158,7 +158,7 @@ backends:                   # endpoint settings per backend; defaults shown
   openai:    {api_key_env: OPENAI_API_KEY}
   anthropic: {api_key_env: ANTHROPIC_API_KEY}
   gateway:   {base_url: "http://127.0.0.1:8787/v1", api_key_env: null, channel: subscription}
-  litellm:   {base_url: "http://127.0.0.1:4000/v1", api_key_env: LITELLM_API_KEY,
+  litellm:   {base_url: "http://127.0.0.1:4400/v1", api_key_env: LITELLM_API_KEY,
               router_aliases: [smart-router]}
 forbid_channels: []         # tests / CI set [subscription, api]
 prices: {}                  # optional: "backend:model" -> {input_per_mtok, output_per_mtok}
@@ -186,17 +186,20 @@ reasoning_effort、max_output_tokens、temperature、timeout、max_retries。和
 | `openai` | OpenAI SDK，任意 OpenAI-compatible 端点 | api | strict `json_schema` | 响应 `model` |
 | `anthropic` | Anthropic SDK Messages | api | 一个强制工具，`input_schema` = strict schema | 响应 `model` |
 | `gateway` | OpenAI SDK → llm-gateway | subscription（可按 profile 覆盖） | strict `json_schema`；gateway 对 DeepSeek / Qwen 降级为 prompted，响应头 `X-LLMGW-Structured-Output: prompted` 记进来源 | 见 §6.2 |
-| `litellm` | OpenAI SDK → LiteLLM Proxy | api | strict `json_schema`（S0 核实各上游的转换） | 见 §6.3 |
+| `litellm` | OpenAI SDK → LiteLLM Proxy | api | strict `json_schema`（S0 经 `ollama_chat/` 核实；其他上游接入时再核实） | 见 §6.3 |
 
 **参数差异是数据**（沿用 lite-rag `PROVIDERS` 的做法），一张 `BackendProfile` 表：
 
-| 字段 | 说明 | 已知值（S0 核实后更新） |
+| 字段 | 说明 | 已知值（S0 2026-11-18 核实） |
 | --- | --- | --- |
-| `max_tokens_param` | `max_tokens` 或 `max_completion_tokens` | ollama：`max_tokens`（Ollama 不认 `max_completion_tokens`，lite-rag 2026-11-08）；openai：`max_completion_tokens`；litellm / gateway：S0 定 |
-| `default_temperature` | 未配置时发送的值；None = 不发 | ollama：0.0；openai：None（推理模型拒绝非默认值） |
+| `max_tokens_param` | `max_tokens` 或 `max_completion_tokens` | ollama：`max_tokens`（Ollama 不认 `max_completion_tokens`，lite-rag 2026-11-08）；openai：`max_completion_tokens`；litellm：`max_completion_tokens`（1.108.9 两个都认，经 `ollama_chat/` 实测都生效；用 OpenAI 的新名字，由 LiteLLM 按上游转换）；gateway：`max_completion_tokens`（两个都映射到 `max_tokens`，新名字优先，llm-gateway `translate.py:58-59`） |
+| `default_temperature` | 未配置时发送的值；None = 不发 | ollama：0.0；openai：None（推理模型拒绝非默认值）；litellm：None（上游可能是推理模型；`temperature: 0` 经 `ollama_chat/` 被接受） |
 | `supports_temperature` | | anthropic 2.6.0：否（lite-rag 2026-11-08 核实） |
-| `reasoning_effort` | 怎么发：顶层参数、`extra_body`、不支持 | gateway：**现在被丢弃**（`schemas.py` 没有该字段，进 `X-LLMGW-Ignored-Params`），llm-gateway 修好前配置了就报错而不是悄悄失效 |
+| `reasoning_effort` | 怎么发：顶层参数、`extra_body`、不支持 | litellm：顶层参数；`"none"` 经 `ollama_chat/` 关掉 qwen3 的思考（实测），`"low"` 对 qwen3 **不减少**思考，未设 = 开着思考。gateway：**现在被丢弃**（`schemas.py` 没有该字段，进 `X-LLMGW-Ignored-Params`），llm-gateway 修好前配置了就报错而不是悄悄失效 |
 | `key_env` | 默认 key 变量 | |
+
+思考 token 计入输出上限：经 LiteLLM 的 qwen3 开着思考时，`max_tokens` 小会得到空 `content` 和
+`finish_reason: "length"`（应报 `Truncated`，不是 `EmptyReply`）。
 
 gateway 后端在响应头里看到 `X-LLMGW-Ignored-Params` 列出配置过的参数时，抛 `ConfigError` 一类的错误
 （`IgnoredParameter`），不把被丢掉的设置当成生效。
@@ -220,12 +223,23 @@ gateway 的响应 `model` 字段写的是 **profile 名**（`translate.py:194,25
 
 ### 6.3 经过 LiteLLM
 
-- LiteLLM 的路由别名在 proxy 配置里打开 `return_raw_model_name: true` 后，响应 `model` 是被选中的模型
-  （文档 2026-11 核实；不打开时会被改回别名）。lite-model 读响应 `model`，并记录响应头
-  `x-litellm-model-id`（选中的 deployment）和 `x-litellm-model-group`（调用的别名）。
-- 路由别名回来的 `model` 仍等于别名时，说明 proxy 没打开 `return_raw_model_name`：抛 `ProvenanceUnknown`，
-  不存一个假来源。
-- 成本：有 `x-litellm-response-cost` 头时写进 `Usage.cost_usd`（S0 核实该头是否存在、何时出现）。
+S0 实测（1.108.9，2026-11-18，`KB/global/litellm/README.md` §2–§3）：
+- **普通别名**（`workhorse`）的响应体 `model` 永远是别名本身；实际模型只在响应头
+  `x-litellm-model-name`（deployment 的 LiteLLM 模型串，如 `ollama_chat/qwen3:8b`）。
+- **路由别名**打开 `return_raw_model_name: true` 后，响应体 `model` 是被选中 deployment 的 LiteLLM 模型串
+  （`ollama_chat/qwen3:1.7b`）；不打开时被改回别名，但 `x-litellm-model-name` 头仍是实际模型。
+- 每个成功响应都有 `x-litellm-model-name`、`x-litellm-model-id`（选中的 deployment）、`x-litellm-model-group`
+  （调用的别名）；错误响应没有。
+
+规则（S3 实现）：
+- `answered` = 响应头 `x-litellm-model-name`。两者都在时（路由别名 + `return_raw_model_name`），响应体
+  `model` 必须与头一致，不一致抛 `ProvenanceUnknown`。头缺失、或只能拿到别名本身时，也抛
+  `ProvenanceUnknown`；普通别名同样适用（拿不到实际模型就不冒充）。
+- 另记 `x-litellm-model-id` 和 `x-litellm-model-group`。
+- proxy 配置仍要求路由别名打开 `return_raw_model_name`（`tests/unit/test_deploy_litellm.py` 守着），让日志和
+  响应体也指向实际模型。
+- 成本：`x-litellm-response-cost` 在 Ollama 模型的成功响应里**不存在**（没有价格），错误响应里是 `0`。有这个头
+  且是成功响应时才写进 `Usage.cost_usd`；接入有价格的上游时再核实。
 
 ## 7. 路由
 
@@ -237,11 +251,14 @@ gateway 的响应 `model` 字段写的是 **profile 名**（`translate.py:194,25
 - llm-steward 直接 import lite-rag，库依赖会传过去；steward 2026-11-08 已因依赖过重去掉过 LiteLLM。
 - 路由配置（model_list、分档、分类器）放在 proxy，所有模块共用一份。
 
-### 7.2 Proxy 配置（示例，S0 核实后放进 `deploy/litellm/config.yaml`）
+### 7.2 Proxy 配置（`deploy/litellm/`，S0 起）
+
+`deploy/litellm/config.yaml` 是实际配置；S0 的分档全是本机 Ollama（`small` = `qwen3:1.7b`，`workhorse` =
+`qwen3:8b`），测试和核实不花钱。接入付费上游时按下面的形状加 deployment：
 
 ```yaml
 model_list:
-  - {model_name: small,     litellm_params: {model: ollama_chat/qwen3:8b, api_base: "http://host.docker.internal:11434"}}
+  - {model_name: small,     litellm_params: {model: ollama_chat/qwen3:1.7b, api_base: "http://host.docker.internal:11434"}}
   - {model_name: workhorse, litellm_params: {model: deepseek/deepseek-chat, api_key: os.environ/DEEPSEEK_API_KEY}}
   - {model_name: flagship,  litellm_params: {model: anthropic/claude-sonnet-5-5, api_key: os.environ/ANTHROPIC_API_KEY}}
   - model_name: smart-router
@@ -251,18 +268,28 @@ model_list:
         tiers: {SIMPLE: small, MEDIUM: workhorse, COMPLEX: flagship, REASONING: flagship}
         classifier_type: heuristic       # no extra model call; same input -> same tier
         return_raw_model_name: true      # §6.3
+        context_compaction: false        # default on: rewrites history with an extra model call
       complexity_router_default_model: workhorse
 litellm_settings:
   num_retries: 0                         # retries stay in lite-model (§8)
 router_settings:
   disable_cooldowns: true
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
 # no `fallbacks`: a failure raises (KB llm-app-architecture §3.2)
 ```
 
-运行：Docker，**按 digest 锁定**镜像；版本选 1.108.x 长期支持线或之后 keyless cosign 签名的版本，用 cosign
-验签后再用；**永远不用 1.107.0、1.82.7、1.82.8**，不用浮动 tag（`latest`、`main-stable`）。不接数据库
-（只要 OpenAI 兼容接口和 master key；注意没有数据库时 `max_budget` 不生效）。端口 4000，只绑 127.0.0.1。
-只挂需要的 key。
+`context_compaction`（1.108.9 默认开）：请求接近选中 deployment 的输入上限时，路由器另调一次模型把历史压成
+摘要再发出去。这既是一次看不见的模型调用，又改写了宿主构造的请求，所以关掉。它还要读 deployment 的
+`max_input_tokens`，Ollama 模型不在 LiteLLM 价格表里，开着时**每次**路由调用都 500（S0 实测）。
+
+运行：版本、digest、公钥、升级步骤在 `deploy/litellm/README.md`。设计上的要求：
+- 镜像按 digest 锁定；**永远不用 1.107.0、1.82.7、1.82.8**，不用浮动 tag。LiteLLM 用 cosign **密钥**签名
+  （不是 keyless），公钥锁定在仓库里。
+- 验签在 compose 里：`verify` 服务先跑 `cosign verify`，`litellm` 依赖它成功退出，验签失败就不启动；本机不装
+  cosign，CI 跑同一个 `verify`。
+- 不接数据库（没有数据库时 `max_budget` 不生效）；只绑 127.0.0.1:**4400**（4000 已登记给 tenderted）；只挂
+  需要的 key。
 
 **订阅额度不进自动路由**：分档里不放指向 llm-gateway 订阅 profile 的 deployment。要用订阅，在 role 上
 显式配 `backend: gateway`。确实要按难度在订阅模型间路由时，另起一个别名（如 `sub-router`），只有显式选它
@@ -273,8 +300,11 @@ router_settings:
 - `RolePolicy.routable`：宿主声明。lite-rag 的 `contextual`、`graph` 的模型 id 是索引身份的一部分
   （lite-rag `config.py:155,217`），必须 `routable=False`；judge 一类测量用途也必须 `False`。
 - `backends.litellm.router_aliases` 列出哪些名字是路由别名；不可路由的 role 配了其中一个，`build()` 拒绝。
-- 每次请求带上 role，供 proxy 日志和按用途分档使用（字段 S0 核实：`metadata.tags` 或 `user`）。
-- 每次请求带 `x-litellm-num-retries: 0`（请求头优先级最高，文档 2026-11 核实），保证重试只在 lite-model 一处。
+- 每次请求带上 role：`metadata: {tags: ["role:<role>"]}`（S0：`user` 和 `metadata.tags` 都被接受；没有数据库或
+  日志 callback 时 proxy 不在任何地方记录它们，接日志时再核实能看到哪个）。用 `tags` 而不用 `user`，`user`
+  留给宿主表示终端用户。
+- 每次请求带 `x-litellm-num-retries: 0`。S0 实测：配置 `num_retries: 2` 时，对不可达的 deployment 不带头重试
+  2 次（4.8 s），带头 0 次（0.06 s）。重试只在 lite-model 一处。
 
 ## 8. 错误与重试
 
@@ -297,7 +327,8 @@ ModelError (base)
 
 ## 9. 用量与成本
 
-- `Usage`：input、output、reasoning（`completion_tokens_details.reasoning_tokens`，有就记）、cost_usd。
+- `Usage`：input、output、reasoning（`completion_tokens_details.reasoning_tokens`，有就记；经 LiteLLM →
+  Ollama 时是 null，思考 token 已含在 `completion_tokens` 里，S0 实测）、cost_usd。
 - 失败和截断的调用也报告用量（挂在异常的 `usage` 属性上）。
 - 成本：优先用 proxy 的成本头；否则用配置里的 `prices`；都没有就是 `None`，不估算。订阅通道的成本是 `None`。
 
@@ -397,7 +428,7 @@ lite-model/
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| **S0** 环境与核实 | repo 骨架（uv、ruff、mypy、pytest、CI）；版本锁定（openai、anthropic、pydantic 与 lite-mem 相同）；起 LiteLLM Proxy（digest 锁定、cosign 验签、无数据库、127.0.0.1:4000、§7.2 配置，分档先全用 Ollama 模型以免花钱）；用 curl 核实：`max_tokens` / `max_completion_tokens`、`temperature`、`reasoning_effort` 到 `ollama_chat` 的转换、strict `json_schema`、`return_raw_model_name`、响应头（`x-litellm-model-id`、`-model-group`、`-response-cost`）、`x-litellm-num-retries`、role 透传字段 | 核实结果写进 KB（`KB/global/litellm/README.md`，并修正 `tech-selection/01b` 过时的两处：`enable_context_window_escalation` 默认 false、`classifier_fallback`）；§5 参数表和 §6.3、§7.3 按结果更新；端口登记到 `KB/global/machine/` |
+| **S0** 环境与核实 | repo 骨架（uv、ruff、mypy、pytest、CI）；版本锁定（openai、anthropic、pydantic 与 lite-mem 相同）；起 LiteLLM Proxy（digest 锁定、cosign 验签、无数据库、127.0.0.1:4400（原定 4000，与 tenderted 冲突）、§7.2 配置，分档先全用 Ollama 模型以免花钱）；用 curl 核实：`max_tokens` / `max_completion_tokens`、`temperature`、`reasoning_effort` 到 `ollama_chat` 的转换、strict `json_schema`、`return_raw_model_name`、响应头（`x-litellm-model-id`、`-model-group`、`-response-cost`）、`x-litellm-num-retries`、role 透传字段 | 核实结果写进 KB（`KB/global/litellm/README.md`，并修正 `tech-selection/01b` 过时的两处：`enable_context_window_escalation` 默认 false、`classifier_fallback`）；§5 参数表和 §6.3、§7.3 按结果更新；端口登记到 `KB/global/machine/` |
 | **S1** 核心 | types、config（含启动校验）、errors、`strict_schema`、openai-compatible 后端（ollama / openai），同步 `text` / `structured`，来源取自响应，`FakeModel`，`dump-config` | 单元 + 契约测试覆盖 §4 每条校验、§5 ollama/openai 参数、§8 每种错误；`-m ollama` 跑通 text 与 structured |
 | **S2** Anthropic 与异步 | anthropic 后端（强制工具、system 字段、`stop_reason`）；`build_async` 与两个异步后端 | 契约测试检查 Anthropic 请求体；同步与异步共用一套契约测试 |
 | **S3** gateway 与 litellm | 两个后端；channel 与 `forbid_channels`；`router_aliases` 与 `RolePolicy` 护栏；§6.2 / §6.3 来源；`IgnoredParameter`；`x-litellm-num-retries: 0` | 契约测试覆盖：路由别名在不可路由 role 上被拒、`return_raw_model_name` 未开时 `ProvenanceUnknown`、gateway 忽略参数时报错；`-m litellm` 用 Ollama 别名跑通，来源是实际模型 |
@@ -408,6 +439,28 @@ lite-model/
 ### 阶段记录
 
 （每个阶段完成后在这里追加：日期、做了什么、review 结论、被拒的 finding 及理由。）
+
+**S0（2026-11-18）环境与核实。**
+- 骨架：`pyproject.toml`（Python 3.12，uv_build；openai 3.46.0、pydantic 2.14.3、pydantic-settings 2.16.2、
+  typer 0.27.3、extra anthropic 2.6.0，与 lite-mem 相同）、ruff / mypy strict / pytest（marker `ollama`、
+  `litellm` 默认不选）、CI（检查 + `compose run --rm verify`，它也解析并插值 compose 文件）。ruff format 不管 `*.md`
+  （设计里的代码块是排过版的示意）。
+- `deploy/litellm/`：compose（`verify` → `litellm`）、config（分档全 Ollama）、`cosign.pub`、README。
+  `tests/unit/test_deploy_litellm.py` 守住这些配置和 `uv.lock` 里没有 `litellm`；每条断言都改坏对应配置看过
+  一次红。
+- curl 核实结果：§5 参数表、§6.3、§7.2、§7.3、§9 已按结果改写；细节在 `KB/global/litellm/README.md`。
+  与原设计不同的三处：（1）普通别名的响应体 `model` 是别名，实际模型取 `x-litellm-model-name` 头（§6.3）；
+  （2）`context_compaction` 默认开且对 Ollama 模型 500，配置里关掉（§7.2）；（3）端口 4000 → 4400（与 tenderted
+  冲突）。
+- KB：新建 `KB/global/litellm/README.md`；修正 `tech-selection/01b`（`enable_context_window_escalation` 默认
+  false、`classifier_fallback`、供应链一条）；`machine/ports.md` 登记 4400。
+- 收尾 review：
+  - `/simplify`（4 个角度）：LiteLLM 镜像只写一处（YAML anchor `x-litellm-image`；cosign 接受 `tag@digest`，
+    实测）；公钥改为比对 sha256 并检查挂载；loopback 检查改为"所有对外端口"；fallback 检查去掉特例；
+    删去 CI 里多余的 `compose config`、`allowed-confusables`、`restart: "no"`；§7.2 运行细节改为指向 README。
+    跳过：CI `concurrency`（规模太小）、缓存验签结果（每次启动验签正是要的保证）。
+  - Codex（只读）：1 条 P2，S0 记录写着 CI 跑 `compose config` 而 workflow 已去掉，已改记录（不加回：
+    `compose run` 本身解析整份文件）。供应链、测试、设计一致性、版本锁定四个方面无 finding。
 
 ## 15. 待确认
 
@@ -434,3 +487,6 @@ lite-model/
 | 2026-11-18 | 名字 `lite-model`（不叫 `lite-router` / `lite-llm`） | 主要是客户端而非路由；`lite-llm` 与 `litellm` 易混 |
 | 2026-11-18 | GitHub `ArthurGao/lite-model`，公开，Apache-2.0 | 与其他 lite 模块一致 |
 | 2026-11-18 | 模块迁移后删除自己的 LLM 客户端，只留 role 声明、prompt、业务解析和一个薄 adapter（§12.1） | 共享库的目的就是消除重复；新旧两份并存会再次分叉 |
+| 2026-11-18 | LiteLLM Proxy 端口 4400 | 4000–4010、4080–4090 已登记给 tenderted |
+| 2026-11-18 | cosign 以容器运行，作为 compose 的 `verify` 服务，`litellm` 依赖它成功退出 | 主人的选择：本机不装 cosign，一条 `compose up` 先验签再启动 |
+| 2026-11-18 | LiteLLM 的 `answered` 取响应头 `x-litellm-model-name`，响应体 `model` 只做一致性检查（§6.3） | S0 实测：普通别名的响应体 `model` 是别名，头才是实际模型 |

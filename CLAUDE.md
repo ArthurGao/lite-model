@@ -12,7 +12,7 @@
   capabilities §10, gateways), `llm-model-eval` (comparing models), `testing-and-ci`, `secrets-hygiene` (keys for
   the proxy), `dev-machine` (ports, Ollama, credentials), `kb-maintain`.
 - Ollama runs on the host; check it for free with `curl -s http://127.0.0.1:11434/api/tags` before `-m ollama`.
-  Check port 4000 with `lsof -ti:4000` before starting the proxy. Do not start long-lived services unasked.
+  Check port 4400 with `lsof -ti:4400` before starting the proxy (`deploy/litellm/README.md`). Do not start long-lived services unasked.
 - **Stage close-out, for every stage, in this order** (`AGENTS.md` Workflow step 4):
   1. `/simplify` on the stage's full diff; apply its fixes.
   2. Codex, from the repo root, read-only, on the stage's whole diff:

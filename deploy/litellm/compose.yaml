@@ -1,0 +1,30 @@
+# LiteLLM Proxy for lite-model (design §7.2). `docker compose -f deploy/litellm/compose.yaml up -d`.
+# `verify` checks the image signature with cosign first; `litellm` starts only if it succeeded.
+# Both images are pinned by digest; README.md says how they were chosen and how to upgrade.
+name: lite-model-litellm
+
+# The one place the LiteLLM image is named: `verify` checks exactly the image `litellm` runs.
+x-litellm-image: &litellm-image ghcr.io/berriai/litellm:v1.108.9@sha256:d817e8e4d6698aad9f3d40b6ccbcaa1cde6c8256cb59867553f07383da3d6608
+
+services:
+  verify:
+    image: ghcr.io/sigstore/cosign/cosign:v3.1.4@sha256:0f06154836d2de34f887a5c273506d52ca43edaa1d9e53e6510fa78a48f69c2d
+    command: ["verify", "--key=/cosign.pub", *litellm-image]
+    volumes:
+      - ./cosign.pub:/cosign.pub:ro
+
+  litellm:
+    image: *litellm-image
+    depends_on:
+      verify:
+        condition: service_completed_successfully
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "127.0.0.1:4400:4000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      # Only the keys the config needs (design §7.2). S0 tiers are all Ollama: no vendor key.
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in deploy/litellm/.env}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

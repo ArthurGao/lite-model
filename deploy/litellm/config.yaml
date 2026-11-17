@@ -1,0 +1,38 @@
+# LiteLLM Proxy config for lite-model (design §7.2).
+# Every tier is a local Ollama model for now: tests and verification never spend money.
+# Subscription profiles (llm-gateway) never sit in an auto-router tier (design §7.2).
+model_list:
+  - model_name: small
+    litellm_params:
+      model: ollama_chat/qwen3:1.7b
+      api_base: http://host.docker.internal:11434
+  - model_name: workhorse
+    litellm_params:
+      model: ollama_chat/qwen3:8b
+      api_base: http://host.docker.internal:11434
+  - model_name: smart-router
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        tiers:
+          SIMPLE: small
+          MEDIUM: workhorse
+          COMPLEX: workhorse
+          REASONING: workhorse
+        classifier_type: heuristic  # no extra model call; the same input gets the same tier
+        return_raw_model_name: true  # the response `model` is the chosen model, not the alias (§6.3)
+        # On by default in 1.108.9: near the input limit the router summarises the history with
+        # an extra model call and sends the summary instead. lite-model sends what the host built.
+        context_compaction: false
+      complexity_router_default_model: workhorse
+
+litellm_settings:
+  num_retries: 0  # retries stay in lite-model (design §8)
+
+router_settings:
+  disable_cooldowns: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# No `fallbacks` anywhere: a failure raises (design §8; KB llm-app-architecture §3.2).

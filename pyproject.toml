@@ -1,0 +1,58 @@
+[project]
+name = "lite-model"
+version = "0.1.0.dev0"
+description = "The shared model-call layer for the lite modules: roles, backends, provenance, routing guards"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+# Pinned exactly, the same versions as lite-mem (AGENTS.md rule 12): an upgrade re-runs the
+# contract tests and `-m ollama`. lite-model never depends on `litellm` (AGENTS.md rule 1).
+dependencies = [
+    "openai==3.46.0",
+    "pydantic==2.14.3",
+    "pydantic-settings==2.16.2",
+    "typer==0.27.3",
+]
+
+[project.optional-dependencies]
+anthropic = [
+    "anthropic==2.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pyyaml==6.0.3",  # tests/unit/test_deploy_litellm.py reads deploy/litellm/*.yaml
+    "types-pyyaml==6.0.12.20261030",
+]
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "RUF"]
+
+[tool.ruff.format]
+# Code blocks in docs are hand-aligned illustrations, not code.
+exclude = ["*.md"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src", "tests"]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Opt-in, deselected by default (AGENTS.md rule 11).
+addopts = "-m 'not ollama and not litellm'"
+markers = [
+    "ollama: talks to the real Ollama server on the host (opt-in: uv run pytest -m ollama)",
+    "litellm: talks to the local LiteLLM Proxy, Ollama-backed aliases only (opt-in: uv run pytest -m litellm)",
+]
