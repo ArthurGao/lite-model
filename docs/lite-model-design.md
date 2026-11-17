@@ -342,6 +342,32 @@ eval 数字一致、来源格式兼容。
 
 lite-model 以 GitHub release wheel 发布，宿主在 `[tool.uv.sources]` 里锁定版本（与 lite-eval 相同的做法）。
 
+### 12.1 迁移后删什么、留什么
+
+迁移的目的是消除重复：一个模块迁移完，它自己那份 LLM 客户端代码**删掉**。模块之间可以一个一个迁，
+没迁的照常工作；但已迁的模块里不能同时留着旧客户端。
+
+| 模块 | 删掉（改由 lite-model 提供） | 留在模块里 |
+| --- | --- | --- |
+| lite-mem | `llm.py` 的 `strict_schema`、`_failed`、`_parsed`、`_VendorLLM`、`OpenAICompatibleLLM`、`AnthropicLLM`、`RoutedLLM`；`config.py` 的 `RoleOverride`、`ModelTarget`、`LLMConfig`（改为嵌入 lite-model 的配置）；`testing.py` 的 FakeLLM；对应的单元测试 | role 名（`extract`、`resolve`、`consolidate`）及其 `RoleSpec`；把 payload 序列化成 user 消息；`prompts/*.j2`；`Provenance` → `produced_by` 的存储格式；embedding 客户端（v2 前） |
+| lite-rag | `llm.py` 的 `PROVIDERS`、`ProviderProfile`、`_Client`、`OpenAICompatLLM`、`AnthropicLLM`、`BoundedCalls`、`build_llm`；`config.py` 的 `LLMConfig` 及其 provider 校验；`testing.py` 的 FakeLLM；对应的单元测试 | `answer`、`contextual`、`graph` 三个 role 的声明（后两个 `routable=False`）；graph 从文本里解析 JSON（业务逻辑）；索引身份里的 LLM id（改为取自 lite-model 的 target）；`prompts/*.j2`；embedding、rerank |
+| llm-steward | `llm/client.py`；`llm/roles.py` 里解析 role 和调模型的部分；各处自己生成 schema 的代码（改用 lite-model 的 `strict_schema`）；`tests/fakes/llm.py` | role 名（`memory.extract`、`memory.resolve`、`kb.risk`、`kb.worthiness`、`kb.draft`）；mem0 的 LLM 配置（mem0 内部调模型，不经过 lite-model） |
+| lite-eval | 不迁移（§1 非目标） | judge 客户端整份 |
+
+每个模块保留一个**薄 adapter**（十几行）：把模块自己的 `LLM` Protocol 接到 `lite_model.Model` 上，模块内部
+的调用点不用改，也满足"每个组件都是 Protocol"的规则。是否改为直接依赖 `lite_model.Model`、去掉 adapter，
+在各模块迁移时决定。
+
+### 12.2 每个模块的迁移步骤
+
+1. 先写契约测试，固定**现在**实际发出去的请求体（参数名、schema、强制工具、header）。
+2. 改为调用 lite-model，跑同一组契约测试：请求体一致。
+3. 跑模块自己的 eval（lite-rag `literag eval`，lite-mem 的 eval）：数字一致；前后数字记进 KB。
+4. 一致之后**删除**旧客户端、旧 fake 和只测旧客户端的单元测试；FakeLLM 换成 `lite_model.testing.FakeModel`。
+5. 更新该模块的设计文档和 `AGENTS.md`：LLM 相关规则（Protocol、no fallback、来源记录、Tests never call a real
+   model）改为指向 lite-model；依赖列表里去掉不再直接使用的 `openai` / `anthropic`（如果别处也不用）。
+6. 按该模块的阶段收尾流程（/simplify → Codex review → 修复 → 重跑全部检查）结束。
+
 ## 13. 项目结构
 
 ```
@@ -395,8 +421,7 @@ lite-model/
 - lite-eval 的 judge 以后是否迁移。
 - 自动路由的效果：在 lite-rag 里做一个 stage，用 `literag eval` 比较固定 small / workhorse / flagship 与
   `smart-router` 的答案质量、token、延迟；先确认 eval 有答案质量指标。
-- 许可证：默认 Apache-2.0，与 lite-mem、lite-rag 相同。
-- GitHub repo `ArthurGao/lite-model`（公开，与其他 lite 模块一致）：S0 由主人确认后创建。
+- 各模块迁移时是否去掉 adapter、直接依赖 `lite_model.Model`（§12.1）。
 
 ### 决定记录
 
@@ -407,3 +432,5 @@ lite-model/
 | 2026-11-18 | 没有 LiteLLM 时走原来的直连方式；配了 LiteLLM 而它不可用时报错，不退回 | lite 模块要能单独使用；no silent fallback |
 | 2026-11-18 | llm-gateway 不依赖 lite-model；调用链是 app → lite-model → llm-gateway | gateway 是服务端，lite-model 是客户端 |
 | 2026-11-18 | 名字 `lite-model`（不叫 `lite-router` / `lite-llm`） | 主要是客户端而非路由；`lite-llm` 与 `litellm` 易混 |
+| 2026-11-18 | GitHub `ArthurGao/lite-model`，公开，Apache-2.0 | 与其他 lite 模块一致 |
+| 2026-11-18 | 模块迁移后删除自己的 LLM 客户端，只留 role 声明、prompt、业务解析和一个薄 adapter（§12.1） | 共享库的目的就是消除重复；新旧两份并存会再次分叉 |
