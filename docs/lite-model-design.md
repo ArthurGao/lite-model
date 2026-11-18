@@ -693,8 +693,11 @@ lite-model/
   scope 时不缓存（否则会把一个租户的答案给另一个租户）。
 - `Bounded` 包在模型外面：hook 命中也要等一个槽位（concurrency 1 时命中要等正在跑的调用）。若成问题，把槽位
   移到执行器里只包住真正的请求。
-- 自动路由的效果：在 lite-rag 里做一个 stage，用 `literag eval` 比较固定 small / workhorse / flagship 与
-  `smart-router` 的答案质量、token、延迟；先确认 eval 有答案质量指标。
+- ~~自动路由的效果~~：**已测**（2026-11-18，lite-rag S14，`KB/global/llm-evals/evals/2026-11-18-lite-rag-auto-routing.md`）。
+  lite-rag 32 道金标题 × 2 次，"对" = 关键事实且 grounded：固定 qwen3:8b 0.938（p50 12 s），经 Proxy 的同一模型 0.938，
+  qwen3:1.7b 0.750（3.8 s），`smart-router`（启发式，small = 1.7b，其余 = 8b）0.844（5.2 s）。启发式分类器**按语言而不是难度**
+  分档：中文题全部去 1.7b。结论：现在的 §7.2 配置不值得在中英混合的 RAG 上打开；要路由，先在实际流量上测 `llm` 分类器或
+  `keyword_tier_rules`。Proxy 本身不改变答案质量。
 - 各模块迁移时是否去掉 adapter、直接依赖 `lite_model.Model`（§12.1）。
 
 ### 决定记录
@@ -719,4 +722,5 @@ lite-model/
 | 2026-11-18 | 调用上下文用 contextvar：`call_context(**values)` → `Call.context`；`Model` 协议不加参数（§10） | 主人的选择：三个宿主马上要照 `Model` 写 adapter，加参数以后就是破坏性改动 |
 | 2026-11-18 | `ModelsConfig.backend` / `model` 必填，没有默认值（§4） | 主人的选择：宿主嵌入时不会悄悄继承默认值，lite-model 的版本不会改宿主的模型 |
 | 2026-11-18 | 公开 API 收窄：`Call`、`Hook`、`Hooks`、`Registration` 从 `lite_model.hooks` 导入；`Reply`、`call_context`、`LiteModel.target()` 公开 | 发布后导出的名字都是承诺；宿主迁移要在调用前拿到 target |
+| 2026-11-18 | 不在中英混合的 RAG 上打开启发式自动路由（§15 实测：0.844 对 0.938，按语言分档） | lite-rag S14 两次真实运行；要路由先测分类器 |
 | 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |
