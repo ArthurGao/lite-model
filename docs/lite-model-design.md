@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S5 完成（2026-11-18），v0.1.0 待发布；之后是各宿主的迁移（S6+，§12）。阶段与验收见 §14。
+状态：S5 完成，v0.1.0 已发布（2026-11-18）；下一步是各宿主的迁移（S6+，§12），各在自己的 repo 里做。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -667,7 +667,14 @@ lite-model/
     - 设计首行状态过期：已改。供应链、来源、密钥、公共 API、发布流程、宿主迁移路径其余均无 finding。
 - 检查：单元 + 契约 226 个，`-m ollama` 4 个，`-m litellm` 3 个；变异 136 处（S1 43、S2 21、S3 18、S4 30、
   S5 13+2，含 live 5 处，Ollama 在线）全部被抓住。
-- 发布：见下一条（推 tag 之后补上 release 和"宿主从 wheel 安装"的结果）。
+- 发布：第一次推 main（`131c850`）时 CI 的 `package` 任务失败——它的 `dump-config` 冒烟步骤是在
+  backend / model 改为必填之前写的、本机也是那时跑的；补上两个变量（`767473d`），本机从 `env -i` 的干净环境重跑
+  CI 的打包步骤后再推，CI 全绿（教训记进 KB）。然后推 tag `v0.1.0`：tag 上的 CI 四个任务全过，`release` 发布了
+  `lite_model-0.1.0-py3-none-any.whl` 和 `lite_model-0.1.0.tar.gz`
+  （https://github.com/ArthurGao/lite-model/releases/tag/v0.1.0）。
+- 验收"宿主可以从 wheel 安装"：一个新项目用 `[tool.uv.sources]` 指向 release 的 wheel URL，装
+  `lite-model[anthropic]`（lite-model 0.1.0、openai 3.46.0、anthropic 2.6.0），对本机 Ollama：`text` 回 `pong`，
+  来源 `ollama:qwen3:1.7b`，有用量；`build_async` + `call_context` 的 `structured` 回 `result=42`。
 
 ## 15. 待确认
 
