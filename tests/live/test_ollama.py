@@ -11,7 +11,10 @@ from lite_model import Message, ModelsConfig, RolePolicy, RoleSpec, Truncated, b
 pytestmark = pytest.mark.ollama
 
 CONFIG = ModelsConfig(
-    model="qwen3:1.7b", reasoning_effort="none", forbid_channels=("subscription", "api")
+    backend="ollama",
+    model="qwen3:1.7b",
+    reasoning_effort="none",
+    forbid_channels=("subscription", "api"),
 )
 ROLES = RoleSpec({"answer": RolePolicy()})
 

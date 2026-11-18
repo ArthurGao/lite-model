@@ -11,12 +11,12 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import BaseModel
 
-from lite_model.backends import Backend, Reply, anthropic_messages, openai_compat
+from lite_model.backends import Backend, anthropic_messages, openai_compat
 from lite_model.config import ModelsConfig, RoleSpec, Target, resolve
 from lite_model.errors import CallFailed, ConfigError
 from lite_model.hooks import Call, Hook, Hooks
 from lite_model.profiles import PROFILES
-from lite_model.types import Message, StructuredReply, TextReply
+from lite_model.types import Message, Reply, StructuredReply, TextReply
 
 if TYPE_CHECKING:
     import httpx2
@@ -56,9 +56,9 @@ def _call(
     schema: type[BaseModel] | None,
 ) -> Call:
     """What hooks see: a read-only deep copy of the request, so a hook cannot change what is
-    sent (Codex S4) and the cache key describes exactly the request that goes out."""
+    sent and the cache key describes exactly the request that goes out."""
     frozen = MappingProxyType(copy.deepcopy(request))
-    return Call(target.role, target, tuple(messages), frozen, schema)
+    return Call(target, tuple(messages), frozen, schema)
 
 
 def _hit(call: Call, hooks: Sequence[Hook]) -> Reply | None:
@@ -130,6 +130,11 @@ class _Routes:
     def __init__(self, routes: dict[str, Route]) -> None:
         self._routes = routes  # role -> route; one SDK client per endpoint
         self.hooks = Hooks()  # design §10
+
+    def target(self, role: str) -> Target:
+        """`role`'s resolved target (model, backend, endpoint): what a host records before any
+        call, e.g. as part of an index's identity (design §12.1)."""
+        return self._route(role)[2]
 
     def _route(self, role: str) -> Route:
         if role not in self._routes:

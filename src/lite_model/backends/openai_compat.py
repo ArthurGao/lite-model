@@ -6,11 +6,11 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from lite_model.backends import Reply, finish, sdk_client
+from lite_model.backends import finish, sdk_client
 from lite_model.config import Target
 from lite_model.profiles import PROFILES
 from lite_model.schema import strict_schema
-from lite_model.types import Message, Usage
+from lite_model.types import Message, Reply, Usage
 
 # finish_reason values that leave no usable answer, whatever the content holds.
 UNUSABLE = {"content_filter"}

@@ -3,16 +3,17 @@ case-insensitive one (Codex S3)."""
 
 import pytest
 
-from lite_model import IgnoredParameter, ModelsConfig, RoleConfig, RolePolicy, RoleSpec
+from lite_model import IgnoredParameter, RoleConfig, RolePolicy, RoleSpec
 from lite_model.backends import finish
 from lite_model.config import Target, resolve
 from lite_model.types import Usage
+from tests.configs import local, local_validate
 
 ROLES = RoleSpec({"answer": RolePolicy(routable=True)})
 
 
 def _target(backend: str, model: str) -> Target:
-    config = ModelsConfig(roles={"answer": RoleConfig(backend=backend, model=model)})
+    config = local(roles={"answer": RoleConfig(backend=backend, model=model)})
     return resolve(config, ROLES)["answer"]
 
 
@@ -52,7 +53,7 @@ def test_a_mixed_case_ignored_params_header_is_read() -> None:
 
 def test_a_cost_that_overflows_is_unknown_not_infinite() -> None:
     # Codex S4: finite rates times token counts can still overflow to inf.
-    config = ModelsConfig.model_validate(
+    config = local_validate(
         {"prices": {"ollama:m": {"input_per_mtok": 1e308, "output_per_mtok": 1e308}}}
     )
     target = resolve(config.model_copy(update={"model": "m"}), ROLES)["answer"]
@@ -68,3 +69,25 @@ def test_a_cost_that_overflows_is_unknown_not_infinite() -> None:
         payload="hi",
     )
     assert reply.usage.cost_usd is None
+
+
+def test_a_host_keeps_its_provider_model_format_by_naming_the_backend() -> None:
+    # lite-mem stores `openai:qwen3:8b` for the local Ollama today (design §6.1): a backend named
+    # `openai` of type ollama keeps that tag, with Ollama's endpoint and profile.
+    config = local_validate(
+        {"backend": "openai", "backends": {"openai": {"type": "ollama"}}, "model": "qwen3:8b"}
+    )
+    target = resolve(config, ROLES)["answer"]
+    assert (target.type, target.channel, target.api_key_env) == ("ollama", "local", None)
+    reply = finish(
+        target,
+        None,
+        {},
+        {},
+        body_model="qwen3:8b",
+        usage=Usage(),
+        truncated=False,
+        unusable=None,
+        payload="hi",
+    )
+    assert reply.provenance.tag == "openai:qwen3:8b"

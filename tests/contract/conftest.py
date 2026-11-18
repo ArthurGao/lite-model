@@ -19,6 +19,7 @@ from lite_model import (
     build_async,
 )
 from lite_model.hooks import Hooks
+from tests.configs import local
 from tests.upstream import Upstream
 
 ROLES = RoleSpec({"answer": RolePolicy(routable=True), "graph": RolePolicy()})
@@ -57,6 +58,6 @@ class Connect(Protocol):
 @pytest.fixture(params=["sync", "async"])
 def connect(request: pytest.FixtureRequest) -> Connect:
     def make(upstream: Upstream, config: ModelsConfig | None = None) -> Caller:
-        return Caller(request.param, upstream, config or ModelsConfig(max_retries=0))
+        return Caller(request.param, upstream, config or local(max_retries=0))
 
     return make

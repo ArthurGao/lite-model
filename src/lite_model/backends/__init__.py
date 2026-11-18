@@ -19,10 +19,9 @@ from lite_model.errors import (
     ProvenanceUnknown,
     Truncated,
 )
+from lite_model.hooks import TRANSPORT
 from lite_model.profiles import PROFILES
-from lite_model.types import Message, Provenance, StructuredReply, TextReply, Usage
-
-Reply = TextReply | StructuredReply[Any]
+from lite_model.types import Message, Provenance, Reply, StructuredReply, TextReply, Usage
 
 
 class Backend(Protocol):
@@ -64,8 +63,9 @@ def sdk_client(cls: Any, target: Target, key: str | None, http_client: Any) -> A
     )
 
 
-# SDK arguments and fields every request carries: never "a configured parameter" (§5).
-_NOT_OPTIONS = {"model", "messages", "extra_headers", "extra_body"}
+# Not "a configured parameter" an endpoint could drop (§5): the transport fields, and
+# `extra_body`, which only carries LiteLLM's role tag.
+_NOT_OPTIONS = TRANSPORT | {"extra_body"}
 
 
 def _answered(target: Target, body_model: str | None, headers: Mapping[str, str]) -> str | None:
@@ -75,7 +75,7 @@ def _answered(target: Target, body_model: str | None, headers: Mapping[str, str]
     if name is None:
         return body_model or None
     answered = headers.get(name)
-    # A header that only repeats the alias says nothing about the deployment (Codex S3); a
+    # A header that only repeats the alias says nothing about the deployment; a
     # routing alias with `return_raw_model_name` off answers with the alias in the body.
     if not answered or answered == target.model or (target.routed and body_model != answered):
         raise ProvenanceUnknown(f"{target.where}: the endpoint did not say which model answered")

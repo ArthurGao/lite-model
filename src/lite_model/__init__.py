@@ -21,9 +21,9 @@ from lite_model.errors import (
     ProvenanceUnknown,
     Truncated,
 )
-from lite_model.hooks import Call, Hook, Hooks, Registration
+from lite_model.hooks import call_context
 from lite_model.schema import strict_schema
-from lite_model.types import Channel, Message, Provenance, StructuredReply, TextReply, Usage
+from lite_model.types import Channel, Message, Provenance, Reply, StructuredReply, TextReply, Usage
 
 __all__ = [
     "AsyncBounded",
@@ -32,13 +32,10 @@ __all__ = [
     "BackendConfig",
     "BadStructuredReply",
     "Bounded",
-    "Call",
     "CallFailed",
     "Channel",
     "ConfigError",
     "EmptyReply",
-    "Hook",
-    "Hooks",
     "IgnoredParameter",
     "LiteModel",
     "Message",
@@ -48,7 +45,7 @@ __all__ = [
     "Price",
     "Provenance",
     "ProvenanceUnknown",
-    "Registration",
+    "Reply",
     "RoleConfig",
     "RolePolicy",
     "RoleSpec",
@@ -59,5 +56,6 @@ __all__ = [
     "Usage",
     "build",
     "build_async",
+    "call_context",
     "strict_schema",
 ]

@@ -20,6 +20,10 @@ class BackendProfile:
     supports_temperature: bool
     supports_reasoning_effort: bool  # sent as the top-level `reasoning_effort`
     requires_max_tokens: bool = False  # the API rejects a request without an output limit
+    extra: str | None = None  # the optional dependency (and its module) this type needs
+    # The SDK appends /v1/... itself (Anthropic); the OpenAI SDK wants /v1 inside base_url.
+    base_url_is_root: bool = False
+    # The fields below are read by the OpenAI-compatible protocol only.
     # Where the answering model is named when the body's `model` is not it (design §6.3); a
     # routing alias is allowed only on a backend type that has one (§6.2).
     answered_header: str | None = None
@@ -67,6 +71,8 @@ PROFILES: dict[BackendType, BackendProfile] = {
         # No default is guessed: hosts set their own (lite-mem 2048, lite-rag 1024) so the
         # request body is unchanged when they migrate (owner, 2026-11-18).
         requires_max_tokens=True,
+        extra="anthropic",
+        base_url_is_root=True,
     ),
     # llm-gateway maps both names to max_tokens (translate.py:58-59) and drops reasoning_effort
     # (it lands in X-LLMGW-Ignored-Params): refused rather than silently lost (design §5).

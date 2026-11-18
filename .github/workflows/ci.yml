@@ -2,14 +2,22 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ["v*"]   # a release: the package job's wheel and sdist go to the GitHub Release
   pull_request:
+
+permissions:
+  contents: read
+
+# Actions are pinned by commit (the same pins as lite-eval); the comment names the version.
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2   # v10.3.3
+        with:
+          version: "0.10.8"
       - run: uv sync --locked --all-extras
       - run: uv run ruff check && uv run ruff format --check
       - run: uv run mypy
@@ -22,5 +30,51 @@ jobs:
     env:
       LITELLM_MASTER_KEY: ci-only
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
       - run: docker compose -f deploy/litellm/compose.yaml run --rm verify
+
+  # Hosts install the release wheel by URL (design §12): build it, install it in a clean venv
+  # with and without the anthropic extra, and use it there. On a v* tag the release job
+  # publishes exactly what this job built.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2   # v10.3.3
+        with:
+          version: "0.10.8"
+      - run: uv build --out-dir dist
+      - name: the tag names the version being released
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test -f "dist/lite_model-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+      - name: the wheel works from a clean venv
+        run: |
+          uv venv --python 3.12 /tmp/clean
+          uv pip install --python /tmp/clean "$(ls dist/*.whl)"
+          cd /tmp
+          LITEMODEL_ROLES__ANSWER__MODEL=qwen3:1.7b /tmp/clean/bin/litemodel dump-config > /dev/null
+          /tmp/clean/bin/python -I "$GITHUB_WORKSPACE/scripts/smoke.py"
+      - name: the anthropic extra installs and builds
+        run: |
+          uv venv --python 3.12 /tmp/claude
+          uv pip install --python /tmp/claude "$(ls dist/*.whl)[anthropic]"
+          cd /tmp && /tmp/claude/bin/python -I "$GITHUB_WORKSPACE/scripts/smoke.py" --anthropic
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, litellm-image, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # this job only: create the release
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -6,10 +6,11 @@ import unicodedata
 
 from pydantic import BaseModel, Field
 
-from lite_model import ModelsConfig, RolePolicy, RoleSpec
+from lite_model import RolePolicy, RoleSpec
 from lite_model.config import resolve
 from lite_model.hooks import Call
 from lite_model.schema import strict_schema
+from tests.configs import local
 
 
 class Café(BaseModel):
@@ -19,8 +20,8 @@ class Café(BaseModel):
 
 
 def test_schema_hash_is_lite_evals_canonical_json_sha256() -> None:
-    target = resolve(ModelsConfig(), RoleSpec({"answer": RolePolicy()}))["answer"]
-    call = Call("answer", target, (), {}, Café)
+    target = resolve(local(), RoleSpec({"answer": RolePolicy()}))["answer"]
+    call = Call(target, (), {}, Café)
 
     def nfc(v: object) -> object:  # lite_eval/canonical.py, written out
         if isinstance(v, str):
@@ -39,4 +40,4 @@ def test_schema_hash_is_lite_evals_canonical_json_sha256() -> None:
         allow_nan=False,
     )
     assert call.schema_hash == hashlib.sha256(expected.encode("utf-8")).hexdigest()
-    assert Call("answer", target, (), {}, None).schema_hash is None
+    assert Call(target, (), {}, None).schema_hash is None

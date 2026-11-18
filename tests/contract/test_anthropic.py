@@ -14,6 +14,7 @@ from lite_model import (
     Truncated,
     strict_schema,
 )
+from tests.configs import local_validate
 from tests.contract.conftest import Connect
 from tests.upstream import Upstream, completion, message, tool_use
 
@@ -38,7 +39,7 @@ def _key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _claude(**fields: object) -> ModelsConfig:
     base = {"backend": "anthropic", "model": "claude-x", "max_output_tokens": 2048}
-    return ModelsConfig.model_validate(base | {"max_retries": 0} | fields)
+    return local_validate(base | {"max_retries": 0} | fields)
 
 
 def test_text_request(connect: Connect) -> None:
@@ -164,7 +165,7 @@ def test_two_protocols_with_the_same_key_get_a_client_each(
     # Both backends use their SDK's default URL (base_url None) and one key variable: the SDK
     # client is shared per (type, endpoint, key, timeouts), never across protocols.
     monkeypatch.setenv("ONE_KEY", "sk-one")
-    config = ModelsConfig.model_validate(
+    config = local_validate(
         {
             "max_retries": 0,
             "backends": {
@@ -220,3 +221,12 @@ def test_only_the_forced_tools_input_is_read(connect: Connect) -> None:
     body = message(tool_use("Other", {"city": "No"}), tool_use("Fact", {"city": "Yes"}))
     value = connect(Upstream((200, body)), _claude()).structured("answer", ASK, Fact).value
     assert value.city == "Yes"
+
+
+def test_an_unknown_stop_reason_is_not_echoed(connect: Connect) -> None:
+    # Codex final review: a compatible endpoint's unexpected stop_reason went into the error
+    # message as is (rule 8: no upstream text in errors).
+    body = message({"type": "text", "text": "x"}, stop="sk-ant-leaked-value")
+    with pytest.raises(EmptyReply, match=r"stop reason unexpected") as caught:
+        connect(Upstream((200, body)), _claude()).text("answer", ASK)
+    assert "leaked" not in str(caught.value)

@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S4 完成（2026-11-18），S5 是下一步。阶段与验收见 §14。
+状态：S5 完成（2026-11-18），v0.1.0 待发布；之后是各宿主的迁移（S6+，§12）。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -78,7 +78,7 @@ class Message:
 @dataclass(frozen=True)
 class Provenance:
     role: str                 # the caller's role, e.g. "answer"
-    backend: str              # ollama | openai | anthropic | gateway | litellm
+    backend: str              # the configured backend's name (e.g. ollama, deepseek), §4
     requested: str            # the model / alias / profile the call asked for
     answered: str | None      # the model that actually answered; None = the endpoint did not say
     channel: Channel          # local | api | subscription
@@ -141,8 +141,8 @@ lite-model 提供 pydantic 配置模型，宿主模块把它嵌进自己的设�
 
 ```yaml
 # defaults, then per-role overrides; a field left out keeps the default
-backend: ollama
-model: qwen3:8b
+backend: ollama             # required: no default (a lite-model release never changes a host's model)
+model: qwen3:8b             # required
 timeout_s: 120
 connect_timeout_s: 10
 max_retries: 1              # same target only (§8)
@@ -239,7 +239,9 @@ gateway 后端在响应头里看到 `X-LLMGW-Ignored-Params` 列出 lite-model *
 - 每次回答都带 `Provenance`。`answered` 取**响应里实际回答的模型**，不取配置；端点没说时为 `None`，
   `tag` 里用 `requested?` 表示"未确认"，不冒充。
 - 宿主存 `tag`（`backend:answered`），需要时另存 `requested` 和 `channel`。lite-mem 现在存的 `provider:model`
-  格式在迁移时按 §12 的映射保持兼容。
+  格式在迁移时保持兼容：`tag` 的前缀是 **backend 的名字**，所以宿主把 backend 命名成它现在存的 provider
+  （lite-mem 对本机 Ollama 存 `openai:qwen3:8b`：`backends: {openai: {type: ollama}}`），存下来的格式不变；
+  也可以在 adapter 里映射。
 - 一次操作固定一个 target（KB §1.4）：调用期间配置变了也不中途换。
 
 ### 6.2 经过 llm-gateway
@@ -397,6 +399,11 @@ ModelError (base)
   `after` 只对刚从端点拿到的回复运行（命中、失败的调用都不运行，缓存不会重复写）。
 - 没有 hook 时不构造 `Call`。hook 是同步的，同步和异步模型共用（lite-cache 的 store 是同步的）。
 - 名字唯一（重复注册报 `ConfigError`），`model.hooks[name]` 取回，`Registration.remove()` 撤销（重复撤销无害）。
+- 调用上下文：`with call_context(scope="acme/u42", cache=True): model.text(...)`，hook 从 `Call.context`（只读）
+  读到；嵌套的块叠加并覆盖外层。是一个 contextvar：`Model` 协议不加参数，宿主 adapter、`FakeModel`、`Bounded`
+  都不变；同步调用和块内创建的 asyncio task 都看得到。lite-model 自己从不读这些值（主人 2026-11-18）。
+- `LiteModel.target(role)` / `AsyncLiteModel.target(role)`：调用前取得某个 role 解析后的 target（宿主把它记进
+  索引身份，§12.1）。
 - hook 抛错 = 调用失败，原样抛出（不吞掉，不包装）；`before` 抛错时不发请求。`after` 抛错时这次已经计费的回复
   和它的 `usage` 一起丢掉：`after` 不应抛错（lite-cache 写失败时照样返回，带 `store_error`）。
 - hook 看到的 `Call.request` 是实际请求的只读深拷贝：hook 改不了发出去的请求，缓存键描述的就是发出去的那个。
@@ -635,6 +642,33 @@ lite-model/
     - Medium：`Call` 缺 scope / policy。**已在 §15**，lite-cache 接入时定。
   - 改后变异 112 处（S4 30、S1 43、S2 21、S3 18）全部被抓住；`-m ollama` 4、`-m litellm` 3 通过。
 
+**S5（2026-11-18）发布与整库收尾。**
+- 打包：版本 `0.1.0`；`license-files = ["LICENSE"]`（打包测试先红：wheel 和 sdist 都缺 LICENSE 原文）；
+  `tests/unit/test_packaging.py` 检查 LICENSE、`License-Expression`、`py.typed`、`litemodel` 入口、`testing.py`
+  在、`tests/` 不在。CI：action 按 commit 锁定（与 lite-eval 同一组）；`package` 任务构建、tag 版本与 wheel
+  一致、干净 venv 里装 wheel 和 `wheel[anthropic]` 跑 `dump-config` 与 `scripts/smoke.py`；`release` 任务只在
+  `v*` tag 上、只有它有 `contents: write`，发布 `package` 任务构建并测过的那一份（主人选择 CI 按 tag 发布）。
+- README 写全（安装、快速上手、配置、后端表、来源、路由、错误、用量、并发、hook、测试宿主）；
+  `tests/unit/test_readme.py` 让 README 的配置示例和快速上手跟着代码走（变异时发现它没测默认 backend，补上）。
+- 整库收尾（范围是 `f13239a` 以来的全部代码，不只 S5）：
+  - `/simplify`（4 个角度）定了发布前的公共 API（主人的两个决定，见决定记录）：`call_context()` 传每次调用的
+    值给 hook（`Model` 协议不加参数）；`ModelsConfig.backend` / `model` 必填。另外：`LiteModel.target(role)`；
+    顶层导出收窄（hook 类型从 `lite_model.hooks` 导入，`Reply`、`call_context` 公开）；`Reply` 只定义一处
+    （`testing` 里的改名 `FakeReply`）；两份"传输字段"集合合成一份；`Call.role` 取自 target；anthropic 的两条
+    检查改为参数表字段（`extra`、`base_url_is_root`）；删去代码里引用 review 轮次的注释；§6.1 写明 lite-mem 的
+    `provider:model` 格式怎么保持（backend 起名 `openai`、`type: ollama`，有测试）。CLI 缺 backend / model 时报清楚
+    的错而不是 traceback。跳过：导入耗时、`strict_schema` 缓存、CI 里构建两次（都是毫秒级或并行）。
+  - Codex（只读，整库）2 条：
+    - Medium：未知的 anthropic `stop_reason` 原样进了 `EmptyReply` 的消息（规则 8）。成立，先红；只写已知的
+      `refusal` / `pause_turn`，其余写 `unexpected`。
+    - Medium：打包测试在子进程里 `uv build`，网络守卫看不到子进程。成立，改为 `uv build --offline`（构建后端
+      在 `uv sync` 后已在缓存）。这一条没有先红的测试：本机缓存里有 `uv_build`，去掉 `--offline` 也会通过；
+      `--offline` 保证的是缓存缺失时失败而不是联网。
+    - 设计首行状态过期：已改。供应链、来源、密钥、公共 API、发布流程、宿主迁移路径其余均无 finding。
+- 检查：单元 + 契约 226 个，`-m ollama` 4 个，`-m litellm` 3 个；变异 136 处（S1 43、S2 21、S3 18、S4 30、
+  S5 13+2，含 live 5 处，Ollama 在线）全部被抓住。
+- 发布：见下一条（推 tag 之后补上 release 和"宿主从 wheel 安装"的结果）。
+
 ## 15. 待确认
 
 - **llm-gateway 的两处修改**（在 llm-gateway repo 里做，不在本 repo）：
@@ -648,10 +682,8 @@ lite-model/
 - hook 只有 `before` / `after`：失败的调用不经过 hook。lite-cache S1 要按 `skip:<reason>` 计数（截断、空回复），
   它包在调用外面时能从异常类型和 `usage` 得到这些；若要在 hook 里拿到，再加一个可选的 `failed(call, error)`。
   lite-cache 接入时定。
-- `Call` 里没有 lite-cache L1 key 的 `scope`，也没有"这个调用点要不要缓存"的 policy（lite-cache §3：只有调用点
-  显式传 policy 才缓存）；一个 hook 注册在模型上、看见所有 role。两种做法：宿主在调用外通过 contextvar 把
-  scope / policy 交给 hook；或 `Call` 加一个调用方传入的不透明 `context`。lite-cache 接入时定，定之前多租户
-  宿主不要用 hook 做缓存（scope 错会把一个租户的答案给另一个租户）。
+- ~~`Call` 缺 lite-cache 的 scope / policy~~：S5 定为 `call_context()`（§10）。lite-cache 的 hook 必须在没有
+  scope 时不缓存（否则会把一个租户的答案给另一个租户）。
 - `Bounded` 包在模型外面：hook 命中也要等一个槽位（concurrency 1 时命中要等正在跑的调用）。若成问题，把槽位
   移到执行器里只包住真正的请求。
 - 自动路由的效果：在 lite-rag 里做一个 stage，用 `literag eval` 比较固定 small / workhorse / flagship 与
@@ -677,4 +709,7 @@ lite-model/
 | 2026-11-18 | `Provenance.via`：端点自己的来源头（参数表里的允许列表，名字小写）；`tag` 不变 | 主人的选择：§6.2、§6.3 要求另记 deployment id、别名、gateway backend |
 | 2026-11-18 | hook 命中的回复 `cached=True` 放在回复上，`Provenance` 不变（§10） | 主人的选择：是否缓存属于这次调用，来源属于当初回答的模型 |
 | 2026-11-18 | `build()` 返回 `LiteModel`（`Model` + `.hooks`）；`Model` 协议不含 hooks（§3、§10） | `FakeModel` 和宿主 adapter 不必实现 hook；`model.hooks.register` 照设计可用 |
+| 2026-11-18 | 调用上下文用 contextvar：`call_context(**values)` → `Call.context`；`Model` 协议不加参数（§10） | 主人的选择：三个宿主马上要照 `Model` 写 adapter，加参数以后就是破坏性改动 |
+| 2026-11-18 | `ModelsConfig.backend` / `model` 必填，没有默认值（§4） | 主人的选择：宿主嵌入时不会悄悄继承默认值，lite-model 的版本不会改宿主的模型 |
+| 2026-11-18 | 公开 API 收窄：`Call`、`Hook`、`Hooks`、`Registration` 从 `lite_model.hooks` 导入；`Reply`、`call_context`、`LiteModel.target()` 公开 | 发布后导出的名字都是承诺；宿主迁移要在调用前拿到 target |
 | 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |

@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -59,3 +59,6 @@ class StructuredReply[T: BaseModel]:
     provenance: Provenance
     usage: Usage
     cached: bool = False  # a hook answered (design §10); provenance stays the original one
+
+
+Reply = TextReply | StructuredReply[Any]

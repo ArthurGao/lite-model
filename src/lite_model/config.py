@@ -16,7 +16,7 @@ from lite_model.profiles import PROFILES, BackendType
 from lite_model.types import Channel
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high"]
-# An empty string is refused, never read as "use the default" (Codex S1).
+# An empty string is refused, never read as "use the default".
 Name = Annotated[str, StringConstraints(min_length=1)]
 
 
@@ -75,8 +75,10 @@ class RoleConfig(_CallSettings):
 class ModelsConfig(_CallSettings):
     """The defaults, per-role overrides, and the named backends."""
 
-    backend: Name = "ollama"
-    model: Name = "qwen3:8b"
+    # No defaults: a host names its model, so a lite-model release never changes it (owner,
+    # 2026-11-18).
+    backend: Name
+    model: Name
     timeout_s: float = Field(default=120.0, gt=0)
     connect_timeout_s: float = Field(default=10.0, gt=0)
     max_retries: int = Field(default=1, ge=0)
@@ -168,8 +170,8 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
     found = []
     if target.api_key_env is not None and not os.environ.get(target.api_key_env):
         found.append(f"{where}: set {target.api_key_env}")
-    if profile.protocol == "anthropic" and importlib.util.find_spec("anthropic") is None:
-        found.append(f"{where}: install the extra: lite-model[anthropic]")
+    if profile.extra and importlib.util.find_spec(profile.extra) is None:
+        found.append(f"{where}: install the extra: lite-model[{profile.extra}]")
     if target.routed and not spec.roles[target.role].routable:
         found.append(f"{where}: {target.model} is a routing alias and the role is not routable")
     if target.routed and profile.answered_header is None:
@@ -182,9 +184,8 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
         found.append(f"{where}: reasoning_effort is not supported by {target.type}")
     if target.max_output_tokens is None and profile.requires_max_tokens:
         found.append(f"{where}: {target.type} needs max_output_tokens")
-    if profile.protocol == "anthropic" and (target.base_url or "").rstrip("/").endswith("/v1"):
-        # The Anthropic SDK appends /v1/messages; the OpenAI SDK wants /v1 in base_url.
-        found.append(f"{where}: anthropic base_url must not end in /v1 (the SDK adds it)")
+    if profile.base_url_is_root and (target.base_url or "").rstrip("/").endswith("/v1"):
+        found.append(f"{where}: {target.type} base_url must not end in /v1 (the SDK adds it)")
     return found
 
 

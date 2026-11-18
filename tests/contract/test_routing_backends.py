@@ -13,6 +13,7 @@ from lite_model import (
     ProvenanceUnknown,
     RoleConfig,
 )
+from tests.configs import local, local_validate
 from tests.contract.conftest import Connect
 from tests.upstream import Upstream, completion
 
@@ -39,7 +40,7 @@ def _litellm(model: str = "workhorse", **fields: object) -> ModelsConfig:
     # `graph` is not routable (tests/contract/conftest.py ROLES): pinned, so a routing alias as
     # the default does not trip the routing guard.
     base = {"backend": "litellm", "model": model, "max_retries": 0}
-    return ModelsConfig.model_validate(base | {"roles": {"graph": {"model": "workhorse"}}} | fields)
+    return local_validate(base | {"roles": {"graph": {"model": "workhorse"}}} | fields)
 
 
 # --- litellm: request ---
@@ -111,7 +112,7 @@ def test_provenance_is_checked_on_structured_replies_too(connect: Connect) -> No
 
 def _gateway(**fields: object) -> ModelsConfig:
     base = {"backend": "gateway", "model": "claude-sub-haiku", "max_retries": 0}
-    return ModelsConfig.model_validate(base | fields)
+    return local_validate(base | fields)
 
 
 GATEWAY_HEADERS = {"X-LLMGW-Profile": "claude-sub-haiku", "X-LLMGW-Backend": "claude-code"}
@@ -167,7 +168,7 @@ def test_the_ignored_check_covers_the_structured_output_format(connect: Connect)
 def test_other_openai_compatible_backends_read_no_proxy_headers(connect: Connect) -> None:
     # A named `openai` backend in front of something that happens to send LiteLLM headers:
     # its profile has no answered header, so the body's model is used and nothing is in `via`.
-    config = ModelsConfig(
+    config = local(
         backend="corp",
         model="m",
         max_retries=0,

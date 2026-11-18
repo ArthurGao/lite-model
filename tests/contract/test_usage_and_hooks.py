@@ -7,7 +7,6 @@ from pydantic import BaseModel
 
 from lite_model import (
     BadStructuredReply,
-    Call,
     CallFailed,
     ConfigError,
     EmptyReply,
@@ -16,12 +15,15 @@ from lite_model import (
     ModelError,
     ModelsConfig,
     ProvenanceUnknown,
+    Reply,
     StructuredReply,
     TextReply,
     Truncated,
     Usage,
+    call_context,
 )
-from lite_model.hooks import Reply
+from lite_model.hooks import Call
+from tests.configs import local, local_validate
 from tests.contract.conftest import Connect
 from tests.upstream import Upstream, completion
 
@@ -43,7 +45,7 @@ def _priced(**fields: Any) -> ModelsConfig:
         "max_retries": 0,
         "prices": {"ollama:qwen3:8b": {"input_per_mtok": 1.0, "output_per_mtok": 2.0}},
     }
-    return ModelsConfig.model_validate(base | fields)
+    return local_validate(base | fields)
 
 
 # --- usage on failed calls (§9) ---
@@ -77,14 +79,12 @@ def test_a_bad_structured_reply_reports_its_usage(connect: Connect) -> None:
 def test_header_failures_report_usage_too(connect: Connect) -> None:
     gw = {"x-llmgw-ignored-params": "temperature"}
     up = Upstream((200, completion(model="claude-sub-haiku", usage=USAGE), gw))
-    config = ModelsConfig(
-        backend="gateway", model="claude-sub-haiku", temperature=0.1, max_retries=0
-    )
+    config = local(backend="gateway", model="claude-sub-haiku", temperature=0.1, max_retries=0)
     with pytest.raises(IgnoredParameter) as caught:
         connect(up, config).text("answer", ASK)
     assert caught.value.usage == Usage(1000, 500, None, None)  # subscription: no cost
     up = Upstream((200, completion(model="workhorse", usage=USAGE)))
-    config = ModelsConfig(backend="litellm", model="workhorse", max_retries=0)
+    config = local(backend="litellm", model="workhorse", max_retries=0)
     with pytest.raises(ProvenanceUnknown) as unknown:
         connect(up, config).text("answer", ASK)
     assert unknown.value.usage == Usage(1000, 500, None, None)
@@ -113,7 +113,7 @@ def test_no_price_and_no_header_is_unknown_never_estimated(connect: Connect) -> 
 
 def test_the_proxys_own_cost_wins_over_the_price_table(connect: Connect) -> None:
     headers = {"x-litellm-model-name": "ollama_chat/qwen3:8b", "x-litellm-response-cost": "0.0042"}
-    config = ModelsConfig.model_validate(
+    config = local_validate(
         {
             "backend": "litellm",
             "model": "workhorse",
@@ -129,7 +129,7 @@ def test_the_proxys_own_cost_wins_over_the_price_table(connect: Connect) -> None
 
 
 def test_a_subscription_has_no_cost(connect: Connect) -> None:
-    config = ModelsConfig.model_validate(
+    config = local_validate(
         {
             "backend": "gateway",
             "model": "claude-sub-haiku",
@@ -299,3 +299,25 @@ def test_a_wrong_hook_reply_does_not_echo_its_content(connect: Connect) -> None:
         caller.structured("answer", ASK, City)
     assert "secret" not in str(caught.value)
     assert "TextReply" in str(caught.value)
+
+
+def test_call_context_reaches_hooks_sync_and_async(connect: Connect) -> None:
+    # The scope / cache policy a cache hook needs, without a parameter on Model (owner,
+    # 2026-11-18): set around the call, read from Call.context.
+    caller = connect(Upstream())
+    hook = Recorder("cache")
+    caller.hooks.register(hook)
+    caller.text("answer", ASK)
+    with call_context(scope="acme/u42", cache=True):
+        caller.text("answer", ASK)
+        with call_context(cache=False, role_note="inner"):
+            caller.text("answer", ASK)
+    caller.text("answer", ASK)
+    assert [dict(c.context) for c in hook.before_calls] == [
+        {},
+        {"scope": "acme/u42", "cache": True},
+        {"scope": "acme/u42", "cache": False, "role_note": "inner"},
+        {},
+    ]
+    with pytest.raises(TypeError):
+        hook.before_calls[1].context["scope"] = "x"  # type: ignore[index]

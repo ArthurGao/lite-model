@@ -7,15 +7,17 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from lite_model.backends import Reply, finish, sdk_client
+from lite_model.backends import finish, sdk_client
 from lite_model.config import Target
 from lite_model.schema import strict_schema
-from lite_model.types import Message, Usage
+from lite_model.types import Message, Reply, Usage
 
-# stop_reason values (anthropic 2.6.0): cut short, or complete. Any other one (refusal,
-# pause_turn, one added later) leaves no usable answer.
+# stop_reason values (anthropic 2.6.0): cut short, or complete. Any other one leaves no usable
+# answer; only the known ones are named in the error, any other is "unexpected" (an endpoint's
+# own string never reaches an error message, rule 8).
 TRUNCATED = {"max_tokens", "model_context_window_exceeded"}
 COMPLETE = {"end_turn", "stop_sequence", "tool_use", None}
+UNUSABLE = {"refusal", "pause_turn"}
 
 
 def connect(target: Target, key: str | None, http_client: Any) -> Any:
@@ -76,6 +78,12 @@ def reply(
         body_model=response.model,
         usage=Usage(input=response.usage.input_tokens, output=response.usage.output_tokens),
         truncated=response.stop_reason in TRUNCATED,
-        unusable=None if response.stop_reason in COMPLETE | TRUNCATED else response.stop_reason,
+        unusable=_unusable(response.stop_reason),
         payload=payload,
     )
+
+
+def _unusable(stop_reason: str | None) -> str | None:
+    if stop_reason in COMPLETE | TRUNCATED:
+        return None
+    return stop_reason if stop_reason in UNUSABLE else "unexpected"

@@ -4,6 +4,7 @@ import dataclasses
 import json
 
 import typer
+from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from lite_model.config import ModelsConfig, target
@@ -30,7 +31,11 @@ def dump_config() -> None:
     """Print the merged config and each configured role's target. Keys appear as variable
     names only. Nothing is called and no startup check runs: this shows what `build()` would
     check."""
-    config = EnvConfig()
+    try:
+        config = EnvConfig()
+    except ValidationError as exc:  # e.g. LITEMODEL_BACKEND / LITEMODEL_MODEL not set
+        typer.echo(f"invalid config (LITEMODEL_* variables, .env):\n{exc}", err=True)
+        raise typer.Exit(1) from exc
     targets = {role: dataclasses.asdict(target(config, role)) for role in config.roles}
     out = {"config": config.model_dump(mode="json"), "targets": targets}
     typer.echo(json.dumps(out, indent=2, ensure_ascii=False))

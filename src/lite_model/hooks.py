@@ -9,9 +9,12 @@ hit, not for a failed call). A hook that raises fails the call; nothing is swall
 import hashlib
 import json
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cached_property
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -19,27 +22,48 @@ from pydantic import BaseModel
 from lite_model.config import Target
 from lite_model.errors import ConfigError
 from lite_model.schema import strict_schema
-from lite_model.types import Message, StructuredReply, TextReply
+from lite_model.types import Message, Reply
 
-Reply = TextReply | StructuredReply[Any]
-# Request entries that are transport, not content: never part of what a cache keys on.
-_NOT_PARAMS = {"model", "messages", "extra_headers"}
+# Request entries that are transport or already in the key (model, messages): not params.
+TRANSPORT = frozenset({"model", "messages", "extra_headers"})
+
+_CONTEXT: ContextVar[Mapping[str, Any]] = ContextVar(
+    "lite_model_call_context", default=MappingProxyType({})
+)
+
+
+@contextmanager
+def call_context(**values: Any) -> Iterator[None]:
+    """Values the calls inside this block hand to hooks as `Call.context` (design §10), e.g.
+    `call_context(scope="acme/u42", cache=True)` for lite-cache. Nested blocks add to and override
+    the outer one; sync calls, threads started with `contextvars.copy_context()` and asyncio tasks
+    created inside the block see it. lite-model itself never reads these values."""
+    token = _CONTEXT.set(MappingProxyType({**_CONTEXT.get(), **values}))
+    try:
+        yield
+    finally:
+        _CONTEXT.reset(token)
 
 
 @dataclass(frozen=True)
 class Call:
     """One call as it is about to be sent: what lite-cache's L1 key is made of."""
 
-    role: str
     target: Target
     messages: tuple[Message, ...]
     request: Mapping[str, Any] = field(repr=False)  # exactly what is sent (SDK arguments)
     schema: type[BaseModel] | None = None
+    # The caller's call_context() at the time of the call (scope, cache policy...).
+    context: Mapping[str, Any] = field(default_factory=_CONTEXT.get)
+
+    @property
+    def role(self) -> str:
+        return self.target.role
 
     @property
     def params(self) -> dict[str, Any]:
         """The request without model, messages and transport headers."""
-        return {k: v for k, v in self.request.items() if k not in _NOT_PARAMS}
+        return {k: v for k, v in self.request.items() if k not in TRANSPORT}
 
     @property
     def schema_name(self) -> str | None:

@@ -19,8 +19,8 @@ class FakeCall:
 
 # A reply: text (for text()), a model instance or a dict (for structured()), or an exception to
 # raise. A list is consumed one reply per call; a callable computes the reply from the call.
-Reply = str | BaseModel | dict[str, Any] | BaseException
-Script = Reply | list[Reply] | Callable[[FakeCall], Reply]
+FakeReply = str | BaseModel | dict[str, Any] | BaseException
+Script = FakeReply | list[FakeReply] | Callable[[FakeCall], FakeReply]
 
 
 class FakeModel:
@@ -31,7 +31,7 @@ class FakeModel:
         self._scripts = {role: list(s) if isinstance(s, list) else s for role, s in scripts.items()}
         self.calls: list[FakeCall] = []
 
-    def _reply(self, call: FakeCall) -> Reply:
+    def _reply(self, call: FakeCall) -> FakeReply:
         self.calls.append(call)
         if call.role not in self._scripts:
             raise AssertionError(f"FakeModel has no reply scripted for role {call.role!r}")

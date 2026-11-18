@@ -23,7 +23,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S4 (usage, costs, Bounded, hooks) done 2026-11-18; S5 (README, deploy docs, v0.1.0 release wheel, final close-out over the whole library) is next** (design §14).
+**S5 (README, packaging, v0.1.0 release wheel, final close-out) done 2026-11-18; next: host migrations (S6+, design §12), each in its own repo** (design §14).
 
 ## Rules
 

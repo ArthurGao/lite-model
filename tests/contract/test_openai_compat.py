@@ -20,7 +20,7 @@ from lite_model import (
     build_async,
     strict_schema,
 )
-from tests.configs import two_vendors
+from tests.configs import local, two_vendors
 from tests.contract.conftest import ROLES, Connect
 from tests.upstream import Upstream, completion
 
@@ -34,7 +34,7 @@ class City(BaseModel):
 
 def _openai(**fields: Any) -> ModelsConfig:
     """The `openai` profile. Nothing leaves the process: the transport is the fake upstream."""
-    return ModelsConfig(backend="openai", model="gpt-x", max_retries=0, **fields)
+    return local(backend="openai", model="gpt-x", max_retries=0, **fields)
 
 
 # --- request bodies ---
@@ -57,7 +57,7 @@ def test_ollama_text_request(connect: Connect) -> None:
 
 def test_ollama_sends_max_tokens_and_reasoning_effort_when_configured(connect: Connect) -> None:
     up = Upstream()
-    config = ModelsConfig(
+    config = local(
         max_retries=0,
         roles={
             "graph": RoleConfig(max_output_tokens=2048, reasoning_effort="none", temperature=0.3),
@@ -202,7 +202,7 @@ def test_an_http_error_fails_without_upstream_text(
 
 def test_retries_stay_on_the_same_target_then_fail(connect: Connect) -> None:
     up = Upstream((500, {"error": {"message": "boom"}}))
-    config = ModelsConfig(max_retries=1)
+    config = local(max_retries=1)
     with pytest.raises(CallFailed, match="InternalServerError"):
         connect(up, config).text("answer", ASK)
     assert len(up.requests) == 2  # one retry
@@ -211,7 +211,7 @@ def test_retries_stay_on_the_same_target_then_fail(connect: Connect) -> None:
 
 def test_a_retry_that_succeeds_returns_the_reply(connect: Connect) -> None:
     up = Upstream((500, {"error": {"message": "boom"}}), (200, completion("second")))
-    reply = connect(up, ModelsConfig(max_retries=1)).text("answer", ASK)
+    reply = connect(up, local(max_retries=1)).text("answer", ASK)
     assert (reply.text, len(up.requests)) == ("second", 2)
 
 
@@ -226,7 +226,7 @@ def test_an_undeclared_role_at_call_time_is_a_config_error(connect: Connect) -> 
 def test_a_test_without_the_fake_transport_cannot_reach_a_server(mode: str) -> None:
     # tests/conftest.py refuses sockets outside -m ollama / -m litellm: a contract test that
     # forgot `http_client` fails instead of calling the real Ollama.
-    config = ModelsConfig(max_retries=0)
+    config = local(max_retries=0)
     with pytest.raises(CallFailed) as caught:
         if mode == "sync":
             build(config, ROLES).text("answer", ASK)
