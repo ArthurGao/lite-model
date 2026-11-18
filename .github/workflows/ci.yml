@@ -52,7 +52,8 @@ jobs:
           uv venv --python 3.12 /tmp/clean
           uv pip install --python /tmp/clean "$(ls dist/*.whl)"
           cd /tmp
-          LITEMODEL_ROLES__ANSWER__MODEL=qwen3:1.7b /tmp/clean/bin/litemodel dump-config > /dev/null
+          LITEMODEL_BACKEND=ollama LITEMODEL_MODEL=qwen3:8b LITEMODEL_ROLES__ANSWER__MODEL=qwen3:1.7b \
+            /tmp/clean/bin/litemodel dump-config > /dev/null
           /tmp/clean/bin/python -I "$GITHUB_WORKSPACE/scripts/smoke.py"
       - name: the anthropic extra installs and builds
         run: |
