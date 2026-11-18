@@ -442,7 +442,7 @@ eval 数字一致、来源格式兼容。
 | 顺序 | 模块 | 要点 |
 | --- | --- | --- |
 | 1 | lite-mem | 功能最全（strict schema、Anthropic 强制工具、按 role 覆盖），最能检验接口。`produced_by` 继续存 `provider:model`。**已迁移**（2026-11-18，lite-mem S12，用 0.1.1 的 `keyless`；12 个请求体前后相同） |
-| 2 | lite-rag | 三处 LLM 配置变成三个 role；`contextual`、`graph` 不可路由；`Completion.model_id` 改成实际回答的模型；`literag eval` 前后一致 |
+| 2 | lite-rag | 三处 LLM 配置变成三个 role；`contextual`、`graph` 不可路由；`Completion.model_id` 改成实际回答的模型；`literag eval` 前后一致。**已迁移**（2026-11-18，lite-rag S15，用 0.2.0 的 `host_roles`；5 个请求体前后相同，索引身份不变） |
 | 3 | llm-steward | 异步；顺带修它没整理过的 strict schema（raw `model_json_schema()`） |
 | — | lite-eval judge | 暂不迁移（§1 非目标） |
 
