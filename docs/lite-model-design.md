@@ -443,7 +443,7 @@ eval 数字一致、来源格式兼容。
 | --- | --- | --- |
 | 1 | lite-mem | 功能最全（strict schema、Anthropic 强制工具、按 role 覆盖），最能检验接口。`produced_by` 继续存 `provider:model`。**已迁移**（2026-11-18，lite-mem S12，用 0.1.1 的 `keyless`；12 个请求体前后相同） |
 | 2 | lite-rag | 三处 LLM 配置变成三个 role；`contextual`、`graph` 不可路由；`Completion.model_id` 改成实际回答的模型；`literag eval` 前后一致。**已迁移**（2026-11-18，lite-rag S15，用 0.2.0 的 `host_roles`；5 个请求体前后相同，索引身份不变） |
-| 3 | llm-steward | 异步；顺带修它没整理过的 strict schema（raw `model_json_schema()`） |
+| 3 | llm-steward | 异步；顺带修它没整理过的 strict schema（raw `model_json_schema()`）。**已迁移**（2026-11-19，llm-steward P9；5 个请求体前后相同——它的 schema 本来就是 strict 形状，`strict_schema` 结果不变；锁定的 lite-rag、lite-mem 一起升到迁移后的版本） |
 | — | lite-eval judge | 暂不迁移（§1 非目标） |
 
 lite-model 以 GitHub release wheel 发布，宿主在 `[tool.uv.sources]` 里锁定版本（与 lite-eval 相同的做法）。
@@ -713,8 +713,14 @@ lite-model/
   分档：中文题全部去 1.7b。结论：现在的 §7.2 配置不值得在中英混合的 RAG 上打开；要路由，先在实际流量上测 `llm` 分类器或
   `keyword_tier_rules`。Proxy 本身不改变答案质量。
 - 各模块迁移时是否去掉 adapter、直接依赖 `lite_model.Model`（§12.1）。
-- ~~**宿主改不了内置 backend**~~（lite-mem S12 发现，2026-11-18）：0.2.0 已做（§4 宿主自己的默认值）。lite-mem 还在用
-  自己的 before-validator，下次升级 lite-model 时改用 `host_backends` 并删掉它。
+- ~~**宿主改不了内置 backend**~~（lite-mem S12 发现，2026-11-18）：0.2.0 已做（§4 宿主自己的默认值）。lite-mem 2026-11-19 已改用
+  `host_backends`、删掉自己的 validator（`be5269f`）。
+- **keyless 与 `api_key_env` 叠加时冲突**（lite-mem 改用 0.2.0 时发现，2026-11-19）：宿主默认 backend 是 `keyless: true`，
+  配置只给同名同 type 的 `api_key_env` 时，逐字段叠加后两者都在，启动报 "keyless and api_key_env cannot both be set"——
+  响亮地失败，不会悄悄不发 key，但用户没写过 `keyless`。现在要同时写 `keyless: false`（lite-mem 有测试）。更好的做法：
+  叠加时把 key 的来源当成一个选择（给了 `api_key_env` 就去掉默认的 `keyless`，反之亦然）。下次改 lite-model 时做。
+- **结构化输出约束解码**（lite-rag S16，2026-11-19）：qwen3:8b 在 Ollama 上自由输出 JSON 时，同一个 chunk 10 次里 7 次漏引号；
+  经 `structured()`（strict JSON schema）10 次全部合法。宿主要 JSON 时应当用 `structured()`，不要自己解析文本。
 
 ### 决定记录
 
