@@ -740,5 +740,4 @@ lite-model/
 | 2026-11-18 | 公开 API 收窄：`Call`、`Hook`、`Hooks`、`Registration` 从 `lite_model.hooks` 导入；`Reply`、`call_context`、`LiteModel.target()` 公开 | 发布后导出的名字都是承诺；宿主迁移要在调用前拿到 target |
 | 2026-11-18 | 不在中英混合的 RAG 上打开启发式自动路由（§15 实测：0.844 对 0.938，按语言分档） | lite-rag S14 两次真实运行；要路由先测分类器 |
 | 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |
-
 | 2026-11-18 | 0.2.0：宿主在 `ModelsConfig` 子类上设 `host_backends` / `host_roles`，配置逐字段叠在上面；只有另一个 `type` 才替换 backend | lite-mem S12 的默认 role 曾被内置 `openai` 顶到 api.openai.com；lite-rag 的 graph 默认值会被 `__ROLES` 整个顶掉。审查：同样的 `type` 照写一遍不能丢宿主的值；role 的 null 仍是"用顶层的值"（和 0.1 一样） |
