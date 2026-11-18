@@ -434,7 +434,7 @@ eval 数字一致、来源格式兼容。
 
 | 顺序 | 模块 | 要点 |
 | --- | --- | --- |
-| 1 | lite-mem | 功能最全（strict schema、Anthropic 强制工具、按 role 覆盖），最能检验接口。`produced_by` 继续存 `provider:model` |
+| 1 | lite-mem | 功能最全（strict schema、Anthropic 强制工具、按 role 覆盖），最能检验接口。`produced_by` 继续存 `provider:model`。**已迁移**（2026-11-18，lite-mem S12，用 0.1.1 的 `keyless`；12 个请求体前后相同） |
 | 2 | lite-rag | 三处 LLM 配置变成三个 role；`contextual`、`graph` 不可路由；`Completion.model_id` 改成实际回答的模型；`literag eval` 前后一致 |
 | 3 | llm-steward | 异步；顺带修它没整理过的 strict schema（raw `model_json_schema()`） |
 | — | lite-eval judge | 暂不迁移（§1 非目标） |
@@ -706,6 +706,11 @@ lite-model/
   分档：中文题全部去 1.7b。结论：现在的 §7.2 配置不值得在中英混合的 RAG 上打开；要路由，先在实际流量上测 `llm` 分类器或
   `keyword_tier_rules`。Proxy 本身不改变答案质量。
 - 各模块迁移时是否去掉 adapter、直接依赖 `lite_model.Model`（§12.1）。
+- **宿主改不了内置 backend**（lite-mem S12 发现，2026-11-18）：`ModelsConfig` 把给定的 `backends` 合并到固定的
+  `DEFAULT_BACKENDS` 上，宿主没有办法换掉某个内置 backend 的默认值。lite-mem 把 Ollama 的 `/v1` 叫做 `openai`
+  （为了保持 `openai:<model>` 的来源格式），只要另外配了一个 backend，`openai` 就会变回内置的 api.openai.com，默认
+  role 的请求会离开本机。lite-mem 目前用自己的 before-validator 挡住；更合适的做法是 lite-model 提供一个宿主可设的默认
+  backend 集合（`ClassVar` 或 `build()` 参数）。lite-rag 迁移时一并考虑。
 
 ### 决定记录
 
