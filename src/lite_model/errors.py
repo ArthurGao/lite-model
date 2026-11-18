@@ -34,4 +34,5 @@ class IgnoredParameter(ModelError):
 
 
 class ProvenanceUnknown(ModelError):
-    """A routed call whose answering model cannot be read (design §6)."""
+    """The answering model cannot be read: a routed call, or any call to a backend that names it
+    in a header (LiteLLM) that did not (design §6.3)."""

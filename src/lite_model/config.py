@@ -120,10 +120,6 @@ class Target:
         return f"role {self.role} ({self.backend}:{self.model})"
 
 
-# Backend types whose client lands in a later stage (design §14).
-_NOT_YET: dict[BackendType, str] = {"gateway": "S3", "litellm": "S3"}
-
-
 def target(config: ModelsConfig, role: str) -> Target:
     """`role`'s target from the defaults and its override; no checks beyond resolving."""
     override = config.roles.get(role, RoleConfig()).model_dump(exclude_none=True)
@@ -154,14 +150,14 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
     where = target.where
     profile = PROFILES[target.type]
     found = []
-    if target.type in _NOT_YET:
-        found.append(f"{where}: backend type {target.type} lands in {_NOT_YET[target.type]}")
     if target.api_key_env is not None and not os.environ.get(target.api_key_env):
         found.append(f"{where}: set {target.api_key_env}")
     if profile.protocol == "anthropic" and importlib.util.find_spec("anthropic") is None:
         found.append(f"{where}: install the extra: lite-model[anthropic]")
     if target.routed and not spec.roles[target.role].routable:
         found.append(f"{where}: {target.model} is a routing alias and the role is not routable")
+    if target.routed and profile.answered_header is None:
+        found.append(f"{where}: routing through {target.type} cannot tell which model answered")
     if target.channel in config.forbid_channels:
         found.append(f"{where}: channel {target.channel} is forbidden")
     if target.temperature is not None and not profile.supports_temperature:

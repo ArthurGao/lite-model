@@ -98,3 +98,10 @@ def test_litellm_is_never_a_python_dependency() -> None:
     packages = {p["name"] for p in lock["package"]}
     assert "lite-model" in packages
     assert "litellm" not in packages
+
+
+def test_no_alias_shares_its_name_with_its_model(config: dict[str, Any]) -> None:
+    # lite-model refuses an x-litellm-model-name header equal to the requested alias (it cannot
+    # tell the alias from the model): an alias named like its own model would always fail.
+    for m in config["model_list"]:
+        assert m["model_name"] != m["litellm_params"]["model"], m["model_name"]

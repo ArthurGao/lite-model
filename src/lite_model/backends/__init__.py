@@ -9,7 +9,14 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ValidationError
 
 from lite_model.config import Target
-from lite_model.errors import BadStructuredReply, EmptyReply, Truncated
+from lite_model.errors import (
+    BadStructuredReply,
+    EmptyReply,
+    IgnoredParameter,
+    ProvenanceUnknown,
+    Truncated,
+)
+from lite_model.profiles import PROFILES
 from lite_model.types import Message, Provenance, StructuredReply, TextReply, Usage
 
 Reply = TextReply | StructuredReply[Any]
@@ -34,7 +41,10 @@ class Backend(Protocol):
         response: Any,
         headers: Mapping[str, str],
         schema: type[BaseModel] | None,
-    ) -> Reply: ...
+        sent: Mapping[str, Any],
+    ) -> Reply:
+        """`sent` is what `request()` returned for this call: the fields actually sent."""
+        ...
 
 
 def sdk_client(cls: Any, target: Target, key: str | None, http_client: Any) -> Any:
@@ -51,27 +61,61 @@ def sdk_client(cls: Any, target: Target, key: str | None, http_client: Any) -> A
     )
 
 
+# SDK arguments and fields every request carries: never "a configured parameter" (§5).
+_NOT_OPTIONS = {"model", "messages", "extra_headers", "extra_body"}
+
+
+def _answered(target: Target, body_model: str | None, headers: Mapping[str, str]) -> str | None:
+    """The answering model: the body's `model`, or the profile's header when the body names an
+    alias (design §6.3). A guess is never recorded (AGENTS.md rule 4)."""
+    name = PROFILES[target.type].answered_header
+    if name is None:
+        return body_model or None
+    answered = headers.get(name)
+    # A header that only repeats the alias says nothing about the deployment (Codex S3); a
+    # routing alias with `return_raw_model_name` off answers with the alias in the body.
+    if not answered or answered == target.model or (target.routed and body_model != answered):
+        raise ProvenanceUnknown(f"{target.where}: the endpoint did not say which model answered")
+    return answered
+
+
+def _check_ignored(target: Target, headers: Mapping[str, str], sent: Mapping[str, Any]) -> None:
+    name = PROFILES[target.type].ignored_params_header
+    listed = headers.get(name) if name else None
+    if not listed:
+        return
+    dropped = {p.strip() for p in listed.split(",")} & (set(sent) - _NOT_OPTIONS)
+    if dropped:  # our own field names, never the endpoint's list
+        raise IgnoredParameter(f"{target.where}: the endpoint ignored {', '.join(sorted(dropped))}")
+
+
 def finish(
     target: Target,
     schema: type[BaseModel] | None,
-    answered: str | None,
-    usage: Usage,
+    sent: Mapping[str, Any],
+    headers: Mapping[str, str],
     *,
+    body_model: str | None,
+    usage: Usage,
     truncated: bool,
     unusable: str | None,
     payload: str | Mapping[str, Any] | None,
 ) -> Reply:
-    """The reply, or the error it amounts to (design §8). `answered` is the model the response
-    names, never config's (§6.1). `payload` is the text, the JSON text of a structured reply, or
-    a forced tool's input; messages never quote it. `unusable` is a stop reason that leaves no
-    usable answer whatever the payload holds (a refusal, a filter, a paused turn)."""
+    """The reply, or the error it amounts to (design §5, §6, §8), for every protocol. Who
+    answered and which parameters were dropped come from the profile's header rules; never from
+    config (§6.1). `payload` is the text, the JSON text of a structured reply, or a forced tool's
+    input; messages never quote it. `unusable` is a stop reason that leaves no usable answer
+    whatever the payload holds (a refusal, a filter, a paused turn)."""
+    headers = {k.lower(): v for k, v in headers.items()}  # profile names are lower case
+    _check_ignored(target, headers, sent)
     who = Provenance(
         role=target.role,
         backend=target.backend,
         requested=target.model,
-        answered=answered or None,
+        answered=_answered(target, body_model, headers),
         channel=target.channel,
         routed=target.routed,
+        via={h: headers[h] for h in PROFILES[target.type].via_headers if h in headers},
     )
     if truncated:
         raise Truncated(f"{target.where}: reply truncated at the output limit ({who.tag})")

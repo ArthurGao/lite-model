@@ -23,7 +23,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S2 (Anthropic and async) done 2026-11-18; S3 (gateway and litellm backends, routing guards, header provenance) is next** (design §14).
+**S3 (gateway and litellm backends, routing guards, header provenance) done 2026-11-18; S4 (usage, costs, Bounded, hooks) is next** (design §14).
 
 ## Rules
 

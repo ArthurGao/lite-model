@@ -20,6 +20,14 @@ class BackendProfile:
     supports_temperature: bool
     supports_reasoning_effort: bool  # sent as the top-level `reasoning_effort`
     requires_max_tokens: bool = False  # the API rejects a request without an output limit
+    # Where the answering model is named when the body's `model` is not it (design §6.3); a
+    # routing alias is allowed only on a backend type that has one (§6.2).
+    answered_header: str | None = None
+    # Header names are lower case: the keys Provenance.via records (lookups ignore case).
+    via_headers: tuple[str, ...] = ()  # provenance headers recorded in Provenance.via
+    ignored_params_header: str | None = None  # lists request fields the endpoint dropped (§5)
+    request_headers: tuple[tuple[str, str], ...] = ()  # sent with every request
+    role_tag: bool = False  # send the role as `metadata.tags` (design §7.3)
 
 
 PROFILES: dict[BackendType, BackendProfile] = {
@@ -70,6 +78,10 @@ PROFILES: dict[BackendType, BackendProfile] = {
         default_temperature=None,
         supports_temperature=True,
         supports_reasoning_effort=False,
+        # The body's `model` is the profile name, which is what answered as far as the client
+        # can tell until llm-gateway passes the upstream model on (design §15).
+        via_headers=("x-llmgw-backend", "x-llmgw-structured-output"),
+        ignored_params_header="x-llmgw-ignored-params",
     ),
     # LiteLLM 1.108.9 honours both names and translates per upstream (S0).
     "litellm": BackendProfile(
@@ -81,5 +93,11 @@ PROFILES: dict[BackendType, BackendProfile] = {
         default_temperature=None,
         supports_temperature=True,
         supports_reasoning_effort=True,
+        # A plain alias answers with body `model` = the alias; the header names the deployment's
+        # model (S0, KB/global/litellm §3). Retries stay in lite-model (design §8).
+        answered_header="x-litellm-model-name",
+        via_headers=("x-litellm-model-id", "x-litellm-model-group"),
+        request_headers=(("x-litellm-num-retries", "0"),),
+        role_tag=True,
     ),
 }

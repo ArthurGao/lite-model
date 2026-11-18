@@ -1,6 +1,7 @@
 """What crosses the interface (design §3): messages in; replies with provenance and usage out."""
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Literal
 
 from pydantic import BaseModel
@@ -24,6 +25,9 @@ class Provenance:
     answered: str | None  # the model that actually answered; None = the endpoint did not say
     channel: Channel
     routed: bool  # requested was a routing alias
+    # The endpoint's own provenance headers (lower-cased names from the profile's allow-list),
+    # e.g. x-litellm-model-id; empty when it sends none (design §6.2, §6.3).
+    via: Mapping[str, str] = field(default_factory=dict, hash=False)
 
     @property
     def tag(self) -> str:

@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S2 完成（2026-11-18），S3 是下一步。阶段与验收见 §14。
+状态：S3 完成（2026-11-18），S4 是下一步。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -83,6 +83,7 @@ class Provenance:
     answered: str | None      # the model that actually answered; None = the endpoint did not say
     channel: Channel          # local | api | subscription
     routed: bool              # requested was a routing alias
+    via: Mapping[str, str]    # the endpoint's own provenance headers (allow-listed per profile, lower-cased)
 
     @property
     def tag(self) -> str: ... # "backend:answered" (or "backend:requested?" when answered is None)
@@ -194,7 +195,7 @@ routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connec
   lite-rag 1024，迁移时请求体不变；主人 2026-11-18）。
 - `anthropic` 的 `base_url` 以 `/v1` 结尾：Anthropic SDK 自己拼 `/v1/messages`（OpenAI SDK 要 `/v1` 在
   `base_url` 里），照抄 OpenAI 风格的 URL 会请求 `/v1/v1/messages`，到第一次调用才失败。
-- S3 之前：gateway / litellm 的 client 还没写，在 `build()` 里报 `ConfigError`。
+- 路由别名用在没有 `answered_header` 的 backend type 上（gateway：拿不到实际模型，§6.2）。
 
 `litemodel dump-config`：读 `LITEMODEL_*` 环境变量和 `.env`，打印合并后的配置和每个已配置 role 的 target
 （key 只显示变量名），不发任何请求，也**不跑**启动校验（缺 key 时照样能看配置；KB §10.3）。
@@ -218,12 +219,18 @@ routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connec
 | `supports_temperature` | | anthropic 2.6.0：否（lite-rag 2026-11-08 核实） |
 | `reasoning_effort` | 怎么发：顶层参数、`extra_body`、不支持 | litellm：顶层参数；`"none"` 经 `ollama_chat/` 关掉 qwen3 的思考（实测），`"low"` 对 qwen3 **不减少**思考，未设 = 开着思考。gateway：**现在被丢弃**（`schemas.py` 没有该字段，进 `X-LLMGW-Ignored-Params`），llm-gateway 修好前配置了就报错而不是悄悄失效 |
 | `key_env` | 默认 key 变量 | |
+| `answered_header` | 实际回答的模型在哪个响应头（响应体 `model` 不是它时） | litellm：`x-litellm-model-name`；其他：无（读响应体） |
+| `via_headers` | 记进 `Provenance.via` 的来源头（允许列表） | litellm：`x-litellm-model-id`、`-model-group`；gateway：`X-LLMGW-Backend`、`X-LLMGW-Structured-Output` |
+| `ignored_params_header` | 列出被丢弃字段的响应头 | gateway：`X-LLMGW-Ignored-Params` |
+| `request_headers` | 每个请求带的头 | litellm：`x-litellm-num-retries: 0` |
+| `role_tag` | 把 role 作为 `metadata.tags` 发出（§7.3） | litellm：是 |
 
 思考 token 计入输出上限：经 LiteLLM 的 qwen3 开着思考时，`max_tokens` 小会得到空 `content` 和
 `finish_reason: "length"`（应报 `Truncated`，不是 `EmptyReply`）。
 
-gateway 后端在响应头里看到 `X-LLMGW-Ignored-Params` 列出配置过的参数时，抛 `ConfigError` 一类的错误
-（`IgnoredParameter`），不把被丢掉的设置当成生效。
+gateway 后端在响应头里看到 `X-LLMGW-Ignored-Params` 列出 lite-model **实际发出**的字段（`max_*_tokens`、
+`temperature`、`reasoning_effort`、`response_format`）时，抛 `IgnoredParameter`，不把被丢掉的设置当成生效；
+列出的其他字段（不是 lite-model 发的）不算错。错误里只有 lite-model 自己的字段名，不回显 gateway 的列表。
 
 ## 6. 来源（provenance）
 
@@ -238,9 +245,10 @@ gateway 后端在响应头里看到 `X-LLMGW-Ignored-Params` 列出配置过的�
 ### 6.2 经过 llm-gateway
 
 gateway 的响应 `model` 字段写的是 **profile 名**（`translate.py:194,256`），不转发上游的响应头。所以：
-- 固定 profile（一个 profile 对应一个模型）：`answered` = profile 名 + `X-LLMGW-Backend` 头，`routed=False`。
-- gateway 后面接 LiteLLM 路由别名：在 llm-gateway 透传上游模型之前（§15），`answered=None`，并且这种组合
-  在校验时**拒绝**（拿不到实际模型就不允许路由）。
+- 固定 profile（一个 profile 对应一个模型）：`answered` = profile 名（响应体 `model`），`via` 记
+  `x-llmgw-backend`（如 `claude-code`）和有时的 `x-llmgw-structured-output: prompted`，`routed=False`。
+- 路由别名配在 gateway 上（`backends.<gateway>.router_aliases`）：在 llm-gateway 透传上游模型之前（§15），
+  `build()` **拒绝**（gateway profile 没有 `answered_header`，拿不到实际模型就不允许路由）。
 
 ### 6.3 经过 LiteLLM
 
@@ -252,11 +260,14 @@ S0 实测（1.108.9，2026-11-18，`KB/global/litellm/README.md` §2–§3）：
 - 每个成功响应都有 `x-litellm-model-name`、`x-litellm-model-id`（选中的 deployment）、`x-litellm-model-group`
   （调用的别名）；错误响应没有。
 
-规则（S3 实现）：
-- `answered` = 响应头 `x-litellm-model-name`。两者都在时（路由别名 + `return_raw_model_name`），响应体
-  `model` 必须与头一致，不一致抛 `ProvenanceUnknown`。头缺失、或只能拿到别名本身时，也抛
-  `ProvenanceUnknown`；普通别名同样适用（拿不到实际模型就不冒充）。
-- 另记 `x-litellm-model-id` 和 `x-litellm-model-group`。
+规则（S3 实现，`openai_compat._answered`）：
+- `answered` = 响应头 `x-litellm-model-name`（profile 的 `answered_header`）。路由别名的响应体 `model` 必须与
+  头一致（`return_raw_model_name` 打开时一致），不一致抛 `ProvenanceUnknown`。头缺失时，普通别名和路由别名都
+  抛 `ProvenanceUnknown`（拿不到实际模型就不冒充）。头的值只是请求的别名本身时同样抛（区分不了别名和模型；
+  因此 proxy 配置里别名不能与它的模型串同名，`tests/unit/test_deploy_litellm.py` 守着）。
+- `via` 记 `x-litellm-model-id` 和 `x-litellm-model-group`（只记允许列表里的头，名字小写）。
+- `-m litellm` 实测（2026-11-18）：`workhorse` → `ollama_chat/qwen3:8b`；`smart-router` 对 "hi" →
+  `ollama_chat/qwen3:1.7b`，对一个长的多步编程问题 → `ollama_chat/qwen3:8b`；`routed=True`。
 - proxy 配置仍要求路由别名打开 `return_raw_model_name`（`tests/unit/test_deploy_litellm.py` 守着），让日志和
   响应体也指向实际模型。
 - 成本：`x-litellm-response-cost` 在 Ollama 模型的成功响应里**不存在**（没有价格），错误响应里是 `0`。有这个头
@@ -338,7 +349,8 @@ ModelError (base)
 │                         input, or a stop reason that leaves none (refusal, pause_turn, content_filter)
 ├─ BadStructuredReply     the reply does not validate against the schema
 ├─ IgnoredParameter       the endpoint reported a configured parameter as ignored (§5)
-└─ ProvenanceUnknown      a routed call whose answering model cannot be read (§6.3)
+└─ ProvenanceUnknown      the answering model cannot be read: a routed call, or any litellm call whose header is
+                          missing or only repeats the alias (§6.3)
 ```
 
 - **不做 fallback**：失败就抛，不换模型、不换后端。
@@ -440,7 +452,7 @@ lite-model/
 │  ├─ backends/          # __init__ (Backend protocol, provenance, finish), openai_compat.py
 │  │                     # (ollama/openai/gateway/litellm), anthropic_messages.py; each: connect,
 │  │                     # connect_async, endpoint, request(), reply(); client.py runs them
-│  ├─ provenance.py      # S3: reading answered model and headers per backend (§6); S1 reads body `model` in the backend
+│  │                     # (provenance: finish() in backends/__init__; header rules in openai_compat, from the profile)
 │  ├─ hooks.py           # Hook, Registration, Call
 │  ├─ bounded.py
 │  ├─ errors.py
@@ -534,7 +546,7 @@ lite-model/
 - 测试：单元 + 契约 115 个（契约测试同步、异步各一遍），`-m ollama` 4 个（新增一个异步 structured）。
   Anthropic 只有契约测试（付费 API，AGENTS.md 规则 11）。变异：S2 新代码 21 处、S1 的 44 处（重构后重新
   指向）全部被抓住。
-- 收尾 review：
+- 收尾 review（S2）：
   - `/simplify`（4 个角度）：构造请求移到 `try` 外（本地错误不再被包成 `CallFailed`）；两个后端共用
     `sdk_client()`（两家 SDK 的 `Timeout` 都是 `httpx2.Timeout`）；`finish()` 收 `answered`，自己建来源；
     anthropic 的两条检查按 `profile.protocol` 而非 `type`；测试的 `Caller` 去掉分支，`Connect` 是有类型的
@@ -549,6 +561,32 @@ lite-model/
     - Medium：结构化回复取第一个 `tool_use`，不看名字。成立，只读被强制的那个工具；回归测试先红。
     - Medium：SDK client 应按 key 的值共享而不是变量名。**拒绝**：按变量名是有意的（共享键里不放密钥值）；收益
       只是"两个变量存了同一个 key"时少建一个 client。记录里的"key"改为"key 变量"。
+
+**S3（2026-11-18）gateway 与 litellm。**
+- 两个 type 用同一个 OpenAI-compatible 模块，差异全是 `BackendProfile` 数据（§5 表）：`answered_header`、
+  `via_headers`、`ignored_params_header`、`request_headers`、`role_tag`。主人的决定：`Provenance` 加 `via`。
+- 来源：§6.2、§6.3（litellm 读头、拿不到抛 `ProvenanceUnknown`；gateway 读 profile 名，路由别名在 build 拒绝）。
+  `IgnoredParameter` 只对 lite-model 实际发出的字段。每个 litellm 请求带 `x-litellm-num-retries: 0` 和
+  `metadata.tags: ["role:<role>"]`。去掉了 S1 的"后续阶段才有"关卡（对应的测试换成"能 build"和"gateway
+  上的路由别名被拒"两条——那个关卡本来就是临时的）。
+- 测试：单元 + 契约 156 个；`-m ollama` 4 个；`-m litellm` 3 个（本机 proxy，Ollama 别名，`channel: local`）。
+  一个 live 测试的期望改过：路由器把"新西兰最大城市"分给 qwen3:1.7b，它答 Wellington——测的是路径不是模型
+  知识，改为算术题。变异：S3 15 处、S1 43 处、S2 21 处全部被抓住。
+- 收尾 review：
+  - `/simplify`（4 个角度）：三条响应头规则（读 answered、记 `via`、`IgnoredParameter`）从 `openai_compat` 移进
+    与协议无关的 `finish()`，和启动检查用同一份参数表数据（否则一个配了 `answered_header` 的 anthropic 协议
+    profile 会放行路由、回复时却记别名）；`reply()` 收到实际发出的请求，`IgnoredParameter` 对照它（不再重算
+    一遍"发了什么"，也不再重复算 `strict_schema`；S4 的 hook 也要它）；参数表里的头名全小写；live 测试读
+    `.env` 用 `python-dotenv`。跳过：测试配置工厂挪进 `tests/configs.py`（只有一个文件用）。
+  - Codex（只读）：
+    - P1 普通别名时，`x-litellm-model-name` 的值就是别名本身也被当作实际模型：成立，回归测试先红，改为抛
+      `ProvenanceUnknown`；代价是 proxy 配置里别名不能与它的模型串同名，加了部署测试守着（§6.3）。
+    - P2 查头依赖 SDK 的大小写不敏感映射：成立（实际运行不受影响），`finish()` 先把头名转小写，单元测试用
+      普通 dict 先红。
+    - 文档：§8 的 `ProvenanceUnknown` 只写了路由调用，改为包括任何 litellm 调用。
+  - Ollama 在收尾期间停了（不是 lite-model 停的）；主人同意后用 `brew services run ollama` 重新启动，重跑：
+    `-m ollama` 4 个、`-m litellm` 3 个通过；5 条 live 变异（Ollama 停着时只是连接失败，不算数）全部被对应的
+    断言抓住。
 
 ## 15. 待确认
 
@@ -580,4 +618,5 @@ lite-model/
 | 2026-11-18 | LiteLLM 的 `answered` 取响应头 `x-litellm-model-name`，响应体 `model` 只做一致性检查（§6.3） | S0 实测：普通别名的响应体 `model` 是别名，头才是实际模型 |
 | 2026-11-18 | 命名 backend：`backends.<name>: {type, base_url, api_key_env, channel, router_aliases}`，role 用名字引用（§4） | 主人的选择：一个宿主要能同时用两个 OpenAI-compatible 厂商；endpoint 和 key 只写一处 |
 | 2026-11-18 | `anthropic` 必须配 `max_output_tokens`，启动时检查，不猜默认值（§4） | 主人的选择：宿主迁移时写自己的旧值（lite-mem 2048、lite-rag 1024），请求体不变 |
+| 2026-11-18 | `Provenance.via`：端点自己的来源头（参数表里的允许列表，名字小写）；`tag` 不变 | 主人的选择：§6.2、§6.3 要求另记 deployment id、别名、gateway backend |
 | 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |

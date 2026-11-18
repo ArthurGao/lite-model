@@ -36,12 +36,13 @@ def endpoint(sdk: Any) -> Any:
 def request(
     target: Target, messages: Sequence[Message], schema: type[BaseModel] | None
 ) -> dict[str, Any]:
+    profile = PROFILES[target.type]
     params: dict[str, Any] = {
         "model": target.model,
         "messages": [{"role": m.role, "content": m.content} for m in messages],
     }
     if target.max_output_tokens is not None:
-        params[PROFILES[target.type].max_tokens_param] = target.max_output_tokens
+        params[profile.max_tokens_param] = target.max_output_tokens
     if target.temperature is not None:
         params["temperature"] = target.temperature
     if target.reasoning_effort is not None:
@@ -49,14 +50,20 @@ def request(
     if schema is not None:
         strict = {"name": schema.__name__, "schema": strict_schema(schema), "strict": True}
         params["response_format"] = {"type": "json_schema", "json_schema": strict}
+    if profile.request_headers:
+        params["extra_headers"] = dict(profile.request_headers)
+    if profile.role_tag:  # not the SDK's typed `metadata` (str values only): sent as is
+        params["extra_body"] = {"metadata": {"tags": [f"role:{target.role}"]}}
     return params
 
 
 def reply(
-    target: Target, response: Any, headers: Mapping[str, str], schema: type[BaseModel] | None
+    target: Target,
+    response: Any,
+    headers: Mapping[str, str],
+    schema: type[BaseModel] | None,
+    sent: Mapping[str, Any],
 ) -> Reply:
-    """S1-S2 read the body's `model`; backends that name the answering model in a header
-    (§6.2, §6.3) read it here, from `headers`."""
     usage = Usage()
     if response.usage is not None:
         details = response.usage.completion_tokens_details
@@ -69,8 +76,10 @@ def reply(
     return finish(
         target,
         schema,
-        response.model,
-        usage,
+        sent,
+        headers,
+        body_model=response.model,
+        usage=usage,
         truncated=choice is not None and choice.finish_reason == "length",
         unusable=choice.finish_reason if choice and choice.finish_reason in UNUSABLE else None,
         payload=choice.message.content if choice is not None else None,

@@ -54,19 +54,24 @@ def tool_use(name: str, data: dict[str, Any]) -> dict[str, Any]:
     return {"type": "tool_use", "id": "toolu_1", "name": name, "input": data}
 
 
+Scripted = tuple[int, dict[str, Any] | str] | tuple[int, dict[str, Any] | str, dict[str, str]]
+
+
 class Upstream:
     """Answers each request with the next scripted (status, body); records every request."""
 
-    def __init__(self, *replies: tuple[int, dict[str, Any] | str]) -> None:
+    def __init__(self, *replies: Scripted) -> None:
+        """Each reply is (status, body) or (status, body, response headers)."""
         self._replies = list(replies) or [(200, completion())]
         self.requests: list[httpx2.Request] = []
 
     def _handle(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
-        status, body = self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
+        status, body, *extra = self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
         # An error says "retry in 1 ms" (the SDK ignores 0): its backoff would otherwise sleep
         # ~0.5 s in every retry test.
         headers = {"retry-after-ms": "1"} if status >= 400 else {}
+        headers |= dict(*extra)
         if isinstance(body, str):
             return httpx2.Response(status, headers=headers, text=body)
         return httpx2.Response(status, headers=headers, json=body)

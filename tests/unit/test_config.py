@@ -135,7 +135,7 @@ def test_a_routing_alias_on_a_pinned_role_is_refused(monkeypatch: pytest.MonkeyP
     assert "role answer (litellm:smart-router): smart-router is a routing alias" not in problems
     pinned = ModelsConfig(roles={"graph": RoleConfig(backend="litellm", model="workhorse")})
     assert target(pinned, "graph").routed is False
-    assert "routing alias" not in _problems(pinned)
+    assert resolve(pinned, ROLES)["graph"].routed is False  # a pinned model is fine
 
 
 def test_a_forbidden_channel_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,16 +176,31 @@ def test_build_checks_before_any_call(monkeypatch: pytest.MonkeyPatch) -> None:
         build(ModelsConfig(backend="openai"), ROLES)
 
 
-def test_backend_types_of_later_stages_are_refused_with_the_rest(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_gateway_and_litellm_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Until S3 these types were refused at build(); S3 added their clients.
     monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
     config = ModelsConfig(
-        roles={"graph": RoleConfig(backend="litellm", model="workhorse"), "nope": RoleConfig()}
+        roles={
+            "answer": RoleConfig(backend="litellm", model="smart-router"),
+            "graph": RoleConfig(backend="gateway", model="claude-sub-haiku"),
+        }
+    )
+    model = build(config, ROLES)
+    assert hasattr(model, "text")
+    targets = resolve(config, ROLES)
+    assert (targets["answer"].routed, targets["answer"].channel) == (True, "api")
+    assert (targets["graph"].routed, targets["graph"].channel) == (False, "subscription")
+
+
+def test_a_routing_alias_through_the_gateway_is_refused() -> None:
+    # The gateway answers with its profile name and does not pass the upstream model on: a
+    # routed call through it could not say which model answered (design §6.2).
+    config = ModelsConfig(
+        backends={"gateway": BackendConfig(type="gateway", router_aliases=("sub-router",))},
+        roles={"answer": RoleConfig(backend="gateway", model="sub-router")},
     )
     problems = _problems(config)
-    assert "role graph (litellm:workhorse): backend type litellm lands in S3" in problems
-    assert "role nope: not declared by the host" in problems  # one error lists both
+    assert "role answer (gateway:sub-router): routing through gateway cannot tell" in problems
 
 
 def test_config_errors_never_carry_a_key_value(monkeypatch: pytest.MonkeyPatch) -> None:

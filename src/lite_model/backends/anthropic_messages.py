@@ -55,7 +55,11 @@ def request(
 
 
 def reply(
-    target: Target, response: Any, headers: Mapping[str, str], schema: type[BaseModel] | None
+    target: Target,
+    response: Any,
+    headers: Mapping[str, str],
+    schema: type[BaseModel] | None,
+    sent: Mapping[str, Any],
 ) -> Reply:
     blocks = response.content
     payload: str | Mapping[str, Any] | None
@@ -67,8 +71,10 @@ def reply(
     return finish(
         target,
         schema,
-        response.model,
-        Usage(input=response.usage.input_tokens, output=response.usage.output_tokens),
+        sent,
+        headers,
+        body_model=response.model,
+        usage=Usage(input=response.usage.input_tokens, output=response.usage.output_tokens),
         truncated=response.stop_reason in TRUNCATED,
         unusable=None if response.stop_reason in COMPLETE | TRUNCATED else response.stop_reason,
         payload=payload,

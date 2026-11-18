@@ -53,7 +53,7 @@ def _run(route: Route, messages: Sequence[Message], schema: type[BaseModel] | No
         response = raw.parse()
     except Exception as exc:
         raise _failed(target, exc) from exc
-    return backend.reply(target, response, raw.headers, schema)
+    return backend.reply(target, response, raw.headers, schema, request)
 
 
 async def _run_async(
@@ -68,7 +68,7 @@ async def _run_async(
             response = await response
     except Exception as exc:
         raise _failed(target, exc) from exc
-    return backend.reply(target, response, raw.headers, schema)
+    return backend.reply(target, response, raw.headers, schema, request)
 
 
 class _Routes:
