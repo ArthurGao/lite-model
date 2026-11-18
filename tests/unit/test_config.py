@@ -257,3 +257,42 @@ def test_an_anthropic_base_url_ending_in_v1_is_refused(monkeypatch: pytest.Monke
     assert "anthropic base_url must not end in /v1" in _problems(config)
     root = config.backends["claude"].model_copy(update={"base_url": "https://gw.example"})
     assert resolve(config.model_copy(update={"backends": {"claude": root}}), ROLES)
+
+
+def test_a_price_for_an_unknown_backend_is_refused() -> None:
+    config = ModelsConfig.model_validate(
+        {
+            "prices": {
+                "olama:qwen3:8b": {"input_per_mtok": 1, "output_per_mtok": 1},
+                "no-colon": {"input_per_mtok": 1, "output_per_mtok": 1},
+            }
+        }
+    )
+    problems = _problems(config)
+    assert "prices: 'olama:qwen3:8b' is not 'backend:model'" in problems
+    assert "prices: 'no-colon' is not 'backend:model'" in problems
+
+
+def test_a_target_carries_only_its_backends_prices() -> None:
+    config = ModelsConfig.model_validate(
+        {
+            "prices": {
+                "ollama:qwen3:8b": {"input_per_mtok": 1, "output_per_mtok": 2},
+                "openai:gpt-x": {"input_per_mtok": 5, "output_per_mtok": 5},
+            }
+        }
+    )
+    assert set(target(config, "answer").prices) == {"qwen3:8b"}
+    with pytest.raises(ValidationError):
+        ModelsConfig.model_validate(
+            {"prices": {"ollama:m": {"input_per_mtok": -1, "output_per_mtok": 0}}}
+        )
+
+
+@pytest.mark.parametrize("rate", [float("inf"), float("nan")])
+def test_a_non_finite_price_is_refused(rate: float) -> None:
+    # Codex S4: a price of inf passed `ge=0` and made cost_usd infinite.
+    with pytest.raises(ValidationError):
+        ModelsConfig.model_validate(
+            {"prices": {"ollama:m": {"input_per_mtok": rate, "output_per_mtok": 0}}}
+        )

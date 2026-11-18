@@ -28,6 +28,7 @@ class BackendProfile:
     ignored_params_header: str | None = None  # lists request fields the endpoint dropped (§5)
     request_headers: tuple[tuple[str, str], ...] = ()  # sent with every request
     role_tag: bool = False  # send the role as `metadata.tags` (design §7.3)
+    cost_header: str | None = None  # the endpoint's own cost in USD, preferred to prices (§9)
 
 
 PROFILES: dict[BackendType, BackendProfile] = {
@@ -99,5 +100,7 @@ PROFILES: dict[BackendType, BackendProfile] = {
         via_headers=("x-litellm-model-id", "x-litellm-model-group"),
         request_headers=(("x-litellm-num-retries", "0"),),
         role_tag=True,
+        # Absent for unpriced (Ollama) models; "0" on errors (S0, KB/global/litellm §3).
+        cost_header="x-litellm-response-cost",
     ),
 }

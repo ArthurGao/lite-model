@@ -48,3 +48,23 @@ def test_a_mixed_case_ignored_params_header_is_read() -> None:
             unusable=None,
             payload="hi",
         )
+
+
+def test_a_cost_that_overflows_is_unknown_not_infinite() -> None:
+    # Codex S4: finite rates times token counts can still overflow to inf.
+    config = ModelsConfig.model_validate(
+        {"prices": {"ollama:m": {"input_per_mtok": 1e308, "output_per_mtok": 1e308}}}
+    )
+    target = resolve(config.model_copy(update={"model": "m"}), ROLES)["answer"]
+    reply = finish(
+        target,
+        None,
+        {},
+        {},
+        body_model="m",
+        usage=Usage(10**6, 10**6),
+        truncated=False,
+        unusable=None,
+        payload="hi",
+    )
+    assert reply.usage.cost_usd is None

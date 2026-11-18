@@ -43,6 +43,15 @@ DEFAULT_BACKENDS: dict[str, BackendConfig] = {
 }
 
 
+class Price(BaseModel):
+    """USD per million tokens."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input_per_mtok: float = Field(ge=0, allow_inf_nan=False)
+    output_per_mtok: float = Field(ge=0, allow_inf_nan=False)
+
+
 class _CallSettings(BaseModel):
     """The call parameters a role may override."""
 
@@ -74,6 +83,9 @@ class ModelsConfig(_CallSettings):
     roles: dict[str, RoleConfig] = Field(default_factory=dict)
     backends: dict[str, BackendConfig] = Field(default_factory=lambda: dict(DEFAULT_BACKENDS))
     forbid_channels: tuple[Channel, ...] = ()  # tests and CI set ("subscription", "api")
+    # "backend:model" (as Provenance.tag names the answering model) -> price; used when the
+    # endpoint does not report the cost itself (design §9).
+    prices: dict[str, Price] = Field(default_factory=dict)
 
     @field_validator("backends")
     @classmethod
@@ -113,6 +125,7 @@ class Target:
     timeout_s: float
     connect_timeout_s: float
     max_retries: int
+    prices: Mapping[str, Price]  # this backend's entries of ModelsConfig.prices, by model
 
     @property
     def where(self) -> str:
@@ -143,6 +156,9 @@ def target(config: ModelsConfig, role: str) -> Target:
         timeout_s=c.timeout_s,
         connect_timeout_s=c.connect_timeout_s,
         max_retries=c.max_retries,
+        prices={
+            k.split(":", 1)[1]: v for k, v in c.prices.items() if k.startswith(f"{c.backend}:")
+        },
     )
 
 
@@ -175,6 +191,11 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
 def resolve(config: ModelsConfig, spec: RoleSpec) -> dict[str, Target]:
     """Every declared role's target, or one ConfigError listing every problem (design §4)."""
     problems = [f"role {r}: not declared by the host" for r in config.roles if r not in spec.roles]
+    problems += [
+        f"prices: {key!r} is not 'backend:model' with a configured backend"
+        for key in config.prices
+        if key.split(":", 1)[0] not in config.backends or ":" not in key
+    ]
     targets: dict[str, Target] = {}
     for role in spec.roles:
         try:

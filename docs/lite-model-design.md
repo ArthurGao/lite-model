@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S3 完成（2026-11-18），S4 是下一步。阶段与验收见 §14。
+状态：S4 完成（2026-11-18），S5 是下一步。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -115,8 +115,8 @@ class AsyncModel(Protocol):
     async def text(self, role: str, messages: Sequence[Message]) -> TextReply: ...
     async def structured[T: BaseModel](self, role: str, messages: Sequence[Message], schema: type[T]) -> StructuredReply[T]: ...
 
-def build(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.Client | None = None) -> Model: ...
-def build_async(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.AsyncClient | None = None) -> AsyncModel: ...
+def build(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.Client | None = None) -> LiteModel: ...  # a Model with .hooks
+def build_async(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.AsyncClient | None = None) -> AsyncLiteModel: ...
 ```
 
 - 调用方只传 role 和 messages；model、endpoint、key、参数都来自配置。
@@ -363,12 +363,21 @@ ModelError (base)
 
 - `Usage`：input、output、reasoning（`completion_tokens_details.reasoning_tokens`，有就记；经 LiteLLM →
   Ollama 时是 null，思考 token 已含在 `completion_tokens` 里，S0 实测）、cost_usd。
-- 失败和截断的调用也报告用量（挂在异常的 `usage` 属性上）。
-- 成本：优先用 proxy 的成本头；否则用配置里的 `prices`；都没有就是 `None`，不估算。订阅通道的成本是 `None`。
+- 失败和截断的调用也报告用量：端点回答了但答案不能用时（`Truncated`、`EmptyReply`、`BadStructuredReply`、
+  `IgnoredParameter`、`ProvenanceUnknown`），异常的 `usage` 是这次花掉的 token 和成本；`CallFailed`、
+  `ConfigError` 的 `usage` 是 `None`（没有回答，SDK 拿不到用量）。
+- 成本：优先用端点自己报的成本（profile 的 `cost_header`，litellm：`x-litellm-response-cost`，能读成非负有限
+  数才用）；否则用配置里的 `prices`（键 `"backend:model"`，model 是**实际回答**的模型，与 `Provenance.tag`
+  一致；USD / 百万 token）；都没有就是 `None`，不估算。订阅通道的成本永远是 `None`。`prices` 的键里 backend
+  不存在时，`build()` 拒绝。
+- hook 命中（`cached=True`）的回复带的是**当初那次**调用的 `usage`：这次省下的，不是这次花的。汇总花费的宿主
+  先看 `cached`。
 
 ## 10. 并发与 hook
 
-- `Bounded`：沿用 lite-rag `BoundedCalls`，限制同时在跑的调用数；`map()` 并发跑独立调用并保持顺序。
+- `Bounded(model, concurrency)` / `AsyncBounded`：沿用 lite-rag `BoundedCalls`，包一个 `Model` / `AsyncModel`，
+  所有经过它的调用（包括别的线程 / task 发起的）同时最多 `concurrency` 个；`map()` 并发跑独立调用、按输入
+  顺序返回，第一个错误抛出。
 - Hook（KB §10：注册、可撤销、可寻址）：
 
   ```python
@@ -380,10 +389,21 @@ ModelError (base)
   model.hooks.register(hook) -> Registration   # Registration.remove() unregisters
   ```
 
-  `Call` 含 role、解析后的 `Target`、messages、发出去的参数、schema 名和 schema hash：正好是 lite-cache L1
-  的缓存键需要的字段（lite-cache 设计 §L1）。缓存命中返回的回复保留**原来的** `Provenance`，另加
-  `cached=True`。
-- hook 抛错 = 调用失败（不吞掉）。
+  `Call` 含 role、解析后的 `Target`、messages、`request`（实际发出的 SDK 参数）、`params`（去掉 model、
+  messages 和传输层的 `extra_headers`）、schema、`schema_name`、`schema_hash`（strict schema 规范化 JSON 的
+  sha256）：正好是 lite-cache L1 的缓存键需要的字段（lite-cache 设计 §3.1）。
+- 顺序：每次调用取一份 hook 快照；`before` 按注册顺序，**第一个**返回回复的 hook 结束这次调用，不发请求，
+  返回的回复 `cached=True`（放在回复上，不在 `Provenance` 上：来源保持原来那次真正回答的模型；主人 2026-11-18）。
+  `after` 只对刚从端点拿到的回复运行（命中、失败的调用都不运行，缓存不会重复写）。
+- 没有 hook 时不构造 `Call`。hook 是同步的，同步和异步模型共用（lite-cache 的 store 是同步的）。
+- 名字唯一（重复注册报 `ConfigError`），`model.hooks[name]` 取回，`Registration.remove()` 撤销（重复撤销无害）。
+- hook 抛错 = 调用失败，原样抛出（不吞掉，不包装）；`before` 抛错时不发请求。`after` 抛错时这次已经计费的回复
+  和它的 `usage` 一起丢掉：`after` 不应抛错（lite-cache 写失败时照样返回，带 `store_error`）。
+- hook 看到的 `Call.request` 是实际请求的只读深拷贝：hook 改不了发出去的请求，缓存键描述的就是发出去的那个。
+- hook 返回的回复类型不对（`text()` 拿到 `StructuredReply`，`structured()` 拿到 `TextReply` 或别的 schema 的
+  值）时抛 `TypeError`，写明是哪个 hook——在出错的地方失败，而不是调用方读值时。
+- `build()` / `build_async()` 返回 `LiteModel` / `AsyncLiteModel`（满足 `Model` / `AsyncModel`，多一个
+  `.hooks`）；`Model` 协议本身不含 hooks，`FakeModel` 和宿主的 adapter 不必实现。
 
 ## 11. 测试工具
 
@@ -453,8 +473,8 @@ lite-model/
 │  │                     # (ollama/openai/gateway/litellm), anthropic_messages.py; each: connect,
 │  │                     # connect_async, endpoint, request(), reply(); client.py runs them
 │  │                     # (provenance: finish() in backends/__init__; header rules in openai_compat, from the profile)
-│  ├─ hooks.py           # Hook, Registration, Call
-│  ├─ bounded.py
+│  ├─ hooks.py           # Hook, Hooks, Registration, Call
+│  ├─ bounded.py         # Bounded, AsyncBounded
 │  ├─ errors.py
 │  ├─ testing.py         # FakeModel, AsyncFakeModel
 │  └─ cli.py             # litemodel dump-config
@@ -588,6 +608,33 @@ lite-model/
     `-m ollama` 4 个、`-m litellm` 3 个通过；5 条 live 变异（Ollama 停着时只是连接失败，不算数）全部被对应的
     断言抓住。
 
+**S4（2026-11-18）用量、成本、并发、hook。**
+- 用量：答案被拒的异常都带 `usage`（含成本），`CallFailed` 为 `None`。成本：端点报的成本头 > `prices`（按实际
+  回答的模型）> `None`；订阅为 `None`。`Price`、`ModelsConfig.prices`、`BackendProfile.cost_header`。
+- `Bounded` / `AsyncBounded`；`hooks.py`（`Call`、`Hook`、`Hooks`、`Registration`）；`LiteModel` /
+  `AsyncLiteModel`；回复加 `cached`（主人的决定：放回复上）。
+- 测试：单元 + 契约 202 个，`-m ollama` 4 个、`-m litellm` 3 个。写测试时发现一个测不到东西的测试：
+  `Bounded` 的并发上限只经 `map()` 测，而 `map()` 的线程池本身就只有 `concurrency` 个线程，去掉信号量也过；加了
+  8 个外部线程共用一个 `Bounded` 的测试。变异：S4 20 处，S1 43、S2 21、S3 18 处（重新指向后）全部被抓住。
+- 收尾 review：
+  - `/simplify`（4 个角度）：hook 返回的回复类型不对时抛 `TypeError`（`cast` 本会把错藏到很后面）；
+    `schema_hash` 改用与 lite-eval `canonical.py` 相同的规则（NFC、`ensure_ascii=False`、`allow_nan=False`），
+    照抄不 import（规则 9），测试对照写出的 lite-eval 算法；`Hooks` 去掉没有设计依据的 `__iter__` / `__len__`
+    （测试改为断言 `hooks[name]` 的 `KeyError`），`Registration` 走 `Hooks._remove`；执行器里 `_before` 的
+    三元组拆成 `call = ... if hooks else None` 加 `_hit()`；去掉 `_awaited`（`map` 的函数是协程）；`_number`
+    简化。又发现一个测不到东西的测试：`concurrency=1` 时 `map()` 是普通循环，"一次一个"永远成立——改为外部
+    8 线程，参数化 1 和 2 个槽位。跳过：hook 快照、`Call.params` 缓存、共享线程池（都是微秒级）。记进 §15：
+    `Call` 缺 lite-cache 的 scope / policy；命中也占 `Bounded` 槽位。§9 写明命中的 `usage` 是省下的。
+  - Codex（只读）5 条：
+    - High：`Call.request` 就是随后发给 SDK 的那个 dict，hook 改它就能让缓存键和实际请求不一致。成立，回归测试
+      先红；hook 拿到只读深拷贝（只在有 hook 时拷贝）。
+    - High：hook 回复类型不对时 `TypeError` 用了 `hit!r`，会带上回复内容（规则 8）。成立，先红；只写类型名。
+    - Medium：`Price` 接受 `inf`、乘积可能溢出成 `inf`。成立，先红；`allow_inf_nan=False`，非有限的结果记 `None`。
+    - Medium：`after()` 抛错或回复解析抛非 `ModelError` 时丢了 `usage`。**拒绝**：hook 异常按设计原样抛出，给任意
+      异常挂属性不干净；`after` 不应抛错，写进 §10。回复解析的形状错误由 SDK 的类型保证。
+    - Medium：`Call` 缺 scope / policy。**已在 §15**，lite-cache 接入时定。
+  - 改后变异 112 处（S4 30、S1 43、S2 21、S3 18）全部被抓住；`-m ollama` 4、`-m litellm` 3 通过。
+
 ## 15. 待确认
 
 - **llm-gateway 的两处修改**（在 llm-gateway repo 里做，不在本 repo）：
@@ -598,6 +645,15 @@ lite-model/
 - embedding 是否在 v2 收进来（lite-rag、lite-mem 各有一份 httpx2 embedding 客户端）。embedding 和索引绑定，
   永远不路由。
 - lite-eval 的 judge 以后是否迁移。
+- hook 只有 `before` / `after`：失败的调用不经过 hook。lite-cache S1 要按 `skip:<reason>` 计数（截断、空回复），
+  它包在调用外面时能从异常类型和 `usage` 得到这些；若要在 hook 里拿到，再加一个可选的 `failed(call, error)`。
+  lite-cache 接入时定。
+- `Call` 里没有 lite-cache L1 key 的 `scope`，也没有"这个调用点要不要缓存"的 policy（lite-cache §3：只有调用点
+  显式传 policy 才缓存）；一个 hook 注册在模型上、看见所有 role。两种做法：宿主在调用外通过 contextvar 把
+  scope / policy 交给 hook；或 `Call` 加一个调用方传入的不透明 `context`。lite-cache 接入时定，定之前多租户
+  宿主不要用 hook 做缓存（scope 错会把一个租户的答案给另一个租户）。
+- `Bounded` 包在模型外面：hook 命中也要等一个槽位（concurrency 1 时命中要等正在跑的调用）。若成问题，把槽位
+  移到执行器里只包住真正的请求。
 - 自动路由的效果：在 lite-rag 里做一个 stage，用 `literag eval` 比较固定 small / workhorse / flagship 与
   `smart-router` 的答案质量、token、延迟；先确认 eval 有答案质量指标。
 - 各模块迁移时是否去掉 adapter、直接依赖 `lite_model.Model`（§12.1）。
@@ -619,4 +675,6 @@ lite-model/
 | 2026-11-18 | 命名 backend：`backends.<name>: {type, base_url, api_key_env, channel, router_aliases}`，role 用名字引用（§4） | 主人的选择：一个宿主要能同时用两个 OpenAI-compatible 厂商；endpoint 和 key 只写一处 |
 | 2026-11-18 | `anthropic` 必须配 `max_output_tokens`，启动时检查，不猜默认值（§4） | 主人的选择：宿主迁移时写自己的旧值（lite-mem 2048、lite-rag 1024），请求体不变 |
 | 2026-11-18 | `Provenance.via`：端点自己的来源头（参数表里的允许列表，名字小写）；`tag` 不变 | 主人的选择：§6.2、§6.3 要求另记 deployment id、别名、gateway backend |
+| 2026-11-18 | hook 命中的回复 `cached=True` 放在回复上，`Provenance` 不变（§10） | 主人的选择：是否缓存属于这次调用，来源属于当初回答的模型 |
+| 2026-11-18 | `build()` 返回 `LiteModel`（`Model` + `.hooks`）；`Model` 协议不含 hooks（§3、§10） | `FakeModel` 和宿主 adapter 不必实现 hook；`model.hooks.register` 照设计可用 |
 | 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |

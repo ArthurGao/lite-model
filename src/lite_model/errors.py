@@ -2,9 +2,17 @@
 type only, never upstream text: SDKs and proxies can echo keys, auth headers or credentialed URLs.
 The original exception stays chained as `__cause__`."""
 
+from lite_model.types import Usage
+
 
 class ModelError(Exception):
-    """Base of every lite-model error."""
+    """Base of every lite-model error. `usage` is what the call spent when the endpoint answered
+    and the answer was refused (truncated, empty, invalid...): billed all the same (design §9).
+    None when nothing came back (a config error, a transport failure)."""
+
+    def __init__(self, message: str, *, usage: Usage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 class ConfigError(ModelError):

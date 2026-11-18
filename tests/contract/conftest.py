@@ -18,6 +18,7 @@ from lite_model import (
     build,
     build_async,
 )
+from lite_model.hooks import Hooks
 from tests.upstream import Upstream
 
 ROLES = RoleSpec({"answer": RolePolicy(routable=True), "graph": RolePolicy()})
@@ -35,6 +36,10 @@ class Caller:
         else:
             self._model = build_async(config, ROLES, http_client=upstream.async_client())
             self._wait = asyncio.run
+
+    @property
+    def hooks(self) -> Hooks:
+        return cast(Hooks, self._model.hooks)
 
     def text(self, role: str, messages: Sequence[Message]) -> TextReply:
         return cast(TextReply, self._wait(self._model.text(role, messages)))

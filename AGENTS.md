@@ -23,7 +23,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S3 (gateway and litellm backends, routing guards, header provenance) done 2026-11-18; S4 (usage, costs, Bounded, hooks) is next** (design §14).
+**S4 (usage, costs, Bounded, hooks) done 2026-11-18; S5 (README, deploy docs, v0.1.0 release wheel, final close-out over the whole library) is next** (design §14).
 
 ## Rules
 

@@ -50,6 +50,7 @@ class TextReply:
     text: str
     provenance: Provenance
     usage: Usage
+    cached: bool = False  # a hook answered (design §10); provenance stays the original one
 
 
 @dataclass(frozen=True)
@@ -57,3 +58,4 @@ class StructuredReply[T: BaseModel]:
     value: T
     provenance: Provenance
     usage: Usage
+    cached: bool = False  # a hook answered (design §10); provenance stays the original one
