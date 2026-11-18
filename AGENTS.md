@@ -23,7 +23,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0 (environment and LiteLLM verification) done 2026-11-18; S1 (core: types, config, errors, ollama / openai backends) is next** (design §14).
+**S1 (core: types, config, errors, ollama / openai backends) done 2026-11-18; S2 (Anthropic and async) is next** (design §14).
 
 ## Rules
 

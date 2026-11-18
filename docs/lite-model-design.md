@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S0 完成（2026-11-18），S1 是下一步。阶段与验收见 §14。
+状态：S1 完成（2026-11-18），S2 是下一步。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -114,11 +114,13 @@ class AsyncModel(Protocol):
     async def text(self, role: str, messages: Sequence[Message]) -> TextReply: ...
     async def structured[T: BaseModel](self, role: str, messages: Sequence[Message], schema: type[T]) -> StructuredReply[T]: ...
 
-def build(config: ModelsConfig, roles: RoleSpec) -> Model: ...
+def build(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.Client | None = None) -> Model: ...
 def build_async(config: ModelsConfig, roles: RoleSpec) -> AsyncModel: ...
 ```
 
 - 调用方只传 role 和 messages；model、endpoint、key、参数都来自配置。
+- `http_client`（S1 加）：替换 SDK 的 transport。宿主迁移时的契约测试（§12.2）用它记录真实 SDK 发出的请求体；
+  也可以用来接代理。lite-model 自己的契约测试同样这样做（`tests/upstream.py`）。
 - 各模块可以保留自己的 `LLM` Protocol（lite-rag 规则 1），用一个薄 adapter 包 lite-model；也可以直接
   依赖 `lite_model.Model`。迁移时各模块自己选（§12）。
 - `RoleSpec`：宿主模块声明自己有哪些 role、哪些可路由（§7.3）、哪些需要结构化输出。例：
@@ -153,30 +155,46 @@ roles:
   graph:
     reasoning_effort: none
     max_output_tokens: 2048
-backends:                   # endpoint settings per backend; defaults shown
-  ollama:    {base_url: "http://127.0.0.1:11434/v1"}
-  openai:    {api_key_env: OPENAI_API_KEY}
-  anthropic: {api_key_env: ANTHROPIC_API_KEY}
-  gateway:   {base_url: "http://127.0.0.1:8787/v1", api_key_env: null, channel: subscription}
-  litellm:   {base_url: "http://127.0.0.1:4400/v1", api_key_env: LITELLM_API_KEY,
-              router_aliases: [smart-router]}
+backends:                   # named endpoints; the five built-ins exist unless replaced by name
+  deepseek:  {type: openai, base_url: "https://api.deepseek.com/v1", api_key_env: DEEPSEEK_API_KEY}
+  # built-ins (type = name), fields left out take the profile's value (§5):
+  #   ollama    base_url http://127.0.0.1:11434/v1, no key, channel local
+  #   openai    SDK default URL, OPENAI_API_KEY, channel api
+  #   anthropic SDK default URL, ANTHROPIC_API_KEY, channel api
+  #   gateway   http://127.0.0.1:8787/v1, no key, channel subscription
+  #   litellm   http://127.0.0.1:4400/v1, LITELLM_API_KEY, channel api, router_aliases [smart-router]
 forbid_channels: []         # tests / CI set [subscription, api]
-prices: {}                  # optional: "backend:model" -> {input_per_mtok, output_per_mtok}
+prices: {}                  # S4: "backend:model" -> {input_per_mtok, output_per_mtok}
 ```
 
-每个 role 解析成一个 `Target`（frozen）：backend、model、base_url、api_key_env、channel、
-reasoning_effort、max_output_tokens、temperature、timeout、max_retries。和 lite-mem 一样：role 换了 backend
-时不沿用默认 backend 的 endpoint 和 key。
+**命名 backend**（S1 定，主人 2026-11-18）：`backends` 下每一项有名字和 `type`（`ollama`、`openai`、
+`anthropic`、`gateway`、`litellm`），`type` 决定协议和 §5 的参数表；`base_url`、`api_key_env`、`channel`、
+`router_aliases` 不写就取 `type` 的默认。role 用名字引用 backend，于是一个宿主可以同时用两个
+OpenAI-compatible 厂商（DeepSeek 和 DashScope 都是 `type: openai`），endpoint 和 key 只写在一处。五个内置名字
+默认存在，配置里写同名项就替换它。
+
+每个 role 解析成一个 `Target`（frozen）：backend（名字）、type、model、base_url、api_key_env、channel、
+routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connect_timeout_s、max_retries。endpoint
+和 key 属于 backend，所以 role 换了 backend 就换了 endpoint 和 key，不会沿用默认 backend 的。
+`max_output_tokens`、`reasoning_effort`、`temperature` 不配就不发（`temperature` 取 profile 默认，Ollama 0），
+这样宿主迁移时请求体不变（lite-mem 不发 `max_tokens`，lite-rag 发 1024）。
+字符串字段（backend、model、base_url、api_key_env、router alias）不接受空字符串：空值不会被悄悄读成
+"用默认值"。`temperature` 限 0–2。
 
 **启动时校验（`build()` 里，失败抛 `ConfigError`）**，依据 `KB/global/llm-app-architecture.md` §1.5：
-- 配置里出现宿主没声明的 role；宿主声明的 role 解析不出 target。
+- 配置里出现宿主没声明的 role；宿主声明的 role 解析不出 target（例如引用了不存在的 backend 名字）。
 - 缺 key（key 环境变量没设或为空）。
 - `anthropic` 后端但没装 extra `anthropic`。
 - 路由别名用在不可路由的 role 上（§7.3）。
 - target 的 channel 在 `forbid_channels` 里。
 - 后端不支持的参数（例如 `anthropic` 配了 `temperature`，见 §5 的参数表）。
+- 所有问题一次列出（一个 `ConfigError`，每条一行），不是遇到第一条就停。错误里只有 role、backend、model 和
+  key 的变量名，没有 key 的值。
+- S1–S2 期间：client 还没写的 backend type（anthropic 到 S2，gateway / litellm 到 S3）在 `build()` 里报
+  `ConfigError`。
 
-`litemodel dump-config`：打印合并后的最终配置（key 只显示变量名），不发任何请求（KB §10.3）。
+`litemodel dump-config`：读 `LITEMODEL_*` 环境变量和 `.env`，打印合并后的配置和每个已配置 role 的 target
+（key 只显示变量名），不发任何请求，也**不跑**启动校验（缺 key 时照样能看配置；KB §10.3）。
 
 ## 5. 后端
 
@@ -355,7 +373,10 @@ ModelError (base)
 
 - `lite_model.testing.FakeModel`：按 role 脚本化回复（文本或结构化对象，也可以是要抛的异常），记录每次请求
   （role、messages、schema），实现 `Model` 和 `AsyncModel`。来源为 `backend="fake"`。
-- 契约测试：用假的 SDK client 检查每个后端实际发出的请求体（参数名、strict schema、强制工具、header）。
+- 契约测试：**真的 SDK**，只把 transport 换成记录请求的假 endpoint（`build(..., http_client=...)`，
+  `tests/upstream.py`），检查每个后端实际发出的请求体（参数名、strict schema、强制工具、header）。
+- `tests/conftest.py` 在 `-m ollama` / `-m litellm` 以外拒绝一切 socket 连接：忘了注入 transport 的测试会失败，
+  而不是悄悄调用真的服务。
 - 标记：`-m ollama`（真实本地 Ollama，免费）；`-m litellm`（需要本机 proxy，**只用指向 Ollama 的别名**）；
   永远没有调用订阅或付费 API 的测试。测试配置设 `forbid_channels: [subscription, api]`。
 
@@ -406,17 +427,20 @@ lite-model/
 ├─ src/lite_model/
 │  ├─ __init__.py        # build, build_async, Model, AsyncModel, Message, replies, errors
 │  ├─ types.py           # Message, Provenance, Usage, replies, Channel
-│  ├─ config.py          # ModelsConfig, Target, RoleSpec, RolePolicy, validation
+│  ├─ config.py          # ModelsConfig, BackendConfig, Target, RoleSpec, RolePolicy, resolve() + checks
+│  ├─ client.py          # build(), Model, dispatch per role; SDK clients shared per endpoint
 │  ├─ profiles.py        # BackendProfile table (§5)
 │  ├─ schema.py          # strict_schema()
 │  ├─ backends/          # openai_compat.py (ollama/openai/gateway/litellm), anthropic.py
-│  ├─ provenance.py      # reading answered model and headers per backend (§6)
+│  ├─ provenance.py      # S3: reading answered model and headers per backend (§6); S1 reads body `model` in the backend
 │  ├─ hooks.py           # Hook, Registration, Call
 │  ├─ bounded.py
 │  ├─ errors.py
 │  ├─ testing.py         # FakeModel
 │  └─ cli.py             # litemodel dump-config
 ├─ tests/unit/ tests/contract/ tests/live/   # live: -m ollama / -m litellm
+│  tests/upstream.py     # recording fake endpoint, plugged in as the SDK transport (contract tests)
+│  tests/conftest.py     # refuses sockets outside -m ollama / -m litellm
 ├─ deploy/litellm/       # config.yaml, compose.yaml (pinned digest), README
 └─ docs/lite-model-design.md
 ```
@@ -462,6 +486,32 @@ lite-model/
   - Codex（只读）：1 条 P2，S0 记录写着 CI 跑 `compose config` 而 workflow 已去掉，已改记录（不加回：
     `compose run` 本身解析整份文件）。供应链、测试、设计一致性、版本锁定四个方面无 finding。
 
+**S1（2026-11-18）核心。**
+- 模块：`errors`、`types`、`profiles`（五个 type 的参数表）、`config`（命名 backend、`target()` / `resolve()`
+  与 §4 全部启动校验）、`schema`（`strict_schema`，与 lite-mem 相同的变换）、`backends/openai_compat`（同步
+  `text` / `structured`）、`client`（`build()`）、`testing`（`FakeModel`）、`cli`（`dump-config`）。
+- 主人的决定：命名 backend（§4）。我定的：`build(http_client=...)`（§3）；`dump-config` 不跑校验；client 还没写的
+  backend type 在 `build()` 报 `ConfigError`；`max_output_tokens` 不配不发。
+- 测试：单元 + 契约 57 个，`-m ollama` 3 个（text、structured、`Truncated`，qwen3:1.7b，真实 Ollama）。
+  每个测试都见过红：对生产代码做了 45 处单点改动（关掉每条校验、改 profile 值、从配置取 `answered`、错误带上游
+  原文、不重试、`FakeModel` 各分支、关掉网络守卫……），每处至少一个测试失败；为此修了一个测不到东西的测试
+  （`dump-config` 不带 key 时没配 role），删了一个不可能失败的测试和一段死代码（`JSONDecodeError`）。
+- 收尾 review：
+  - `/simplify`（4 个角度）：role 覆盖改用 `model_copy` 合并（去掉 12 行 `_pick` 和永远不会触发的 None 检查）；
+    profile 的 temperature 默认值在 `target()` 里解析（`dump-config` 显示实际发出的值）；"后续阶段的 backend"
+    检查并进 `resolve()`，与其他问题一次列出；`Target.where` 统一错误定位（规则 8）；profile 表改用关键字参数；
+    `_Model` 一个 dict；后端改用 `with_raw_response`，来源和用量在 `_read(target, response, headers)` 里读——S3
+    读响应头只改这一处；测试共用双厂商配置，重试测试带 `retry-after-ms: 1`（套件 1.5 s → 0.5 s）。
+    跳过：失败调用带用量（S4 验收项，留给 S4 连同测试）、按 `protocol` 分发和异步 `FakeModel`（S2）、
+    `strict_schema` 缓存（返回可变 dict，收益是微秒级）。改完重跑 44 处变异，全部被抓住。
+  - Codex（只读）3 条：
+    - P2 空字符串被 `or` 读成默认值：成立（后果不是 Codex 说的绕过 key 检查——`""` 回落到 `OPENAI_API_KEY` 仍被
+      检查——而是"无 key"的意图被悄悄改写）。回归测试先红，修为不接受空字符串。
+    - P2 `temperature` 不限范围：成立，回归测试先红，修为 0–2。
+    - P1 gateway 的 `reasoning_effort` 应由 `X-LLMGW-Ignored-Params` 报 `IgnoredParameter`：**拒绝（属于 S3）**。
+      llm-gateway 修好前在配置时拒绝正是 §5、§15 的要求；gateway 后端 S1 不可用；响应头检查是 S3 验收项。
+  - 待定（未改）：`type: openai` 的 endpoint 没法声明"不需要 key"（本地 vLLM 一类）。真有宿主需要时再加。
+
 ## 15. 待确认
 
 - **llm-gateway 的两处修改**（在 llm-gateway repo 里做，不在本 repo）：
@@ -490,3 +540,5 @@ lite-model/
 | 2026-11-18 | LiteLLM Proxy 端口 4400 | 4000–4010、4080–4090 已登记给 tenderted |
 | 2026-11-18 | cosign 以容器运行，作为 compose 的 `verify` 服务，`litellm` 依赖它成功退出 | 主人的选择：本机不装 cosign，一条 `compose up` 先验签再启动 |
 | 2026-11-18 | LiteLLM 的 `answered` 取响应头 `x-litellm-model-name`，响应体 `model` 只做一致性检查（§6.3） | S0 实测：普通别名的响应体 `model` 是别名，头才是实际模型 |
+| 2026-11-18 | 命名 backend：`backends.<name>: {type, base_url, api_key_env, channel, router_aliases}`，role 用名字引用（§4） | 主人的选择：一个宿主要能同时用两个 OpenAI-compatible 厂商；endpoint 和 key 只写一处 |
+| 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |
