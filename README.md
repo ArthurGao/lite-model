@@ -26,7 +26,7 @@ lite-model is not on PyPI. Each release attaches a wheel to its
 dependencies = ["lite-model"]          # or "lite-model[anthropic]" for the Anthropic backend
 
 [tool.uv.sources]
-lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.1.1/lite_model-0.1.1-py3-none-any.whl" }
+lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.2.0/lite_model-0.2.0-py3-none-any.whl" }
 ```
 
 Python 3.12. Pinned: `openai==3.46.0`, `pydantic==2.14.3`, `pydantic-settings==2.16.2`, `typer==0.27.3`;
@@ -66,8 +66,23 @@ city = model.structured("answer", [Message("user", "Largest city in New Zealand?
 resolved target (backend, model, endpoint) before any call, e.g. to record it in an index's identity.
 
 Hosts embed `ModelsConfig` in their own settings, so variables carry the host's prefix
-(`LITERAG_LLM__MODEL=…`). `litemodel dump-config` prints the merged config read from `LITEMODEL_*` and each
-role's resolved target; keys appear as variable names only, and nothing is called.
+(`LITERAG_LLM__MODEL=…`). A host's own defaults go on a subclass; whatever a config gives is merged on
+top, so adding a backend or tuning one role never drops a default it did not name:
+
+```python
+class LLMSettings(ModelsConfig):
+    backend: str = "ollama"
+    model: str = "qwen3:8b"
+    host_backends = {"ollama": BackendConfig(type="ollama", base_url="http://gpu:11434/v1")}
+    host_roles = {"graph": RoleConfig(reasoning_effort="none", max_output_tokens=2048)}
+```
+
+A backend or role given under an existing name changes it field by field (`{"ollama": {"base_url": …}}`;
+a role's `null` removes the host's value, so the role takes the top-level one); only a backend naming
+another `type` starts afresh.
+
+`litemodel dump-config` prints the merged config read from `LITEMODEL_*` and each role's resolved
+target; keys appear as variable names only, and nothing is called.
 
 ## Configuration
 

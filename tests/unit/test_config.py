@@ -1,5 +1,8 @@
 """Design §4: role resolution and every startup check `build()` runs."""
 
+from collections.abc import Mapping
+from typing import Any, ClassVar
+
 import pytest
 from pydantic import ValidationError
 
@@ -333,3 +336,84 @@ def test_a_keyless_endpoint_needs_no_key(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_keyless_and_a_key_variable_conflict() -> None:
     with pytest.raises(ValidationError, match="keyless and api_key_env cannot both be set"):
         BackendConfig(type="openai", keyless=True, api_key_env="OPENAI_API_KEY")
+
+
+# --- a host's own defaults (0.2.0; lite-mem S12, lite-rag S15) ---
+
+
+class HostConfig(ModelsConfig):
+    """What a host declares: its own default backends and per-role defaults, under any config."""
+
+    host_backends: ClassVar[Mapping[str, BackendConfig]] = {
+        "openai": BackendConfig(type="openai", base_url="http://127.0.0.1:11434/v1", keyless=True)
+    }
+    host_roles: ClassVar[Mapping[str, RoleConfig]] = {
+        "graph": RoleConfig(reasoning_effort="none", max_output_tokens=2048)
+    }
+
+
+def _host(data: dict[str, Any]) -> HostConfig:
+    return HostConfig.model_validate({"backend": "openai", "model": "qwen3:8b", **data})
+
+
+def test_a_hosts_defaults_hold_when_the_config_adds_something_else() -> None:
+    config = _host({
+        "backends": {"vendor": {"type": "openai", "base_url": "https://v.test/v1"}},
+        "roles": {"answer": {"model": "big"}},
+    })  # fmt: skip
+    answer, graph = target(config, "answer"), target(config, "graph")
+    # the host's `openai`, not the built-in api.openai.com
+    assert (answer.base_url, answer.api_key_env, answer.model) == (
+        "http://127.0.0.1:11434/v1", None, "big"
+    )  # fmt: skip
+    assert (graph.reasoning_effort, graph.max_output_tokens) == ("none", 2048)
+    assert {"ollama", "anthropic", "litellm", "vendor"} <= set(config.backends)
+    assert (_host({}).backends["openai"].keyless, target(_host({}), "graph").max_output_tokens) == (
+        True, 2048
+    )  # fmt: skip
+
+
+def test_an_entry_without_a_type_or_a_role_changes_the_default_field_by_field() -> None:
+    config = _host({
+        "backends": {"openai": {"base_url": "http://docker-host:11434/v1"},
+                     "ollama": {"base_url": "http://gpu:11434/v1"}},
+        "roles": {"graph": {"model": "qwen3:1.7b"}},
+    })  # fmt: skip
+    assert config.backends["openai"] == BackendConfig(
+        type="openai", base_url="http://docker-host:11434/v1", keyless=True
+    )
+    assert config.backends["ollama"] == BackendConfig(type="ollama", base_url="http://gpu:11434/v1")
+    graph = target(config, "graph")
+    assert (graph.model, graph.reasoning_effort, graph.max_output_tokens) == (
+        "qwen3:1.7b", "none", 2048
+    )  # fmt: skip
+
+
+def test_only_another_type_replaces_a_default_and_null_clears_a_field() -> None:
+    # the same type written out (`..._OPENAI__TYPE=openai`, to be explicit) keeps the host's fields:
+    # replacing would send the role to api.openai.com (altitude review, 0.2.0)
+    same = _host({"backends": {"openai": {"type": "openai", "base_url": "http://h:11434/v1"}}})
+    assert same.backends["openai"] == BackendConfig(
+        type="openai", base_url="http://h:11434/v1", keyless=True
+    )
+    config = _host({
+        "backends": {"openai": {"type": "gateway"}},
+        "roles": {"graph": {"reasoning_effort": None}},
+    })  # fmt: skip
+    assert config.backends["openai"] == BackendConfig(type="gateway")  # nothing of the host's
+    graph = target(config, "graph")
+    assert (graph.reasoning_effort, graph.max_output_tokens) == (None, 2048)
+
+
+def test_a_role_given_as_an_object_overrides_only_the_fields_it_set() -> None:
+    config = HostConfig(
+        backend="openai", model="qwen3:8b", roles={"graph": RoleConfig(reasoning_effort=None)}
+    )
+    graph = target(config, "graph")
+    assert (graph.reasoning_effort, graph.max_output_tokens) == (None, 2048)
+
+
+def test_a_null_removes_the_hosts_role_setting_and_the_role_takes_the_top_level_value() -> None:
+    # Codex 0.2.0: null in a role is "not set here", as in 0.1 (a role's None keeps the default)
+    config = _host({"reasoning_effort": "low", "roles": {"graph": {"reasoning_effort": None}}})
+    assert target(config, "graph").reasoning_effort == "low"

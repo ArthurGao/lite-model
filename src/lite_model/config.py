@@ -7,7 +7,7 @@ import importlib.util
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import (
     BaseModel,
@@ -49,7 +49,7 @@ class BackendConfig(BaseModel):
         return self
 
 
-# Present unless the config replaces them by name; a config adds more under new names.
+# Under a host's own (`host_backends`) and a config's backends (design §4); more go under new names.
 DEFAULT_BACKENDS: dict[str, BackendConfig] = {
     "ollama": BackendConfig(type="ollama"),
     "openai": BackendConfig(type="openai"),
@@ -98,17 +98,47 @@ class ModelsConfig(_CallSettings):
     timeout_s: float = Field(default=120.0, gt=0)
     connect_timeout_s: float = Field(default=10.0, gt=0)
     max_retries: int = Field(default=1, ge=0)
-    roles: dict[str, RoleConfig] = Field(default_factory=dict)
-    backends: dict[str, BackendConfig] = Field(default_factory=lambda: dict(DEFAULT_BACKENDS))
+    # A host's own defaults, set on its subclass (0.2.0): backends over the built-ins, and call
+    # settings per role; a config's entries are merged on top (`_layered`, design §4).
+    host_backends: ClassVar[Mapping[str, BackendConfig]] = {}
+    host_roles: ClassVar[Mapping[str, RoleConfig]] = {}
+    roles: dict[str, RoleConfig] = Field(default_factory=dict, validate_default=True)
+    backends: dict[str, BackendConfig] = Field(default_factory=dict, validate_default=True)
     forbid_channels: tuple[Channel, ...] = ()  # tests and CI set ("subscription", "api")
     # "backend:model" (as Provenance.tag names the answering model) -> price; used when the
     # endpoint does not report the cost itself (design §9).
     prices: dict[str, Price] = Field(default_factory=dict)
 
-    @field_validator("backends")
+    @field_validator("backends", mode="before")
     @classmethod
-    def _over_defaults(cls, value: dict[str, BackendConfig]) -> dict[str, BackendConfig]:
-        return {**DEFAULT_BACKENDS, **value}
+    def _over_defaults(cls, value: Any) -> Any:
+        return _layered({**DEFAULT_BACKENDS, **cls.host_backends}, value)
+
+    @field_validator("roles", mode="before")
+    @classmethod
+    def _over_host_roles(cls, value: Any) -> Any:
+        return _layered(cls.host_roles, value)
+
+
+def _layered(defaults: Mapping[str, BaseModel], value: Any) -> Any:
+    """`value`'s entries over `defaults` (design §4): an entry changes its default field by field
+    (a role's null removes the host's value: the role takes the top-level one), unless it names
+    another backend `type`, which starts afresh."""
+    if not isinstance(value, Mapping):
+        return value  # pydantic reports it
+    merged: dict[str, Any] = dict(defaults)
+    for name, given in value.items():
+        own = given.model_dump(exclude_unset=True) if isinstance(given, BaseModel) else given
+        base = defaults.get(name)
+        if base is not None and isinstance(own, Mapping) and own.get("type", _NO) in (
+            _NO, getattr(base, "type", _NO)
+        ):  # fmt: skip
+            own = {**base.model_dump(exclude_unset=True), **own}
+        merged[name] = own
+    return merged
+
+
+_NO = object()  # no `type` given (or a role, which has none)
 
 
 @dataclass(frozen=True)

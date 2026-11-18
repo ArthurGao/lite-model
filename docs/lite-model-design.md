@@ -156,7 +156,7 @@ roles:
   graph:
     reasoning_effort: none
     max_output_tokens: 2048
-backends:                   # named endpoints; the five built-ins exist unless replaced by name
+backends:                   # named endpoints; the five built-ins are always there (changed by name)
   deepseek:  {type: openai, base_url: "https://api.deepseek.com/v1", api_key_env: DEEPSEEK_API_KEY}
   # built-ins (type = name), fields left out take the profile's value (§5):
   #   ollama    base_url http://127.0.0.1:11434/v1, no key, channel local
@@ -171,10 +171,17 @@ prices: {}                  # S4: "backend:model" -> {input_per_mtok, output_per
 **命名 backend**（S1 定，主人 2026-11-18）：`backends` 下每一项有名字和 `type`（`ollama`、`openai`、
 `anthropic`、`gateway`、`litellm`），`type` 决定协议和 §5 的参数表；`base_url`、`api_key_env`、`channel`、
 `router_aliases` 不写就取 `type` 的默认。role 用名字引用 backend，于是一个宿主可以同时用两个
-OpenAI-compatible 厂商（DeepSeek 和 DashScope 都是 `type: openai`），endpoint 和 key 只写在一处。
+OpenAI-compatible 厂商（DeepSeek 和 DashScope 都是 `type: openai`），endpoint 和 key 只写在一处。五个内置名字一直存在。
+
 `keyless: true`（0.1.1）：这个 endpoint 不要 key（例如把 Ollama 的 `/v1` 当 `type: openai` 用，什么 Ollama 专有的参数
-都不加），SDK 拿到占位 key；和 `api_key_env` 同时写会被拒绝。五个内置名字
-默认存在，配置里写同名项就替换它。
+都不加），SDK 拿到占位 key；和 `api_key_env` 同时写会被拒绝。
+
+**宿主自己的默认值**（0.2.0，lite-mem S12 发现）：宿主在 `ModelsConfig` 的子类上设 `host_backends`（盖在内置 backend
+上面）和 `host_roles`（每个 role 的调用参数）。配置给的值叠在上面：同名的 backend 或 role 逐字段改它（例如只改内置
+`ollama` 的 `base_url`；role 里写 null 去掉宿主给这个 role 的值，这个 role 回到顶层的值），只有写了**另一个** `type` 的 backend 才从头开始——同样的 `type` 照写一遍
+（`..._OPENAI__TYPE=openai`）不会丢掉宿主的 `base_url`、`keyless`。于是配置**加**一个 backend 或改一个 role，不会把它
+没提到的默认值弄丢。0.1.x 里配置了任何 backend 都会让同名的内置值顶掉宿主的，lite-mem 的默认 role 因此会被送到
+api.openai.com。
 
 每个 role 解析成一个 `Target`（frozen）：backend（名字）、type、model、base_url、api_key_env、channel、
 routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connect_timeout_s、max_retries。endpoint
@@ -706,11 +713,8 @@ lite-model/
   分档：中文题全部去 1.7b。结论：现在的 §7.2 配置不值得在中英混合的 RAG 上打开；要路由，先在实际流量上测 `llm` 分类器或
   `keyword_tier_rules`。Proxy 本身不改变答案质量。
 - 各模块迁移时是否去掉 adapter、直接依赖 `lite_model.Model`（§12.1）。
-- **宿主改不了内置 backend**（lite-mem S12 发现，2026-11-18）：`ModelsConfig` 把给定的 `backends` 合并到固定的
-  `DEFAULT_BACKENDS` 上，宿主没有办法换掉某个内置 backend 的默认值。lite-mem 把 Ollama 的 `/v1` 叫做 `openai`
-  （为了保持 `openai:<model>` 的来源格式），只要另外配了一个 backend，`openai` 就会变回内置的 api.openai.com，默认
-  role 的请求会离开本机。lite-mem 目前用自己的 before-validator 挡住；更合适的做法是 lite-model 提供一个宿主可设的默认
-  backend 集合（`ClassVar` 或 `build()` 参数）。lite-rag 迁移时一并考虑。
+- ~~**宿主改不了内置 backend**~~（lite-mem S12 发现，2026-11-18）：0.2.0 已做（§4 宿主自己的默认值）。lite-mem 还在用
+  自己的 before-validator，下次升级 lite-model 时改用 `host_backends` 并删掉它。
 
 ### 决定记录
 
@@ -736,3 +740,5 @@ lite-model/
 | 2026-11-18 | 公开 API 收窄：`Call`、`Hook`、`Hooks`、`Registration` 从 `lite_model.hooks` 导入；`Reply`、`call_context`、`LiteModel.target()` 公开 | 发布后导出的名字都是承诺；宿主迁移要在调用前拿到 target |
 | 2026-11-18 | 不在中英混合的 RAG 上打开启发式自动路由（§15 实测：0.844 对 0.938，按语言分档） | lite-rag S14 两次真实运行；要路由先测分类器 |
 | 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |
+
+| 2026-11-18 | 0.2.0：宿主在 `ModelsConfig` 子类上设 `host_backends` / `host_roles`，配置逐字段叠在上面；只有另一个 `type` 才替换 backend | lite-mem S12 的默认 role 曾被内置 `openai` 顶到 api.openai.com；lite-rag 的 graph 默认值会被 `__ROLES` 整个顶掉。审查：同样的 `type` 照写一遍不能丢宿主的值；role 的 null 仍是"用顶层的值"（和 0.1 一样） |
