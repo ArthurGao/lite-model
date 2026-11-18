@@ -26,7 +26,7 @@ lite-model is not on PyPI. Each release attaches a wheel to its
 dependencies = ["lite-model"]          # or "lite-model[anthropic]" for the Anthropic backend
 
 [tool.uv.sources]
-lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.1.0/lite_model-0.1.0-py3-none-any.whl" }
+lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.1.1/lite_model-0.1.1-py3-none-any.whl" }
 ```
 
 Python 3.12. Pinned: `openai==3.46.0`, `pydantic==2.14.3`, `pydantic-settings==2.16.2`, `typer==0.27.3`;
@@ -85,6 +85,7 @@ roles:                          # per role; a field left out keeps the default
   extract: {backend: deepseek, model: deepseek-chat}
 backends:                       # the five built-ins exist (type = name); add more by name
   deepseek: {type: openai, base_url: "https://api.deepseek.com/v1", api_key_env: DEEPSEEK_API_KEY}
+  local: {type: openai, base_url: "http://127.0.0.1:11434/v1", keyless: true}   # no key, nothing Ollama-specific
 forbid_channels: []             # tests and CI: [subscription, api]
 prices:                         # optional, USD per million tokens, by "backend:answering-model"
   "deepseek:deepseek-chat": {input_per_mtok: 0.27, output_per_mtok: 1.10}

@@ -9,7 +9,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from lite_model.errors import ConfigError
 from lite_model.profiles import PROFILES, BackendType
@@ -31,6 +38,15 @@ class BackendConfig(BaseModel):
     api_key_env: Name | None = None  # the variable holding the key; never the key itself
     channel: Channel | None = None
     router_aliases: tuple[Name, ...] = ()  # litellm: the names that are routing aliases (§7.3)
+    # The endpoint takes no key, whatever the type's profile says (e.g. Ollama's /v1 used as
+    # `type: openai`); the SDK gets a placeholder. 0.1.1, for lite-mem.
+    keyless: bool = False
+
+    @model_validator(mode="after")
+    def _key_or_keyless(self) -> "BackendConfig":
+        if self.keyless and self.api_key_env is not None:
+            raise ValueError("keyless and api_key_env cannot both be set")
+        return self
 
 
 # Present unless the config replaces them by name; a config adds more under new names.
@@ -149,7 +165,7 @@ def target(config: ModelsConfig, role: str) -> Target:
         type=backend.type,
         model=c.model,
         base_url=backend.base_url or profile.base_url,
-        api_key_env=backend.api_key_env or profile.key_env,
+        api_key_env=None if backend.keyless else backend.api_key_env or profile.key_env,
         channel=backend.channel or profile.channel,
         routed=c.model in backend.router_aliases,
         temperature=c.temperature if c.temperature is not None else profile.default_temperature,

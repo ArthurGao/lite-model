@@ -308,3 +308,28 @@ def test_a_built_model_tells_each_roles_target() -> None:
         assert (graph.backend, graph.model, graph.role) == ("ollama", "qwen3:1.7b", "graph")
         with pytest.raises(ConfigError, match="role nope: not declared"):
             model.target("nope")
+
+
+def test_a_keyless_endpoint_needs_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 0.1.1 (lite-mem): an OpenAI-protocol endpoint that takes no key, e.g. Ollama's /v1 used as
+    # `type: openai` so nothing Ollama-specific (temperature 0) is added to the request.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config = local_validate(
+        {
+            "backend": "openai",
+            "backends": {
+                "openai": {
+                    "type": "openai",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "keyless": True,
+                }
+            },
+        }
+    )
+    resolved = resolve(config, ROLES)["answer"]
+    assert (resolved.type, resolved.api_key_env, resolved.channel) == ("openai", None, "api")
+
+
+def test_keyless_and_a_key_variable_conflict() -> None:
+    with pytest.raises(ValidationError, match="keyless and api_key_env cannot both be set"):
+        BackendConfig(type="openai", keyless=True, api_key_env="OPENAI_API_KEY")

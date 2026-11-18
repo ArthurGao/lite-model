@@ -171,7 +171,9 @@ prices: {}                  # S4: "backend:model" -> {input_per_mtok, output_per
 **命名 backend**（S1 定，主人 2026-11-18）：`backends` 下每一项有名字和 `type`（`ollama`、`openai`、
 `anthropic`、`gateway`、`litellm`），`type` 决定协议和 §5 的参数表；`base_url`、`api_key_env`、`channel`、
 `router_aliases` 不写就取 `type` 的默认。role 用名字引用 backend，于是一个宿主可以同时用两个
-OpenAI-compatible 厂商（DeepSeek 和 DashScope 都是 `type: openai`），endpoint 和 key 只写在一处。五个内置名字
+OpenAI-compatible 厂商（DeepSeek 和 DashScope 都是 `type: openai`），endpoint 和 key 只写在一处。
+`keyless: true`（0.1.1）：这个 endpoint 不要 key（例如把 Ollama 的 `/v1` 当 `type: openai` 用，什么 Ollama 专有的参数
+都不加），SDK 拿到占位 key；和 `api_key_env` 同时写会被拒绝。五个内置名字
 默认存在，配置里写同名项就替换它。
 
 每个 role 解析成一个 `Target`（frozen）：backend（名字）、type、model、base_url、api_key_env、channel、
@@ -675,6 +677,11 @@ lite-model/
 - 验收"宿主可以从 wheel 安装"：一个新项目用 `[tool.uv.sources]` 指向 release 的 wheel URL，装
   `lite-model[anthropic]`（lite-model 0.1.0、openai 3.46.0、anthropic 2.6.0），对本机 Ollama：`text` 回 `pong`，
   来源 `ollama:qwen3:1.7b`，有用量；`build_async` + `call_context` 的 `structured` 回 `result=42`。
+
+**0.1.1（2026-11-18）`keyless` backend。** lite-mem 迁移（它的 S12）需要：它现在用 OpenAI 协议连 Ollama，不发 temperature、
+不要 key；`type: ollama` 会多发 `temperature: 0.0`，`type: openai` 要 `OPENAI_API_KEY`。主人选择加 `BackendConfig.keyless`
+（而不是接受请求体变化）。测试先红（配置解析、占位 key 和不发 temperature 的请求、与 `api_key_env` 冲突），变异 2 处都被抓住。
+生产代码约 12 行、一个文件：按全局规则这是小改动，不做 `/simplify` 和 Codex 收尾。
 
 ## 15. 待确认
 

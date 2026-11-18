@@ -20,7 +20,7 @@ from lite_model import (
     build_async,
     strict_schema,
 )
-from tests.configs import local, two_vendors
+from tests.configs import local, local_validate, two_vendors
 from tests.contract.conftest import ROLES, Connect
 from tests.upstream import Upstream, completion
 
@@ -242,3 +242,24 @@ def test_a_filtered_reply_is_no_usable_reply(connect: Connect) -> None:
     up = Upstream((200, completion("I can't help with th", finish="content_filter")))
     with pytest.raises(EmptyReply, match=r"no usable reply \(stop reason content_filter\)"):
         connect(up).text("answer", ASK)
+
+
+def test_a_keyless_openai_endpoint_sends_the_placeholder_key(connect: Connect) -> None:
+    # 0.1.1: the SDK insists on a key; a keyless endpoint gets "unused", and no temperature.
+    up = Upstream()
+    config = local_validate(
+        {
+            "backend": "openai",
+            "max_retries": 0,
+            "backends": {
+                "openai": {
+                    "type": "openai",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "keyless": True,
+                }
+            },
+        }
+    )
+    connect(up, config).text("answer", ASK)
+    assert up.requests[0].headers["authorization"] == "Bearer unused"
+    assert "temperature" not in up.body()
