@@ -121,7 +121,7 @@ class Target:
 
 
 # Backend types whose client lands in a later stage (design §14).
-_NOT_YET: dict[BackendType, str] = {"anthropic": "S2", "gateway": "S3", "litellm": "S3"}
+_NOT_YET: dict[BackendType, str] = {"gateway": "S3", "litellm": "S3"}
 
 
 def target(config: ModelsConfig, role: str) -> Target:
@@ -158,7 +158,7 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
         found.append(f"{where}: backend type {target.type} lands in {_NOT_YET[target.type]}")
     if target.api_key_env is not None and not os.environ.get(target.api_key_env):
         found.append(f"{where}: set {target.api_key_env}")
-    if target.type == "anthropic" and importlib.util.find_spec("anthropic") is None:
+    if profile.protocol == "anthropic" and importlib.util.find_spec("anthropic") is None:
         found.append(f"{where}: install the extra: lite-model[anthropic]")
     if target.routed and not spec.roles[target.role].routable:
         found.append(f"{where}: {target.model} is a routing alias and the role is not routable")
@@ -168,6 +168,11 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
         found.append(f"{where}: temperature is not supported by {target.type}")
     if target.reasoning_effort is not None and not profile.supports_reasoning_effort:
         found.append(f"{where}: reasoning_effort is not supported by {target.type}")
+    if target.max_output_tokens is None and profile.requires_max_tokens:
+        found.append(f"{where}: {target.type} needs max_output_tokens")
+    if profile.protocol == "anthropic" and (target.base_url or "").rstrip("/").endswith("/v1"):
+        # The Anthropic SDK appends /v1/messages; the OpenAI SDK wants /v1 in base_url.
+        found.append(f"{where}: anthropic base_url must not end in /v1 (the SDK adds it)")
     return found
 
 

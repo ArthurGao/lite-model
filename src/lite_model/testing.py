@@ -1,4 +1,5 @@
-"""`FakeModel` (design §11): scripted replies per role, every call recorded; no network."""
+"""`FakeModel` and `AsyncFakeModel` (design §11): scripted replies per role, every call
+recorded; no network."""
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -69,3 +70,22 @@ class FakeModel:
             )
         data = reply.model_dump() if isinstance(reply, BaseModel) else reply
         return StructuredReply(schema.model_validate(data), self._provenance(role), Usage())
+
+
+class AsyncFakeModel:
+    """Implements `AsyncModel`, with the same scripts and the same `calls` as `FakeModel`."""
+
+    def __init__(self, **scripts: Script) -> None:
+        self._fake = FakeModel(**scripts)
+
+    @property
+    def calls(self) -> list[FakeCall]:
+        return self._fake.calls
+
+    async def text(self, role: str, messages: Sequence[Message]) -> TextReply:
+        return self._fake.text(role, messages)
+
+    async def structured[T: BaseModel](
+        self, role: str, messages: Sequence[Message], schema: type[T]
+    ) -> StructuredReply[T]:
+        return self._fake.structured(role, messages, schema)

@@ -16,11 +16,13 @@ class CallFailed(ModelError):
 
 
 class Truncated(ModelError):
-    """The reply stopped at the output limit (`finish_reason: length`)."""
+    """The reply was cut short (`finish_reason: length`; `stop_reason: max_tokens` or
+    `model_context_window_exceeded`)."""
 
 
 class EmptyReply(ModelError):
-    """No text in the reply (e.g. the whole budget went to thinking)."""
+    """No usable answer: no text (e.g. the whole budget went to thinking), no forced-tool input,
+    or a stop reason that leaves none (a refusal, a content filter, a paused turn)."""
 
 
 class BadStructuredReply(ModelError):

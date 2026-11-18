@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S1 完成（2026-11-18），S2 是下一步。阶段与验收见 §14。
+状态：S2 完成（2026-11-18），S3 是下一步。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -115,7 +115,7 @@ class AsyncModel(Protocol):
     async def structured[T: BaseModel](self, role: str, messages: Sequence[Message], schema: type[T]) -> StructuredReply[T]: ...
 
 def build(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.Client | None = None) -> Model: ...
-def build_async(config: ModelsConfig, roles: RoleSpec) -> AsyncModel: ...
+def build_async(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.AsyncClient | None = None) -> AsyncModel: ...
 ```
 
 - 调用方只传 role 和 messages；model、endpoint、key、参数都来自配置。
@@ -190,8 +190,11 @@ routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connec
 - 后端不支持的参数（例如 `anthropic` 配了 `temperature`，见 §5 的参数表）。
 - 所有问题一次列出（一个 `ConfigError`，每条一行），不是遇到第一条就停。错误里只有 role、backend、model 和
   key 的变量名，没有 key 的值。
-- S1–S2 期间：client 还没写的 backend type（anthropic 到 S2，gateway / litellm 到 S3）在 `build()` 里报
-  `ConfigError`。
+- `anthropic` 没配 `max_output_tokens`（Messages API 必须带 `max_tokens`；不猜默认值，宿主自己写，lite-mem 2048、
+  lite-rag 1024，迁移时请求体不变；主人 2026-11-18）。
+- `anthropic` 的 `base_url` 以 `/v1` 结尾：Anthropic SDK 自己拼 `/v1/messages`（OpenAI SDK 要 `/v1` 在
+  `base_url` 里），照抄 OpenAI 风格的 URL 会请求 `/v1/v1/messages`，到第一次调用才失败。
+- S3 之前：gateway / litellm 的 client 还没写，在 `build()` 里报 `ConfigError`。
 
 `litemodel dump-config`：读 `LITEMODEL_*` 环境变量和 `.env`，打印合并后的配置和每个已配置 role 的 target
 （key 只显示变量名），不发任何请求，也**不跑**启动校验（缺 key 时照样能看配置；KB §10.3）。
@@ -202,7 +205,7 @@ routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connec
 | --- | --- | --- | --- | --- |
 | `ollama` | OpenAI SDK → Ollama `/v1` | local | strict `json_schema` | 响应 `model` |
 | `openai` | OpenAI SDK，任意 OpenAI-compatible 端点 | api | strict `json_schema` | 响应 `model` |
-| `anthropic` | Anthropic SDK Messages | api | 一个强制工具，`input_schema` = strict schema | 响应 `model` |
+| `anthropic` | Anthropic SDK Messages（system 消息用 `\n\n` 拼进 `system` 字段；`max_tokens` / `model_context_window_exceeded` → `Truncated`；`end_turn` / `stop_sequence` / `tool_use` 是完整回复；其他 stop_reason（`refusal`、`pause_turn`……）→ `EmptyReply`；结构化回复只读被强制的那个工具的 input） | api | 一个强制工具，`input_schema` = strict schema，`tool_choice` 指定它（与 lite-mem 相同） | 响应 `model` |
 | `gateway` | OpenAI SDK → llm-gateway | subscription（可按 profile 覆盖） | strict `json_schema`；gateway 对 DeepSeek / Qwen 降级为 prompted，响应头 `X-LLMGW-Structured-Output: prompted` 记进来源 | 见 §6.2 |
 | `litellm` | OpenAI SDK → LiteLLM Proxy | api | strict `json_schema`（S0 经 `ollama_chat/` 核实；其他上游接入时再核实） | 见 §6.3 |
 
@@ -330,8 +333,9 @@ general_settings:
 ModelError (base)
 ├─ ConfigError            config invalid; raised by build(), never at call time if avoidable
 ├─ CallFailed             transport / HTTP error / SDK exception, after retries on the same target
-├─ Truncated              finish_reason "length" / stop_reason "max_tokens"
-├─ EmptyReply             no text (e.g. the whole budget went to thinking)
+├─ Truncated              finish_reason "length" / stop_reason "max_tokens", "model_context_window_exceeded"
+├─ EmptyReply             no usable answer: no text (e.g. the whole budget went to thinking), no forced-tool
+│                         input, or a stop reason that leaves none (refusal, pause_turn, content_filter)
 ├─ BadStructuredReply     the reply does not validate against the schema
 ├─ IgnoredParameter       the endpoint reported a configured parameter as ignored (§5)
 └─ ProvenanceUnknown      a routed call whose answering model cannot be read (§6.3)
@@ -371,8 +375,10 @@ ModelError (base)
 
 ## 11. 测试工具
 
-- `lite_model.testing.FakeModel`：按 role 脚本化回复（文本或结构化对象，也可以是要抛的异常），记录每次请求
-  （role、messages、schema），实现 `Model` 和 `AsyncModel`。来源为 `backend="fake"`。
+- `lite_model.testing.FakeModel`：按 role 脚本化回复（文本或结构化对象，也可以是要抛的异常；列表按次消费，
+  函数按调用计算），记录每次请求（role、messages、schema），实现 `Model`。`AsyncFakeModel` 同样的脚本、同一份
+  `calls`，实现 `AsyncModel`（一个类不能让同名方法既同步又异步）。来源为 `backend="fake"`。
+- 契约测试同步、异步各跑一遍（`tests/contract/conftest.py` 的 `connect` fixture）。
 - 契约测试：**真的 SDK**，只把 transport 换成记录请求的假 endpoint（`build(..., http_client=...)`，
   `tests/upstream.py`），检查每个后端实际发出的请求体（参数名、strict schema、强制工具、header）。
 - `tests/conftest.py` 在 `-m ollama` / `-m litellm` 以外拒绝一切 socket 连接：忘了注入 transport 的测试会失败，
@@ -431,12 +437,14 @@ lite-model/
 │  ├─ client.py          # build(), Model, dispatch per role; SDK clients shared per endpoint
 │  ├─ profiles.py        # BackendProfile table (§5)
 │  ├─ schema.py          # strict_schema()
-│  ├─ backends/          # openai_compat.py (ollama/openai/gateway/litellm), anthropic.py
+│  ├─ backends/          # __init__ (Backend protocol, provenance, finish), openai_compat.py
+│  │                     # (ollama/openai/gateway/litellm), anthropic_messages.py; each: connect,
+│  │                     # connect_async, endpoint, request(), reply(); client.py runs them
 │  ├─ provenance.py      # S3: reading answered model and headers per backend (§6); S1 reads body `model` in the backend
 │  ├─ hooks.py           # Hook, Registration, Call
 │  ├─ bounded.py
 │  ├─ errors.py
-│  ├─ testing.py         # FakeModel
+│  ├─ testing.py         # FakeModel, AsyncFakeModel
 │  └─ cli.py             # litemodel dump-config
 ├─ tests/unit/ tests/contract/ tests/live/   # live: -m ollama / -m litellm
 │  tests/upstream.py     # recording fake endpoint, plugged in as the SDK transport (contract tests)
@@ -512,6 +520,36 @@ lite-model/
       llm-gateway 修好前在配置时拒绝正是 §5、§15 的要求；gateway 后端 S1 不可用；响应头检查是 S3 验收项。
   - 待定（未改）：`type: openai` 的 endpoint 没法声明"不需要 key"（本地 vLLM 一类）。真有宿主需要时再加。
 
+**S2（2026-11-18）Anthropic 与异步。**
+- 结构：每个协议一个模块（`openai_compat`、`anthropic_messages`），只有不碰网络的 `request()` / `reply()`
+  加 `connect` / `connect_async` / `endpoint`；共用的来源和错误判定在 `backends/__init__.py`（`provenance`、
+  `finish`）；`client.py` 只有一个同步执行器和一个异步执行器，按 `profile.protocol` 查表。`build_async()`、
+  `AsyncModel`、`AsyncFakeModel`。
+- Anthropic 请求体与 lite-mem / lite-rag 现在的相同（§5）。主人的决定：`anthropic` 必须配 `max_output_tokens`。
+  新的启动检查：`anthropic` 的 `base_url` 不能以 `/v1` 结尾（写测试时发现：同一个 URL 给两家 SDK 用会请求
+  `/v1/v1/messages`）。SDK client 按 (type, endpoint, key 变量, 超时, 重试) 共享，不跨协议。
+- SDK 实测（记进 `KB/global/llm-evals/providers/`）：anthropic 2.6.0 用 `authorization: Bearer` 发 key，没有
+  `x-api-key`；anthropic 的异步 `raw.parse()` 是协程，openai 的不是（执行器里 `inspect.isawaitable`）；
+  anyio 的异步 transport 在 TaskGroup 里连接，网络守卫的错误包在 `ExceptionGroup` 里（测试会展开它）。
+- 测试：单元 + 契约 115 个（契约测试同步、异步各一遍），`-m ollama` 4 个（新增一个异步 structured）。
+  Anthropic 只有契约测试（付费 API，AGENTS.md 规则 11）。变异：S2 新代码 21 处、S1 的 44 处（重构后重新
+  指向）全部被抓住。
+- 收尾 review：
+  - `/simplify`（4 个角度）：构造请求移到 `try` 外（本地错误不再被包成 `CallFailed`）；两个后端共用
+    `sdk_client()`（两家 SDK 的 `Timeout` 都是 `httpx2.Timeout`）；`finish()` 收 `answered`，自己建来源；
+    anthropic 的两条检查按 `profile.protocol` 而非 `type`；测试的 `Caller` 去掉分支，`Connect` 是有类型的
+    Protocol；`_causes` 换成 `traceback.format_exception`。跳过：`strict_schema` 缓存（微秒级，且会共享可变
+    dict）、`_Routes` 基类（无害）、为 S4 hook 拆执行器（S4 再拆）。改后 65 处变异全部被抓住。
+  - Codex（只读）3 条：
+    - High：只有 `max_tokens` 算截断，`refusal` / `pause_turn` 的部分文字被当成功回复，
+      `model_context_window_exceeded` 不算截断。成立，而且 OpenAI 侧 `content_filter` 同样的缺口。回归测试先红
+      （14 个），修为：截断集合加 `model_context_window_exceeded`；完整集合以外的 stop_reason 和 OpenAI 的
+      `content_filter` 报 `EmptyReply("no usable reply (stop reason …)")`（只带枚举值，不带上游文字）。没有加新的
+      异常类（公共 API 不变）。
+    - Medium：结构化回复取第一个 `tool_use`，不看名字。成立，只读被强制的那个工具；回归测试先红。
+    - Medium：SDK client 应按 key 的值共享而不是变量名。**拒绝**：按变量名是有意的（共享键里不放密钥值）；收益
+      只是"两个变量存了同一个 key"时少建一个 client。记录里的"key"改为"key 变量"。
+
 ## 15. 待确认
 
 - **llm-gateway 的两处修改**（在 llm-gateway repo 里做，不在本 repo）：
@@ -541,4 +579,5 @@ lite-model/
 | 2026-11-18 | cosign 以容器运行，作为 compose 的 `verify` 服务，`litellm` 依赖它成功退出 | 主人的选择：本机不装 cosign，一条 `compose up` 先验签再启动 |
 | 2026-11-18 | LiteLLM 的 `answered` 取响应头 `x-litellm-model-name`，响应体 `model` 只做一致性检查（§6.3） | S0 实测：普通别名的响应体 `model` 是别名，头才是实际模型 |
 | 2026-11-18 | 命名 backend：`backends.<name>: {type, base_url, api_key_env, channel, router_aliases}`，role 用名字引用（§4） | 主人的选择：一个宿主要能同时用两个 OpenAI-compatible 厂商；endpoint 和 key 只写一处 |
+| 2026-11-18 | `anthropic` 必须配 `max_output_tokens`，启动时检查，不猜默认值（§4） | 主人的选择：宿主迁移时写自己的旧值（lite-mem 2048、lite-rag 1024），请求体不变 |
 | 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |

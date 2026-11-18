@@ -19,6 +19,7 @@ class BackendProfile:
     default_temperature: float | None  # sent when none is configured; None: not sent
     supports_temperature: bool
     supports_reasoning_effort: bool  # sent as the top-level `reasoning_effort`
+    requires_max_tokens: bool = False  # the API rejects a request without an output limit
 
 
 PROFILES: dict[BackendType, BackendProfile] = {
@@ -54,6 +55,9 @@ PROFILES: dict[BackendType, BackendProfile] = {
         default_temperature=None,
         supports_temperature=False,
         supports_reasoning_effort=False,
+        # No default is guessed: hosts set their own (lite-mem 2048, lite-rag 1024) so the
+        # request body is unchanged when they migrate (owner, 2026-11-18).
+        requires_max_tokens=True,
     ),
     # llm-gateway maps both names to max_tokens (translate.py:58-59) and drops reasoning_effort
     # (it lands in X-LLMGW-Ignored-Params): refused rather than silently lost (design §5).

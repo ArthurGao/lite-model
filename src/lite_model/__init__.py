@@ -1,6 +1,6 @@
 """lite-model: the shared model-call layer for the lite modules (docs/lite-model-design.md)."""
 
-from lite_model.client import Model, build
+from lite_model.client import AsyncModel, Model, build, build_async
 from lite_model.config import (
     BackendConfig,
     ModelsConfig,
@@ -23,6 +23,7 @@ from lite_model.schema import strict_schema
 from lite_model.types import Channel, Message, Provenance, StructuredReply, TextReply, Usage
 
 __all__ = [
+    "AsyncModel",
     "BackendConfig",
     "BadStructuredReply",
     "CallFailed",
@@ -45,5 +46,6 @@ __all__ = [
     "Truncated",
     "Usage",
     "build",
+    "build_async",
     "strict_schema",
 ]

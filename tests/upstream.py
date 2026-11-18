@@ -31,6 +31,29 @@ def completion(
     }
 
 
+def message(
+    *blocks: dict[str, Any],
+    model: str = "claude-x-20261101",
+    stop: str = "end_turn",
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """An Anthropic Messages response body; `blocks` default to one text block "ok"."""
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": list(blocks) or [{"type": "text", "text": "ok"}],
+        "stop_reason": stop,
+        "stop_sequence": None,
+        "usage": usage or {"input_tokens": 9, "output_tokens": 4},
+    }
+
+
+def tool_use(name: str, data: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "tool_use", "id": "toolu_1", "name": name, "input": data}
+
+
 class Upstream:
     """Answers each request with the next scripted (status, body); records every request."""
 
@@ -50,6 +73,9 @@ class Upstream:
 
     def client(self) -> httpx2.Client:
         return httpx2.Client(transport=httpx2.MockTransport(self._handle))
+
+    def async_client(self) -> httpx2.AsyncClient:
+        return httpx2.AsyncClient(transport=httpx2.MockTransport(self._handle))
 
     def body(self, index: int = -1) -> dict[str, Any]:
         data = json.loads(self.requests[index].content)

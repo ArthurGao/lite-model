@@ -1,10 +1,12 @@
 """Design §11: FakeModel scripts replies per role and records every call."""
 
+import asyncio
+
 import pytest
 from pydantic import BaseModel
 
-from lite_model import EmptyReply, Message, Model
-from lite_model.testing import FakeCall, FakeModel
+from lite_model import AsyncModel, EmptyReply, Message, Model
+from lite_model.testing import AsyncFakeModel, FakeCall, FakeModel
 
 ASK = [Message("user", "Hi?")]
 
@@ -75,3 +77,22 @@ def test_an_unscripted_role_or_wrong_reply_type_fails_loudly() -> None:
         fake.text("answer", ASK)
     with pytest.raises(AssertionError, match="structured\\(\\) needs an object"):
         fake.structured("judge", ASK, Verdict)
+
+
+def test_async_fake_model_scripts_and_records_like_fake_model() -> None:
+    fake = AsyncFakeModel(answer=["one", EmptyReply("answer: empty")], judge={"ok": True})
+    model: AsyncModel = fake
+
+    async def calls() -> tuple[str, Verdict]:
+        text = (await model.text("answer", ASK)).text
+        verdict = (await model.structured("judge", ASK, Verdict)).value
+        with pytest.raises(EmptyReply):
+            await model.text("answer", ASK)
+        return text, verdict
+
+    assert asyncio.run(calls()) == ("one", Verdict(ok=True))
+    assert [(c.role, c.schema) for c in fake.calls] == [
+        ("answer", None),
+        ("judge", Verdict),
+        ("answer", None),
+    ]

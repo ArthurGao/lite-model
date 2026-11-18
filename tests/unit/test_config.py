@@ -217,3 +217,28 @@ def test_a_temperature_out_of_range_is_refused(value: float) -> None:
         ModelsConfig(temperature=value)
     with pytest.raises(ValidationError):
         RoleConfig(temperature=value)
+
+
+def test_anthropic_without_an_output_limit_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The Messages API requires max_tokens; no default is guessed (owner, 2026-11-18).
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    config = ModelsConfig(backend="anthropic", model="claude-x")
+    assert "role answer (anthropic:claude-x): anthropic needs max_output_tokens" in _problems(
+        config
+    )
+    assert resolve(config.model_copy(update={"max_output_tokens": 1024}), ROLES)
+
+
+def test_an_anthropic_base_url_ending_in_v1_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The Anthropic SDK appends /v1/messages itself (the OpenAI SDK wants /v1 in base_url): a
+    # copied OpenAI-style URL would call /v1/v1/messages and fail only at the first call.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    config = ModelsConfig(
+        backend="claude",
+        model="claude-x",
+        max_output_tokens=64,
+        backends={"claude": BackendConfig(type="anthropic", base_url="https://gw.example/v1/")},
+    )
+    assert "anthropic base_url must not end in /v1" in _problems(config)
+    root = config.backends["claude"].model_copy(update={"base_url": "https://gw.example"})
+    assert resolve(config.model_copy(update={"backends": {"claude": root}}), ROLES)
