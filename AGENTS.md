@@ -23,7 +23,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S5 (README, packaging, v0.1.0 release wheel, final close-out) done 2026-11-18; next: host migrations (S6+, design §12), each in its own repo** (design §14).
+**S5 (README, packaging, v0.1.0 release wheel, final close-out) done 2026-11-18; host migrations (design §12) done 2026-11-19: lite-mem, lite-rag, llm-steward. Current release: v0.2.1** (design §14).
 
 ## Rules
 

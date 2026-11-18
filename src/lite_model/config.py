@@ -123,7 +123,8 @@ class ModelsConfig(_CallSettings):
 def _layered(defaults: Mapping[str, BaseModel], value: Any) -> Any:
     """`value`'s entries over `defaults` (design §4): an entry changes its default field by field
     (a role's null removes the host's value: the role takes the top-level one), unless it names
-    another backend `type`, which starts afresh."""
+    another backend `type`, which starts afresh. Where a backend's key comes from (`api_key_env`
+    or `keyless`) is one choice: an entry that sets either replaces the default's."""
     if not isinstance(value, Mapping):
         return value  # pydantic reports it
     merged: dict[str, Any] = dict(defaults)
@@ -133,12 +134,16 @@ def _layered(defaults: Mapping[str, BaseModel], value: Any) -> Any:
         if base is not None and isinstance(own, Mapping) and own.get("type", _NO) in (
             _NO, getattr(base, "type", _NO)
         ):  # fmt: skip
-            own = {**base.model_dump(exclude_unset=True), **own}
+            inherited = base.model_dump(exclude_unset=True)
+            if _KEY_SOURCE & {k for k, v in own.items() if v}:  # where the key comes from is one
+                inherited = {k: v for k, v in inherited.items() if k not in _KEY_SOURCE}  # choice
+            own = {**inherited, **own}
         merged[name] = own
     return merged
 
 
 _NO = object()  # no `type` given (or a role, which has none)
+_KEY_SOURCE = {"api_key_env", "keyless"}  # an entry that sets one replaces both (0.2.1)
 
 
 @dataclass(frozen=True)

@@ -405,6 +405,30 @@ def test_only_another_type_replaces_a_default_and_null_clears_a_field() -> None:
     assert (graph.reasoning_effort, graph.max_output_tokens) == (None, 2048)
 
 
+def test_where_the_key_comes_from_is_one_choice_the_config_makes() -> None:
+    # 0.2.1 (lite-mem, 2026-11-19): a key variable over the host's keyless backend used to keep
+    # `keyless` too and fail with "cannot both be set", though the config never wrote `keyless`
+    keyed = _host({"backends": {"openai": {"base_url": "https://v.test/v1", "api_key_env": "VK"}}})
+    assert keyed.backends["openai"] == BackendConfig(
+        type="openai", base_url="https://v.test/v1", api_key_env="VK"
+    )
+    assert target(keyed, "answer").api_key_env == "VK"
+
+    class KeyedHost(ModelsConfig):
+        host_backends: ClassVar[Mapping[str, BackendConfig]] = {
+            "vendor": BackendConfig(type="openai", base_url="https://v.test/v1", api_key_env="VK")
+        }
+
+    # and the other way: keyless over a host's key variable drops the variable
+    keyless = KeyedHost(backend="vendor", model="m", backends={"vendor": {"keyless": True}})
+    assert keyless.backends["vendor"] == BackendConfig(
+        type="openai", base_url="https://v.test/v1", keyless=True
+    )
+    # both in one entry is still the config's own contradiction
+    with pytest.raises(ValidationError, match="keyless and api_key_env cannot both be set"):
+        _host({"backends": {"openai": {"api_key_env": "VK", "keyless": True}}})
+
+
 def test_a_role_given_as_an_object_overrides_only_the_fields_it_set() -> None:
     config = HostConfig(
         backend="openai", model="qwen3:8b", roles={"graph": RoleConfig(reasoning_effort=None)}

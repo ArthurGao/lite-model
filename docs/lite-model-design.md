@@ -180,7 +180,8 @@ OpenAI-compatible 厂商（DeepSeek 和 DashScope 都是 `type: openai`），end
 上面）和 `host_roles`（每个 role 的调用参数）。配置给的值叠在上面：同名的 backend 或 role 逐字段改它（例如只改内置
 `ollama` 的 `base_url`；role 里写 null 去掉宿主给这个 role 的值，这个 role 回到顶层的值），只有写了**另一个** `type` 的 backend 才从头开始——同样的 `type` 照写一遍
 （`..._OPENAI__TYPE=openai`）不会丢掉宿主的 `base_url`、`keyless`。于是配置**加**一个 backend 或改一个 role，不会把它
-没提到的默认值弄丢。0.1.x 里配置了任何 backend 都会让同名的内置值顶掉宿主的，lite-mem 的默认 role 因此会被送到
+没提到的默认值弄丢。key 从哪里来（`api_key_env` 或 `keyless`）算一个选择（0.2.1）：配置写了其中一个，就替换宿主的那一个——
+在宿主的 keyless backend 上只写 `api_key_env` 就是改成要 key，不用再写 `keyless: false`。0.1.x 里配置了任何 backend 都会让同名的内置值顶掉宿主的，lite-mem 的默认 role 因此会被送到
 api.openai.com。
 
 每个 role 解析成一个 `Target`（frozen）：backend（名字）、type、model、base_url、api_key_env、channel、
@@ -690,6 +691,10 @@ lite-model/
 （而不是接受请求体变化）。测试先红（配置解析、占位 key 和不发 temperature 的请求、与 `api_key_env` 冲突），变异 2 处都被抓住。
 生产代码约 12 行、一个文件：按全局规则这是小改动，不做 `/simplify` 和 Codex 收尾。
 
+**0.2.1（2026-11-19）key 的来源是一个选择。** lite-mem 改用 0.2.0 `host_backends` 时发现：宿主的 `openai` 是 keyless，配置只写
+`api_key_env` 时两者叠在一起，启动报 "keyless and api_key_env cannot both be set"。现在叠加时，配置写了 `api_key_env` 或
+`keyless` 就去掉宿主的这两个；同一个条目里两个都写仍然报错。测试先红；生产代码约 6 行、一个文件，按全局规则不做收尾。
+
 ## 15. 待确认
 
 - **llm-gateway 的两处修改**（在 llm-gateway repo 里做，不在本 repo）：
@@ -715,10 +720,7 @@ lite-model/
 - 各模块迁移时是否去掉 adapter、直接依赖 `lite_model.Model`（§12.1）。
 - ~~**宿主改不了内置 backend**~~（lite-mem S12 发现，2026-11-18）：0.2.0 已做（§4 宿主自己的默认值）。lite-mem 2026-11-19 已改用
   `host_backends`、删掉自己的 validator（`be5269f`）。
-- **keyless 与 `api_key_env` 叠加时冲突**（lite-mem 改用 0.2.0 时发现，2026-11-19）：宿主默认 backend 是 `keyless: true`，
-  配置只给同名同 type 的 `api_key_env` 时，逐字段叠加后两者都在，启动报 "keyless and api_key_env cannot both be set"——
-  响亮地失败，不会悄悄不发 key，但用户没写过 `keyless`。现在要同时写 `keyless: false`（lite-mem 有测试）。更好的做法：
-  叠加时把 key 的来源当成一个选择（给了 `api_key_env` 就去掉默认的 `keyless`，反之亦然）。下次改 lite-model 时做。
+- ~~**keyless 与 `api_key_env` 叠加时冲突**~~（lite-mem 改用 0.2.0 时发现，2026-11-19）：0.2.1 已做（§4）。
 - **结构化输出约束解码**（lite-rag S16，2026-11-19）：qwen3:8b 在 Ollama 上自由输出 JSON 时，同一个 chunk 10 次里 7 次漏引号；
   经 `structured()`（strict JSON schema）10 次全部合法。宿主要 JSON 时应当用 `structured()`，不要自己解析文本。
 
