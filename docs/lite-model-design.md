@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S5 完成（v0.1.0，2026-11-18）；宿主迁移完成（2026-11-19）；0.3.0 实现完成（2026-11-20：`AsyncHook`、`Bounded` 槽位只包请求、`map` 带 context、Proxy 缓存头），待发布。阶段与验收见 §14。
+状态：S5 完成（v0.1.0，2026-11-18）；宿主迁移完成（2026-11-19）；0.3.0 已发布（2026-11-20：`AsyncHook`、`Bounded` 槽位只包请求、`map` 带 context、Proxy 缓存头，Proxy 实测通过）。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -338,7 +338,9 @@ general_settings:
   lite-model 上（§10）。Proxy 命中时 lite-model 现在认不出来：回复不会标 `cached`，省下的 token 会被记成这次花的
   （§9）。0.3.0：读到非空的 `x-litellm-cache-key` 时标 `cached=True`（profile 的 `cached_header`），这样即使
   有人开了，用量也不会算错。依据 1.108.9 源码：`cache_key` 只在命中分支写进 hidden params（`caching/caching_handler.py`），
-  空值的头不发（`proxy/common_request_processing.py`）；Proxy 上的实测待做（会启动 Proxy，要 owner 同意）。
+  空值的头不发（`proxy/common_request_processing.py`）。2026-11-20 Proxy 实测（owner 同意，临时开 in-memory cache）：
+  未命中没有这个头，命中有，且 `x-litellm-model-name` 仍是当初回答的模型；命中回复的 `usage` 是原来的 token 数
+  （KB `global/litellm` §3.1）。
 
 **订阅额度不进自动路由**：分档里不放指向 llm-gateway 订阅 profile 的 deployment。要用订阅，在 role 上
 显式配 `backend: gateway`。确实要按难度在订阅模型间路由时，另起一个别名（如 `sub-router`），只有显式选它
@@ -732,8 +734,8 @@ lite-model/
 - ~~`Bounded` 包在模型外面：hook 命中也要等一个槽位~~：0.3.0 把槽位移进执行器（§10，2026-11-20）。
 - ~~**异步宿主的 hook**~~：0.3.0 加了 `AsyncHook`（§10，2026-11-20）。
 - **LiteLLM Proxy 的 cache 命中**（2026-11-19）：Proxy 的 cache 不开（§7.2）；0.3.0 读 `x-litellm-cache-key` 标
-  `cached=True`。2026-11-20 源码核实：1.108.9 只在命中时带这个头（§7.2）。仍待 Proxy 实测：命中时
-  `x-litellm-model-name` 是否仍是当初回答的模型。
+  `cached=True`。2026-11-20 源码核实并 Proxy 实测：1.108.9 只在命中时带这个头，命中时 `x-litellm-model-name`
+  仍是当初回答的模型（§7.2）。
 - ~~自动路由的效果~~：**已测**（2026-11-18，lite-rag S14，`KB/global/llm-evals/evals/2026-11-18-lite-rag-auto-routing.md`）。
   lite-rag 32 道金标题 × 2 次，"对" = 关键事实且 grounded：固定 qwen3:8b 0.938（p50 12 s），经 Proxy 的同一模型 0.938，
   qwen3:1.7b 0.750（3.8 s），`smart-router`（启发式，small = 1.7b，其余 = 8b）0.844（5.2 s）。启发式分类器**按语言而不是难度**
