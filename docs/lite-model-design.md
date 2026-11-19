@@ -419,7 +419,7 @@ ModelError (base)
 - `LiteModel.target(role)` / `AsyncLiteModel.target(role)`：调用前取得某个 role 解析后的 target（宿主把它记进
   索引身份，§12.1）。
 - hook 抛错 = 调用失败，原样抛出（不吞掉，不包装）；`before` 抛错时不发请求。`after` 抛错时这次已经计费的回复
-  和它的 `usage` 一起丢掉：`after` 不应抛错（lite-cache 写失败时照样返回，带 `store_error`）。
+  和它的 `usage` 一起丢掉：`after` 不应抛错（lite-cache 写失败时照样返回回复；回复上没有 `store_error` 字段，失败记在日志和 `CacheHook.store_errors` 里，lite-cache 设计 §3.5）。
 - hook 看到的 `Call.request` 是实际请求的只读深拷贝：hook 改不了发出去的请求，缓存键描述的就是发出去的那个。
 - hook 返回的回复类型不对（`text()` 拿到 `StructuredReply`，`structured()` 拿到 `TextReply` 或别的 schema 的
   值）时抛 `TypeError`，写明是哪个 hook——在出错的地方失败，而不是调用方读值时。
