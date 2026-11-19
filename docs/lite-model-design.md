@@ -429,6 +429,9 @@ ModelError (base)
   - `AsyncHook`（`async def before / after`），`AsyncLiteModel` 接受它；同步 `Hook` 在异步模型上照旧可用。
     原因：llm-steward 是 async 的，lite-cache 的同步 psycopg 查询放在同步 hook 里会阻塞 event loop。
   - `Bounded` / `AsyncBounded` 的槽位移进执行器，只包住真正发出的请求：hook 命中不再排队等槽位（§15）。
+  - `Bounded.map` 的工作线程用调用方的 `contextvars.copy_context()` 运行每一项：现在用 `ThreadPoolExecutor.map`，
+    线程不继承 contextvar，`call_context()` 的值到不了 hook，lite-cache 在并发的 map 里静默失效（lite-rag S18 发现，
+    lite-rag 在自己的 `BoundedLLM.map` 里先绕过；2026-11-19）。
   - 不加 `failed(call, error)` hook：lite-cache 不统计失败的调用（它的设计 §0），失败调用的用量在异常上（§9）。
 
 ## 11. 测试工具
