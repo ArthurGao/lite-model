@@ -7,7 +7,7 @@
 - Never answer a LiteLLM / OpenAI SDK / Anthropic SDK / Ollama / llm-gateway API question from memory: check
   context7 or the pinned version's docs (LiteLLM moves fast and has renamed config keys), and record surprises in
   the KB (`KB/global/litellm/` for LiteLLM facts). llm-gateway's behaviour is in its repo
-  (`/Users/arthurgao/Code/AI/llm-gateway`, `docs/DESIGN.md`) and `KB/global/llm-gateway/README.md`.
+  (`/Users/arthurgao/Code/AI/lite-ai/llm-gateway`, `docs/DESIGN.md`) and `KB/global/llm-gateway/README.md`.
 - Relevant user-level skills: `llm-app-architecture` (role layer, no fallback chain, provenance, pluggable
   capabilities §10, gateways), `llm-model-eval` (comparing models), `testing-and-ci`, `secrets-hygiene` (keys for
   the proxy), `dev-machine` (ports, Ollama, credentials), `kb-maintain`.
