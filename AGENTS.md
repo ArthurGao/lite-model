@@ -23,7 +23,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S5 done 2026-11-18; host migrations (design §12) done 2026-11-19. Current release: v0.2.1; 0.3.0 implemented 2026-11-20, not yet released** (design §14): `AsyncHook`, `Bounded` slot around the request only, `Bounded.map` carries the caller's context, `x-litellm-cache-key` → `cached` (design §10, §7.2). Open: the Proxy live check of the cache header (starts the Proxy: owner's OK).
+**S5 done 2026-11-18; host migrations (design §12) done 2026-11-19. Current release: v0.3.0 (2026-11-20)** (design §14): `AsyncHook`, `Bounded` slot around the request only, `Bounded.map` carries the caller's context, `x-litellm-cache-key` → `cached` (design §10, §7.2).
 
 ## Rules
 
