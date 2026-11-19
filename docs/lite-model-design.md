@@ -334,6 +334,10 @@ general_settings:
   cosign，CI 跑同一个 `verify`。
 - 不接数据库（没有数据库时 `max_budget` 不生效）；只绑 127.0.0.1:**4400**（4000 已登记给 tenderted）；只挂
   需要的 key。
+- **不开 Proxy 的 cache**（`litellm_settings.cache`，2026-11-19）：缓存是 lite-cache 的事，它作为 hook 接在
+  lite-model 上（§10）。Proxy 命中时 lite-model 现在认不出来：回复不会标 `cached`，省下的 token 会被记成这次花的
+  （§9）。计划（0.3.0，先在 Proxy 上实测命中时的响应头）：读到 `x-litellm-cache-key` 时标 `cached=True`，这样
+  即使有人开了，用量也不会算错。
 
 **订阅额度不进自动路由**：分档里不放指向 llm-gateway 订阅 profile 的 deployment。要用订阅，在 role 上
 显式配 `backend: gateway`。确实要按难度在订阅模型间路由时，另起一个别名（如 `sub-router`），只有显式选它
@@ -421,6 +425,11 @@ ModelError (base)
   值）时抛 `TypeError`，写明是哪个 hook——在出错的地方失败，而不是调用方读值时。
 - `build()` / `build_async()` 返回 `LiteModel` / `AsyncLiteModel`（满足 `Model` / `AsyncModel`，多一个
   `.hooks`）；`Model` 协议本身不含 hooks，`FakeModel` 和宿主的 adapter 不必实现。
+- **计划（0.3.0，lite-cache 接入 async 宿主之前，2026-11-19 定）**：
+  - `AsyncHook`（`async def before / after`），`AsyncLiteModel` 接受它；同步 `Hook` 在异步模型上照旧可用。
+    原因：llm-steward 是 async 的，lite-cache 的同步 psycopg 查询放在同步 hook 里会阻塞 event loop。
+  - `Bounded` / `AsyncBounded` 的槽位移进执行器，只包住真正发出的请求：hook 命中不再排队等槽位（§15）。
+  - 不加 `failed(call, error)` hook：lite-cache 不统计失败的调用（它的设计 §0），失败调用的用量在异常上（§9）。
 
 ## 11. 测试工具
 
@@ -516,6 +525,7 @@ lite-model/
 | **S4** 用量、并发、hook | `Usage`（含 reasoning、失败时的用量）、价格表与成本头、`Bounded`、hook 注册 / 撤销 / 短路 | 测试覆盖：失败调用也有用量、hook 命中保留原来源并 `cached=True`、撤销后不再生效 |
 | **S5** 发布与收尾 | README、`deploy/litellm/`、v0.1.0 release wheel；整个库的最终收尾 review | 宿主可以从 wheel 安装；全量检查绿 |
 | **S6+** 迁移 | 在 lite-mem、lite-rag、llm-steward 各自 repo 里按 §12 迁移 | 见 §12 |
+| **0.3.0**（计划）lite-cache 的前置 | `AsyncHook`；`Bounded` 槽位只包住真正的请求；litellm 回复带 `x-litellm-cache-key` 时 `cached=True`（先在 Proxy 上核实） | 测试覆盖：async hook 命中短路且不阻塞其它 task；concurrency 1 时命中不等正在跑的调用；带缓存头的 litellm 回复 `cached=True`、来源不变 |
 
 ### 阶段记录
 
@@ -705,13 +715,15 @@ lite-model/
 - embedding 是否在 v2 收进来（lite-rag、lite-mem 各有一份 httpx2 embedding 客户端）。embedding 和索引绑定，
   永远不路由。
 - lite-eval 的 judge 以后是否迁移。
-- hook 只有 `before` / `after`：失败的调用不经过 hook。lite-cache S1 要按 `skip:<reason>` 计数（截断、空回复），
-  它包在调用外面时能从异常类型和 `usage` 得到这些；若要在 hook 里拿到，再加一个可选的 `failed(call, error)`。
-  lite-cache 接入时定。
+- ~~hook 只有 `before` / `after`，失败的调用不经过 hook~~：2026-11-19 定，不加 `failed()`。lite-cache 改为 hook
+  接入，失败的调用不计数，`skip:<reason>` 只来自它自己的 `accept` 谓词（lite-cache 设计 §0、§3.4）。
 - ~~`Call` 缺 lite-cache 的 scope / policy~~：S5 定为 `call_context()`（§10）。lite-cache 的 hook 必须在没有
   scope 时不缓存（否则会把一个租户的答案给另一个租户）。
-- `Bounded` 包在模型外面：hook 命中也要等一个槽位（concurrency 1 时命中要等正在跑的调用）。若成问题，把槽位
-  移到执行器里只包住真正的请求。
+- `Bounded` 包在模型外面：hook 命中也要等一个槽位（concurrency 1 时命中要等正在跑的调用）。2026-11-19 定：0.3.0
+  把槽位移进执行器（§10），在 lite-cache 接入 lite-rag（它的 S4）之前做。
+- **异步宿主的 hook**（2026-11-19）：0.3.0 加 `AsyncHook`（§10），在 lite-cache 接入 llm-steward 之前做。
+- **LiteLLM Proxy 的 cache 命中**（2026-11-19）：Proxy 的 cache 不开（§7.2）；0.3.0 读 `x-litellm-cache-key` 标
+  `cached=True`。待核实：1.108.9 命中时这个头在不在，`x-litellm-model-name` 是否仍是当初的模型。
 - ~~自动路由的效果~~：**已测**（2026-11-18，lite-rag S14，`KB/global/llm-evals/evals/2026-11-18-lite-rag-auto-routing.md`）。
   lite-rag 32 道金标题 × 2 次，"对" = 关键事实且 grounded：固定 qwen3:8b 0.938（p50 12 s），经 Proxy 的同一模型 0.938，
   qwen3:1.7b 0.750（3.8 s），`smart-router`（启发式，small = 1.7b，其余 = 8b）0.844（5.2 s）。启发式分类器**按语言而不是难度**
@@ -749,3 +761,5 @@ lite-model/
 | 2026-11-18 | 不在中英混合的 RAG 上打开启发式自动路由（§15 实测：0.844 对 0.938，按语言分档） | lite-rag S14 两次真实运行；要路由先测分类器 |
 | 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |
 | 2026-11-18 | 0.2.0：宿主在 `ModelsConfig` 子类上设 `host_backends` / `host_roles`，配置逐字段叠在上面；只有另一个 `type` 才替换 backend | lite-mem S12 的默认 role 曾被内置 `openai` 顶到 api.openai.com；lite-rag 的 graph 默认值会被 `__ROLES` 整个顶掉。审查：同样的 `type` 照写一遍不能丢宿主的值；role 的 null 仍是"用顶层的值"（和 0.1 一样） |
+| 2026-11-19 | 缓存选 lite-cache 作为 hook、存 PostgreSQL；LiteLLM Proxy 的 cache 不开，不用 Redis（§7.2，lite-cache 设计 §0） | 默认调用不经过 Proxy；Proxy 命中时 lite-model 标不出 `cached`，用量算错；没有必填 scope；Redis 对 1–20 s 的模型调用没有速度上的意义，又是新的基础设施 |
+| 2026-11-19 | 0.3.0 计划：`AsyncHook`、`Bounded` 槽位移进执行器、读 `x-litellm-cache-key`；不加 `failed()` hook（§10、§15） | lite-cache 接入 async 的 llm-steward 和 lite-rag 之前需要；lite-cache 不统计失败的调用 |
