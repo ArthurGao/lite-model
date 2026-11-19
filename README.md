@@ -168,7 +168,9 @@ bounded = Bounded(model, concurrency=4)      # at most 4 calls in flight, from a
 headers = bounded.map(lambda chunk: bounded.text("contextual", prompt(chunk)).text, chunks)
 ```
 
-`AsyncBounded` does the same for `AsyncModel`; `map()` keeps input order.
+`AsyncBounded` does the same for `AsyncModel`; `map()` keeps input order. Around a built model the slot covers only
+the request itself: a hook's hit does not wait for a slot, and a hook may call the model through the same
+`Bounded`. `map()` runs each item in a copy of the caller's context, so `call_context()` reaches the hooks.
 
 ## Hooks
 
@@ -186,7 +188,13 @@ registration.remove()
 
 Hooks see a read-only copy of the request actually sent. A hit keeps its original provenance; its `usage` is
 what the hit saved. A hook that raises fails the call; `after` should not raise (the reply is lost).
-`Call`, `Hook` and `Hooks` live in `lite_model.hooks`.
+`Call`, `Hook`, `AsyncHook` and `Hooks` live in `lite_model.hooks`. On a model from `build_async()` a hook may be an
+`AsyncHook` (`async def before / after`, awaited, so a database lookup does not block the event loop); a sync model
+refuses one with `TypeError`.
+
+A `litellm` reply that the Proxy served from its own cache (non-empty `x-litellm-cache-key`) is `cached=True` too:
+`cached` means nothing was spent again. Unlike a hook's hit, such a reply does reach `after`, so a hook that counts
+spending should skip a reply whose `cached` is true.
 
 Per-call values a hook needs (a cache's scope, whether this call site may be cached) travel in a context,
 not as parameters, so `Model` stays `text(role, messages)` / `structured(role, messages, schema)`:

@@ -7,6 +7,7 @@ original provenance. `after(call, reply)` runs only for a reply the endpoint jus
 hit, not for a failed call). A hook that raises fails the call; nothing is swallowed."""
 
 import hashlib
+import inspect
 import json
 import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
@@ -104,6 +105,21 @@ class Hook(Protocol):
     def after(self, call: Call, reply: Reply) -> None: ...
 
 
+class AsyncHook(Protocol):
+    """A hook whose `before` / `after` are coroutines (0.3.0): only an async model awaits them,
+    so a hook that does I/O (a database lookup) does not block the event loop."""
+
+    name: str
+
+    async def before(self, call: Call) -> Reply | None: ...
+
+    async def after(self, call: Call, reply: Reply) -> None: ...
+
+
+def is_async(hook: Hook | AsyncHook) -> bool:
+    return inspect.iscoroutinefunction(hook.before) or inspect.iscoroutinefunction(hook.after)
+
+
 class Registration:
     def __init__(self, hooks: "Hooks", name: str) -> None:
         self._hooks = hooks
@@ -115,24 +131,30 @@ class Registration:
 
 
 class Hooks:
-    """The hooks of one built model."""
+    """The hooks of one built model. A sync model refuses an `AsyncHook`: it could never be
+    awaited."""
 
-    def __init__(self) -> None:
-        self._registered: dict[str, Hook] = {}
+    def __init__(self, *, allow_async: bool = False) -> None:
+        self._registered: dict[str, Hook | AsyncHook] = {}
+        self._allow_async = allow_async
 
-    def register(self, hook: Hook) -> Registration:
+    def register(self, hook: Hook | AsyncHook) -> Registration:
         if hook.name in self._registered:
             raise ConfigError(f"a hook named {hook.name!r} is already registered")
+        if is_async(hook) and not self._allow_async:
+            raise TypeError(
+                f"hook {hook.name!r} is async (AsyncHook): register it on a build_async() model"
+            )
         self._registered[hook.name] = hook
         return Registration(self, hook.name)
 
-    def __getitem__(self, name: str) -> Hook:
+    def __getitem__(self, name: str) -> Hook | AsyncHook:
         """The hook registered under `name`; KeyError when there is none."""
         return self._registered[name]
 
     def _remove(self, name: str) -> None:
         self._registered.pop(name, None)
 
-    def snapshot(self) -> Sequence[Hook]:
+    def snapshot(self) -> Sequence[Hook | AsyncHook]:
         """The hooks for one call: a registration change during the call does not affect it."""
         return tuple(self._registered.values())
