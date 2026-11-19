@@ -33,6 +33,8 @@ class BackendProfile:
     request_headers: tuple[tuple[str, str], ...] = ()  # sent with every request
     role_tag: bool = False  # send the role as `metadata.tags` (design §7.3)
     cost_header: str | None = None  # the endpoint's own cost in USD, preferred to prices (§9)
+    # Present and non-empty only when the endpoint answered from its own cache (§7.2, §9).
+    cached_header: str | None = None
 
 
 PROFILES: dict[BackendType, BackendProfile] = {
@@ -108,5 +110,9 @@ PROFILES: dict[BackendType, BackendProfile] = {
         role_tag=True,
         # Absent for unpriced (Ollama) models; "0" on errors (S0, KB/global/litellm §3).
         cost_header="x-litellm-response-cost",
+        # Set only on a cache hit: LiteLLM 1.108.9 writes `cache_key` into a response's hidden
+        # params in its cache-hit branches only, and drops empty header values (0.3.0, KB
+        # global/litellm). The Proxy's cache stays off (§7.2); this keeps the usage honest if on.
+        cached_header="x-litellm-cache-key",
     ),
 }

@@ -259,7 +259,7 @@ def test_a_hook_reply_of_the_wrong_kind_fails_at_the_hook(
         else:
             caller.text("answer", ASK)
     other = StructuredReply(Other(name="x"), text.provenance, Usage())
-    caller.hooks["cache"].answer = other  # type: ignore[attr-defined]
+    caller.hooks["cache"].answer = other  # type: ignore[union-attr]
     with pytest.raises(TypeError, match="not a StructuredReply of City"):
         caller.structured("answer", ASK, City)
 
@@ -287,7 +287,7 @@ def test_a_hook_cannot_change_what_is_sent(connect: Connect) -> None:
     assert up.body()["model"] == "qwen3:8b"
     assert up.body()["messages"] == [{"role": "user", "content": "Hi?"}]
     with pytest.raises(TypeError):
-        caller.hooks["meddler"].before_calls[0].request["model"] = "x"  # type: ignore[attr-defined]
+        caller.hooks["meddler"].before_calls[0].request["model"] = "x"  # type: ignore[union-attr]
 
 
 def test_a_wrong_hook_reply_does_not_echo_its_content(connect: Connect) -> None:
@@ -321,3 +321,35 @@ def test_call_context_reaches_hooks_sync_and_async(connect: Connect) -> None:
     ]
     with pytest.raises(TypeError):
         hook.before_calls[1].context["scope"] = "x"  # type: ignore[index]
+
+
+# --- the Proxy's own cache (0.3.0, design §7.2) ---
+
+_PROXY = {"backend": "litellm", "model": "workhorse", "max_retries": 0}
+_ANSWERED = {"x-litellm-model-name": "ollama_chat/qwen3:8b"}
+
+
+@pytest.mark.parametrize(
+    ("headers", "cached"),
+    [
+        (_ANSWERED | {"x-litellm-cache-key": "4f1c9a"}, True),
+        (_ANSWERED, False),
+        # LiteLLM 1.108.9 drops empty header values; an empty one is still not a hit
+        (_ANSWERED | {"x-litellm-cache-key": ""}, False),
+    ],
+    ids=["hit", "miss", "empty"],
+)
+def test_a_proxy_cache_hit_is_marked_cached(
+    connect: Connect, headers: dict[str, str], cached: bool
+) -> None:
+    # LiteLLM 1.108.9 sets the cache key only on a cached result (caching_handler.py), so the
+    # header means the Proxy answered from its cache: the tokens were not spent again (§9).
+    up = Upstream((200, completion(model="workhorse", usage=USAGE), headers))
+    reply = connect(up, local_validate(_PROXY)).text("answer", ASK)
+    assert reply.cached is cached
+    assert reply.provenance.answered == "ollama_chat/qwen3:8b"  # provenance unchanged
+
+
+def test_the_cache_header_means_nothing_on_another_backend(connect: Connect) -> None:
+    up = Upstream((200, completion(), {"x-litellm-cache-key": "4f1c9a"}))
+    assert connect(up).text("answer", ASK).cached is False

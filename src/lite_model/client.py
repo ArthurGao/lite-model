@@ -5,16 +5,17 @@ import copy
 import inspect
 import os
 from collections.abc import Callable, Sequence
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from dataclasses import replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 from pydantic import BaseModel
 
 from lite_model.backends import Backend, anthropic_messages, openai_compat
 from lite_model.config import ModelsConfig, RoleSpec, Target, resolve
 from lite_model.errors import CallFailed, ConfigError
-from lite_model.hooks import Call, Hook, Hooks
+from lite_model.hooks import AsyncHook, Call, Hook, Hooks
 from lite_model.profiles import PROFILES
 from lite_model.types import Message, Reply, StructuredReply, TextReply
 
@@ -61,27 +62,43 @@ def _call(
     return Call(target, tuple(messages), frozen, schema)
 
 
+Slot = AbstractContextManager[Any]  # held only around the request (Bounded, design §10)
+AsyncSlot = AbstractAsyncContextManager[Any]
+
+
+def _checked(hook: Hook | AsyncHook, call: Call, hit: Reply) -> Reply:
+    """A hook's reply, marked cached (design §10), after checking it fits the call."""
+    schema = call.schema
+    fits = (
+        isinstance(hit, TextReply)
+        if schema is None
+        else isinstance(hit, StructuredReply) and isinstance(hit.value, schema)
+    )
+    if not fits:  # a hook bug: fail here, not far from the cause; never quote the reply
+        wanted = "a TextReply" if schema is None else f"a StructuredReply of {schema.__name__}"
+        got = type(hit).__name__
+        if isinstance(hit, StructuredReply):
+            got += f" of {type(hit.value).__name__}"
+        raise TypeError(f"hook {hook.name!r} answered {call.target.where} with {got}, not {wanted}")
+    return replace(hit, cached=True)
+
+
 def _hit(call: Call, hooks: Sequence[Hook]) -> Reply | None:
-    """The first hook's reply, marked cached (design §10); None when no hook answered."""
+    """The first hook's reply, marked cached; None when no hook answered."""
+    for hook in hooks:
+        if (hit := hook.before(call)) is not None:
+            return _checked(hook, call, hit)
+    return None
+
+
+async def _hit_async(call: Call, hooks: Sequence[Hook | AsyncHook]) -> Reply | None:
+    """`_hit` for an async model: an AsyncHook's `before` is awaited, a sync hook's is not."""
     for hook in hooks:
         hit = hook.before(call)
-        if hit is None:
-            continue
-        schema = call.schema
-        fits = (
-            isinstance(hit, TextReply)
-            if schema is None
-            else isinstance(hit, StructuredReply) and isinstance(hit.value, schema)
-        )
-        if not fits:  # a hook bug: fail here, not far from the cause; never quote the reply
-            wanted = "a TextReply" if schema is None else f"a StructuredReply of {schema.__name__}"
-            got = type(hit).__name__
-            if isinstance(hit, StructuredReply):
-                got += f" of {type(hit.value).__name__}"
-            raise TypeError(
-                f"hook {hook.name!r} answered {call.target.where} with {got}, not {wanted}"
-            )
-        return replace(hit, cached=True)
+        if inspect.isawaitable(hit):
+            hit = await hit
+        if hit is not None:
+            return _checked(hook, call, hit)
     return None
 
 
@@ -92,8 +109,21 @@ def _after(call: Call | None, hooks: Sequence[Hook], reply: Reply) -> Reply:
     return reply
 
 
+async def _after_async(call: Call | None, hooks: Sequence[Hook | AsyncHook], reply: Reply) -> Reply:
+    if call is not None:
+        for hook in hooks:
+            done = hook.after(call, reply)
+            if inspect.isawaitable(done):
+                await done
+    return reply
+
+
 def _run(
-    route: Route, messages: Sequence[Message], schema: type[BaseModel] | None, hooks: Sequence[Hook]
+    route: Route,
+    messages: Sequence[Message],
+    schema: type[BaseModel] | None,
+    hooks: Sequence[Hook],
+    slot: Slot,
 ) -> Reply:
     backend, sdk, target = route
     request = backend.request(target, messages, schema)  # a local error here is not CallFailed
@@ -101,35 +131,54 @@ def _run(
     if call is not None and (hit := _hit(call, hooks)) is not None:
         return hit
     try:
-        raw = backend.endpoint(sdk).create(**request)
-        response = raw.parse()
+        with slot:  # only the request waits for a slot: hooks run outside it
+            raw = backend.endpoint(sdk).create(**request)
+            response = raw.parse()
     except Exception as exc:
         raise _failed(target, exc) from exc
     return _after(call, hooks, backend.reply(target, response, raw.headers, schema, request))
 
 
 async def _run_async(
-    route: Route, messages: Sequence[Message], schema: type[BaseModel] | None, hooks: Sequence[Hook]
+    route: Route,
+    messages: Sequence[Message],
+    schema: type[BaseModel] | None,
+    hooks: Sequence[Hook | AsyncHook],
+    slot: AsyncSlot,
 ) -> Reply:
     backend, sdk, target = route
     request = backend.request(target, messages, schema)  # a local error here is not CallFailed
     call = _call(target, messages, request, schema) if hooks else None
-    if call is not None and (hit := _hit(call, hooks)) is not None:
+    if call is not None and (hit := await _hit_async(call, hooks)) is not None:
         return hit
     try:
-        raw = await backend.endpoint(sdk).create(**request)
-        response = raw.parse()
-        if inspect.isawaitable(response):  # anthropic's async parse() is a coroutine, openai's not
-            response = await response
+        async with slot:
+            raw = await backend.endpoint(sdk).create(**request)
+            response = raw.parse()
+            if inspect.isawaitable(
+                response
+            ):  # anthropic's async parse() is a coroutine, openai's not
+                response = await response
     except Exception as exc:
         raise _failed(target, exc) from exc
-    return _after(call, hooks, backend.reply(target, response, raw.headers, schema, request))
+    reply = backend.reply(target, response, raw.headers, schema, request)
+    return await _after_async(call, hooks, reply)
 
 
 class _Routes:
-    def __init__(self, routes: dict[str, Route]) -> None:
+    def __init__(
+        self, routes: dict[str, Route], hooks: Hooks | None = None, slot: Any = None
+    ) -> None:
         self._routes = routes  # role -> route; one SDK client per endpoint
-        self.hooks = Hooks()  # design §10
+        self.hooks = hooks if hooks is not None else Hooks()  # design §10
+        # Taken around the request only (`Bounded`, design §10): a Slot for LiteModel, an
+        # AsyncSlot for AsyncLiteModel.
+        self._slot = slot if slot is not None else nullcontext()
+
+    def limited(self, slot: Any) -> Self:
+        """The same routes and hooks with each request taking `slot` (`Bounded` / `AsyncBounded`,
+        design §10)."""
+        return type(self)(self._routes, self.hooks, slot)
 
     def target(self, role: str) -> Target:
         """`role`'s resolved target (model, backend, endpoint): what a host records before any
@@ -145,28 +194,39 @@ class _Routes:
 class LiteModel(_Routes):
     """What `build()` returns: a `Model` with `.hooks`."""
 
+    def _hooks(self) -> Sequence[Hook]:
+        return cast(Sequence[Hook], self.hooks.snapshot())  # Hooks refuses an AsyncHook here
+
     def text(self, role: str, messages: Sequence[Message]) -> TextReply:
-        reply = _run(self._route(role), messages, None, self.hooks.snapshot())
+        reply = _run(self._route(role), messages, None, self._hooks(), self._slot)
         return cast(TextReply, reply)
 
     def structured[T: BaseModel](
         self, role: str, messages: Sequence[Message], schema: type[T]
     ) -> StructuredReply[T]:
-        reply = _run(self._route(role), messages, schema, self.hooks.snapshot())
+        reply = _run(self._route(role), messages, schema, self._hooks(), self._slot)
         return cast(StructuredReply[T], reply)
 
 
 class AsyncLiteModel(_Routes):
-    """What `build_async()` returns: an `AsyncModel` with `.hooks` (sync hooks, design §10)."""
+    """What `build_async()` returns: an `AsyncModel` with `.hooks` (sync hooks and `AsyncHook`s,
+    design §10)."""
+
+    def __init__(
+        self, routes: dict[str, Route], hooks: Hooks | None = None, slot: Any = None
+    ) -> None:
+        super().__init__(routes, hooks if hooks is not None else Hooks(allow_async=True), slot)
 
     async def text(self, role: str, messages: Sequence[Message]) -> TextReply:
-        reply = await _run_async(self._route(role), messages, None, self.hooks.snapshot())
+        hooks = self.hooks.snapshot()
+        reply = await _run_async(self._route(role), messages, None, hooks, self._slot)
         return cast(TextReply, reply)
 
     async def structured[T: BaseModel](
         self, role: str, messages: Sequence[Message], schema: type[T]
     ) -> StructuredReply[T]:
-        reply = await _run_async(self._route(role), messages, schema, self.hooks.snapshot())
+        hooks = self.hooks.snapshot()
+        reply = await _run_async(self._route(role), messages, schema, hooks, self._slot)
         return cast(StructuredReply[T], reply)
 
 

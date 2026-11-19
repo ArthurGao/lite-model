@@ -155,6 +155,9 @@ def finish(
         via={h: headers[h] for h in PROFILES[target.type].via_headers if h in headers},
     )
     where, tag = target.where, who.tag
+    # the endpoint's own cache answered: nothing was spent again (§9)
+    cached_header = PROFILES[target.type].cached_header
+    cached = bool(cached_header and headers.get(cached_header))
     if truncated:
         raise Truncated(f"{where}: reply truncated at the output limit ({tag})", usage=usage)
     if unusable is not None:  # a stop-reason enum value, not upstream text
@@ -164,7 +167,7 @@ def finish(
         raise EmptyReply(f"{where}: empty reply ({tag})", usage=usage)
     if schema is None:
         assert isinstance(payload, str)
-        return TextReply(payload, who, usage)
+        return TextReply(payload, who, usage, cached=cached)
     try:
         if isinstance(payload, str):
             value = schema.model_validate_json(payload)
@@ -173,4 +176,4 @@ def finish(
     except ValidationError as exc:
         msg = f"{where}: reply does not match {schema.__name__} ({tag})"
         raise BadStructuredReply(msg, usage=usage) from exc
-    return StructuredReply(value, who, usage)
+    return StructuredReply(value, who, usage, cached=cached)

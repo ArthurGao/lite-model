@@ -23,7 +23,7 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S5 (README, packaging, v0.1.0 release wheel, final close-out) done 2026-11-18; host migrations (design §12) done 2026-11-19: lite-mem, lite-rag, llm-steward. Current release: v0.2.1** (design §14). Next: 0.3.0, lite-cache's prerequisites — `AsyncHook`, `Bounded` slot around the request only, `x-litellm-cache-key` → `cached` (design §10, §14; planned 2026-11-19).
+**S5 done 2026-11-18; host migrations (design §12) done 2026-11-19. Current release: v0.2.1; 0.3.0 implemented 2026-11-20, not yet released** (design §14): `AsyncHook`, `Bounded` slot around the request only, `Bounded.map` carries the caller's context, `x-litellm-cache-key` → `cached` (design §10, §7.2). Open: the Proxy live check of the cache header (starts the Proxy: owner's OK).
 
 ## Rules
 
