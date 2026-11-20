@@ -23,9 +23,9 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**0.4.0 implemented 2026-11-21, not yet released: `turn()`, one model-chosen tool turn for lite-agent** (design §3.1; `tests/contract/test_turns.py`). Additive: `text()` / `structured()`, `Model` and hooks are unchanged, hosts stay on 0.3.0 until they need it.
+**Current release: v0.4.0 (2026-11-21): `turn()`, one model-chosen tool turn** (design §3.1; `tests/contract/test_turns.py`). Additive: `text()` / `structured()`, `Model` and hooks are unchanged. lite-agent depends on it; the other hosts stay on 0.3.0 until they need it.
 
-**S5 done 2026-11-18; host migrations (design §12) done 2026-11-19. Current release: v0.3.0 (2026-11-20)** (design §14): `AsyncHook`, `Bounded` slot around the request only, `Bounded.map` carries the caller's context, `x-litellm-cache-key` → `cached` (design §10, §7.2).
+**S5 done 2026-11-18; host migrations (design §12) done 2026-11-19. v0.3.0 (2026-11-20)** (design §14): `AsyncHook`, `Bounded` slot around the request only, `Bounded.map` carries the caller's context, `x-litellm-cache-key` → `cached` (design §10, §7.2).
 
 ## Rules
 
