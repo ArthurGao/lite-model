@@ -137,6 +137,33 @@ on the `litellm` backend (`router_aliases`, default `[smart-router]`) and use it
 (pinned image, signature checked by cosign before it starts, Ollama-only tiers by default) is in
 [`deploy/litellm/`](deploy/litellm/README.md).
 
+## Tool turns
+
+For a host that runs its own agent loop: one request in which the model may call tools. lite-model sends the
+turn and reads it back; it never executes a tool, loops or keeps a session.
+
+```python
+from lite_model import Message, ToolResult, ToolResults, ToolSpec
+
+clock = ToolSpec("get_time", "Current local time.", {"type": "object", "properties": {}})
+history = [Message("user", "What time is it?")]
+
+reply = model.turn("answer", history, [clock])      # a TurnReply
+if reply.stop == "tool_calls":
+    results = [ToolResult(c.id, run(c.name, c.arguments)) for c in reply.turn.tool_calls]
+    history += [reply.turn, ToolResults(tuple(results))]   # the turn goes back unchanged
+    reply = model.turn("answer", history, [clock])
+print(reply.turn.text)
+```
+
+- `reply.turn.blocks` are in the endpoint's order: `Text`, `ToolCall` and `Opaque` (Anthropic thinking blocks,
+  replayed verbatim to Anthropic and left out of a request to an OpenAI-compatible endpoint).
+- `reply.stop == "length"`: the turn was cut off. Do not execute its calls; answer each with an error result.
+  `text()` raises `Truncated` here; `turn()` returns, because the calls need their results.
+- `ToolCall.arguments is None`: the endpoint's JSON did not parse (`raw_arguments` has the text).
+- Hooks do not see `turn()`. `ToolModel` / `AsyncToolModel` are the protocols; `FakeModel.turn` scripts
+  `AssistantTurn`s and records `turn_calls`.
+
 ## Errors
 
 ```

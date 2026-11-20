@@ -5,7 +5,20 @@ import asyncio
 import pytest
 from pydantic import BaseModel
 
-from lite_model import AsyncModel, EmptyReply, Message, Model
+from lite_model import (
+    AssistantTurn,
+    AsyncModel,
+    CallFailed,
+    EmptyReply,
+    Message,
+    Model,
+    Text,
+    ToolCall,
+    ToolResult,
+    ToolResults,
+    ToolSpec,
+    TurnMessage,
+)
 from lite_model.testing import AsyncFakeModel, FakeCall, FakeModel
 
 ASK = [Message("user", "Hi?")]
@@ -96,3 +109,50 @@ def test_async_fake_model_scripts_and_records_like_fake_model() -> None:
         ("judge", Verdict),
         ("answer", None),
     ]
+
+
+# --- turn() (design §11) ---
+
+
+def test_fake_turn_scripts_turns_and_records_the_tools() -> None:
+    clock = ToolSpec("get_time", "Current time.", {"type": "object"})
+    call = AssistantTurn((ToolCall("c1", "get_time", {}),))
+    done = AssistantTurn((Text("It is noon."),))
+    fake = FakeModel(agent=[call, done])
+    ask = [Message("user", "Time?")]
+
+    first = fake.turn("agent", ask, [clock])
+    assert (first.stop, first.turn) == ("tool_calls", call)
+    assert first.provenance.backend == "fake"
+    history: list[TurnMessage] = [*ask, first.turn, ToolResults((ToolResult("c1", "12:00"),))]
+    second = fake.turn("agent", history, [clock])
+    assert (second.stop, second.turn.text) == ("end", "It is noon.")
+
+    assert [c.tools for c in fake.turn_calls] == [(clock,), (clock,)]
+    assert fake.turn_calls[1].messages == tuple(history)
+    assert fake.calls == []  # text() / structured() calls only
+
+
+def test_fake_turn_scripts_a_truncated_turn_and_an_error() -> None:
+    cut = AssistantTurn((ToolCall("c1", "get_time", None, '{"tz": "U'),))
+    fake = FakeModel(agent=[(cut, "length"), CallFailed("agent failed: TimeoutError")])
+    assert fake.turn("agent", [Message("user", "Time?")], []).stop == "length"
+    with pytest.raises(CallFailed):
+        fake.turn("agent", [Message("user", "Time?")], [])
+
+
+def test_fake_turn_refuses_a_reply_of_the_wrong_kind() -> None:
+    fake = FakeModel(agent="just text", answer=AssistantTurn((Text("hi"),)))
+    with pytest.raises(AssertionError, match="turn\\(\\) needs an AssistantTurn"):
+        fake.turn("agent", [Message("user", "Hi")], [])
+    with pytest.raises(AssertionError, match="text\\(\\) needs str"):
+        fake.text("answer", [Message("user", "Hi")])
+
+
+def test_async_fake_turn_shares_the_script_and_the_record() -> None:
+    from lite_model.testing import AsyncFakeModel
+
+    fake = AsyncFakeModel(agent=AssistantTurn((Text("hi"),)))
+    reply = asyncio.run(fake.turn("agent", [Message("user", "Hi")], []))
+    assert (reply.stop, reply.turn.text) == ("end", "hi")
+    assert len(fake.turn_calls) == 1

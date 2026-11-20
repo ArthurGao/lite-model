@@ -4,7 +4,7 @@ and run calls the same way for every protocol, sync or async."""
 import copy
 import inspect
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from dataclasses import replace
 from types import MappingProxyType
@@ -17,7 +17,15 @@ from lite_model.config import ModelsConfig, RoleSpec, Target, resolve
 from lite_model.errors import CallFailed, ConfigError
 from lite_model.hooks import AsyncHook, Call, Hook, Hooks
 from lite_model.profiles import PROFILES
-from lite_model.types import Message, Reply, StructuredReply, TextReply
+from lite_model.types import (
+    Message,
+    Reply,
+    StructuredReply,
+    TextReply,
+    ToolSpec,
+    TurnMessage,
+    TurnReply,
+)
 
 if TYPE_CHECKING:
     import httpx2
@@ -39,6 +47,21 @@ class AsyncModel(Protocol):
     async def structured[T: BaseModel](
         self, role: str, messages: Sequence[Message], schema: type[T]
     ) -> StructuredReply[T]: ...
+
+
+class ToolModel(Protocol):
+    """One model-chosen tool turn (design §3). A protocol of its own: hosts that implement
+    `Model` with an adapter or a fake keep satisfying it."""
+
+    def turn(
+        self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
+    ) -> TurnReply: ...
+
+
+class AsyncToolModel(Protocol):
+    async def turn(
+        self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
+    ) -> TurnReply: ...
 
 
 Route = tuple[Backend, Any, Target]  # protocol module, SDK client, target
@@ -118,6 +141,33 @@ async def _after_async(call: Call | None, hooks: Sequence[Hook | AsyncHook], rep
     return reply
 
 
+def _send(route: Route, request: dict[str, Any], slot: Slot) -> tuple[Any, Mapping[str, str]]:
+    """Send `request` and return the parsed response and its headers. Only the request waits
+    for a slot: hooks run outside it. Any failure is CallFailed (§8)."""
+    backend, sdk, target = route
+    try:
+        with slot:
+            raw = backend.endpoint(sdk).create(**request)
+            return raw.parse(), raw.headers
+    except Exception as exc:
+        raise _failed(target, exc) from exc
+
+
+async def _send_async(
+    route: Route, request: dict[str, Any], slot: AsyncSlot
+) -> tuple[Any, Mapping[str, str]]:
+    backend, sdk, target = route
+    try:
+        async with slot:
+            raw = await backend.endpoint(sdk).create(**request)
+            response = raw.parse()
+            if inspect.isawaitable(response):  # anthropic's async parse() is a coroutine
+                response = await response
+            return response, raw.headers
+    except Exception as exc:
+        raise _failed(target, exc) from exc
+
+
 def _run(
     route: Route,
     messages: Sequence[Message],
@@ -125,18 +175,13 @@ def _run(
     hooks: Sequence[Hook],
     slot: Slot,
 ) -> Reply:
-    backend, sdk, target = route
+    backend, _, target = route
     request = backend.request(target, messages, schema)  # a local error here is not CallFailed
     call = _call(target, messages, request, schema) if hooks else None
     if call is not None and (hit := _hit(call, hooks)) is not None:
         return hit
-    try:
-        with slot:  # only the request waits for a slot: hooks run outside it
-            raw = backend.endpoint(sdk).create(**request)
-            response = raw.parse()
-    except Exception as exc:
-        raise _failed(target, exc) from exc
-    return _after(call, hooks, backend.reply(target, response, raw.headers, schema, request))
+    response, headers = _send(route, request, slot)
+    return _after(call, hooks, backend.reply(target, response, headers, schema, request))
 
 
 async def _run_async(
@@ -146,23 +191,43 @@ async def _run_async(
     hooks: Sequence[Hook | AsyncHook],
     slot: AsyncSlot,
 ) -> Reply:
-    backend, sdk, target = route
+    backend, _, target = route
     request = backend.request(target, messages, schema)  # a local error here is not CallFailed
     call = _call(target, messages, request, schema) if hooks else None
     if call is not None and (hit := await _hit_async(call, hooks)) is not None:
         return hit
-    try:
-        async with slot:
-            raw = await backend.endpoint(sdk).create(**request)
-            response = raw.parse()
-            if inspect.isawaitable(
-                response
-            ):  # anthropic's async parse() is a coroutine, openai's not
-                response = await response
-    except Exception as exc:
-        raise _failed(target, exc) from exc
-    reply = backend.reply(target, response, raw.headers, schema, request)
+    response, headers = await _send_async(route, request, slot)
+    reply = backend.reply(target, response, headers, schema, request)
     return await _after_async(call, hooks, reply)
+
+
+def _turn_request(
+    route: Route, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
+) -> dict[str, Any]:
+    backend, _, target = route
+    if not PROFILES[target.type].supports_tools:
+        raise ConfigError(f"{target.where}: backend type {target.type} does not take tools")
+    return backend.turn_request(target, messages, tools)  # a local error is not CallFailed
+
+
+def _run_turn(
+    route: Route, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec], slot: Slot
+) -> TurnReply:
+    """`_run` for `turn()`. No hooks: their replies are text or structured, and nothing caches
+    an agent's turns (design §10)."""
+    backend, _, target = route
+    request = _turn_request(route, messages, tools)
+    response, headers = _send(route, request, slot)
+    return backend.turn_reply(target, response, headers, request)
+
+
+async def _run_turn_async(
+    route: Route, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec], slot: AsyncSlot
+) -> TurnReply:
+    backend, _, target = route
+    request = _turn_request(route, messages, tools)
+    response, headers = await _send_async(route, request, slot)
+    return backend.turn_reply(target, response, headers, request)
 
 
 class _Routes:
@@ -192,7 +257,7 @@ class _Routes:
 
 
 class LiteModel(_Routes):
-    """What `build()` returns: a `Model` with `.hooks`."""
+    """What `build()` returns: a `Model` and a `ToolModel`, with `.hooks`."""
 
     def _hooks(self) -> Sequence[Hook]:
         return cast(Sequence[Hook], self.hooks.snapshot())  # Hooks refuses an AsyncHook here
@@ -206,6 +271,11 @@ class LiteModel(_Routes):
     ) -> StructuredReply[T]:
         reply = _run(self._route(role), messages, schema, self._hooks(), self._slot)
         return cast(StructuredReply[T], reply)
+
+    def turn(
+        self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
+    ) -> TurnReply:
+        return _run_turn(self._route(role), messages, tools, self._slot)
 
 
 class AsyncLiteModel(_Routes):
@@ -228,6 +298,11 @@ class AsyncLiteModel(_Routes):
         hooks = self.hooks.snapshot()
         reply = await _run_async(self._route(role), messages, schema, hooks, self._slot)
         return cast(StructuredReply[T], reply)
+
+    async def turn(
+        self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
+    ) -> TurnReply:
+        return await _run_turn_async(self._route(role), messages, tools, self._slot)
 
 
 def _routes(

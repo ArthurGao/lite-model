@@ -21,7 +21,20 @@ from lite_model.errors import (
 )
 from lite_model.hooks import TRANSPORT
 from lite_model.profiles import PROFILES
-from lite_model.types import Message, Provenance, Reply, StructuredReply, TextReply, Usage
+from lite_model.types import (
+    AssistantTurn,
+    Block,
+    Message,
+    Provenance,
+    Reply,
+    StructuredReply,
+    TextReply,
+    ToolSpec,
+    TurnMessage,
+    TurnReply,
+    Usage,
+    stop_for,
+)
 
 
 class Backend(Protocol):
@@ -47,6 +60,14 @@ class Backend(Protocol):
     ) -> Reply:
         """`sent` is what `request()` returned for this call: the fields actually sent."""
         ...
+
+    def turn_request(
+        self, target: Target, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
+    ) -> dict[str, Any]: ...
+
+    def turn_reply(
+        self, target: Target, response: Any, headers: Mapping[str, str], sent: Mapping[str, Any]
+    ) -> TurnReply: ...
 
 
 def sdk_client(cls: Any, target: Target, key: str | None, http_client: Any) -> Any:
@@ -120,23 +141,16 @@ def _number(raw: str | None) -> float | None:
     return value if math.isfinite(value) and value >= 0 else None
 
 
-def finish(
+def _settle(
     target: Target,
-    schema: type[BaseModel] | None,
     sent: Mapping[str, Any],
     headers: Mapping[str, str],
-    *,
     body_model: str | None,
     usage: Usage,
-    truncated: bool,
-    unusable: str | None,
-    payload: str | Mapping[str, Any] | None,
-) -> Reply:
-    """The reply, or the error it amounts to (design §5, §6, §8), for every protocol. Who
-    answered and which parameters were dropped come from the profile's header rules; never from
-    config (§6.1). `payload` is the text, the JSON text of a structured reply, or a forced tool's
-    input; messages never quote it. `unusable` is a stop reason that leaves no usable answer
-    whatever the payload holds (a refusal, a filter, a paused turn)."""
+) -> tuple[Provenance, Usage, bool]:
+    """Who answered, what it cost and whether the endpoint's own cache answered: the part of
+    every reply that does not depend on its content. Raises what the headers amount to
+    (IgnoredParameter, ProvenanceUnknown), with the usage the call spent."""
     headers = {k.lower(): v for k, v in headers.items()}  # profile names are lower case
     try:
         _check_ignored(target, headers, sent)
@@ -154,10 +168,57 @@ def finish(
         routed=target.routed,
         via={h: headers[h] for h in PROFILES[target.type].via_headers if h in headers},
     )
-    where, tag = target.where, who.tag
     # the endpoint's own cache answered: nothing was spent again (§9)
     cached_header = PROFILES[target.type].cached_header
-    cached = bool(cached_header and headers.get(cached_header))
+    return who, usage, bool(cached_header and headers.get(cached_header))
+
+
+def finish_turn(
+    target: Target,
+    sent: Mapping[str, Any],
+    headers: Mapping[str, str],
+    *,
+    body_model: str | None,
+    usage: Usage,
+    truncated: bool,
+    unusable: str | None,
+    blocks: Sequence[Block],
+) -> TurnReply:
+    """`finish()` for `turn()` (design §8). A turn cut off at the output limit comes back as
+    `stop="length"` with the calls it carries, because the caller owes each of them a result;
+    only one with nothing to answer raises Truncated."""
+    who, usage, cached = _settle(target, sent, headers, body_model, usage)
+    where, tag = target.where, who.tag
+    if unusable is not None:  # a stop-reason enum value, not upstream text
+        msg = f"{where}: no usable reply (stop reason {unusable}) ({tag})"
+        raise EmptyReply(msg, usage=usage)
+    turn = AssistantTurn(tuple(blocks))
+    if not turn.tool_calls and not turn.text.strip():
+        if truncated:
+            raise Truncated(f"{where}: reply truncated at the output limit ({tag})", usage=usage)
+        raise EmptyReply(f"{where}: empty reply ({tag})", usage=usage)
+    return TurnReply(turn, stop_for(turn, truncated=truncated), who, usage, cached=cached)
+
+
+def finish(
+    target: Target,
+    schema: type[BaseModel] | None,
+    sent: Mapping[str, Any],
+    headers: Mapping[str, str],
+    *,
+    body_model: str | None,
+    usage: Usage,
+    truncated: bool,
+    unusable: str | None,
+    payload: str | Mapping[str, Any] | None,
+) -> Reply:
+    """The reply, or the error it amounts to (design §5, §6, §8), for every protocol. Who
+    answered and which parameters were dropped come from the profile's header rules; never from
+    config (§6.1). `payload` is the text, the JSON text of a structured reply, or a forced tool's
+    input; messages never quote it. `unusable` is a stop reason that leaves no usable answer
+    whatever the payload holds (a refusal, a filter, a paused turn)."""
+    who, usage, cached = _settle(target, sent, headers, body_model, usage)
+    where, tag = target.where, who.tag
     if truncated:
         raise Truncated(f"{where}: reply truncated at the output limit ({tag})", usage=usage)
     if unusable is not None:  # a stop-reason enum value, not upstream text

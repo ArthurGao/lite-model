@@ -40,7 +40,8 @@ LiteLLM Proxy 做，lite-model 只把它当作一个后端，并在客户端补�
 
 - **不包装 `litellm` Python 包**，也不在进程里跑路由。路由只在 LiteLLM Proxy 里做（理由见 §7.1）。
 - 不做换模型的 fallback；不做同一模型简单重试以外的重试。
-- 不执行工具、不跑 agent loop、不管会话状态。
+- 不执行工具、不跑 agent loop、不管会话状态。0.4.0 起提供"带 tools 的一轮调用"（§3.1）：只是一次请求和
+  回复，loop 在调用方（lite-agent）。
 - 不管 prompt 模板（留在各模块的 `prompts/`），不做缓存本身（交给 lite-cache）。
 - 不做 streaming（4 个模块都没用到）。
 - embedding 留到 v2（lite-rag、lite-mem 各有一份 embedding 客户端，见 §15 待确认）。
@@ -133,6 +134,111 @@ def build_async(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.As
       "graph": RolePolicy(routable=False),
   })
   ```
+
+### 3.1 带 tools 的一轮：`turn()`（0.4.0）
+
+给 lite-agent 的 loop 用：模型自己决定调不调 tool、调哪个。lite-model 只负责**这一轮**的请求和回复；
+执行 tool、决定是否继续、保存历史都是调用方的事（§1 非目标不变）。
+
+```python
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    parameters: Mapping[str, Any]          # JSON Schema of the input
+
+@dataclass(frozen=True)
+class Text:
+    text: str
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: Mapping[str, Any] | None    # None: the endpoint's JSON text did not parse to an object
+    raw_arguments: str | None = None       # the text as received, only when it did not parse
+
+@dataclass(frozen=True)
+class Opaque:                              # content only its own protocol understands
+    protocol: Literal["openai", "anthropic"]
+    data: Mapping[str, Any]
+
+@dataclass(frozen=True)
+class AssistantTurn:                       # goes back into the history unchanged
+    blocks: tuple[Text | ToolCall | Opaque, ...]   # in the endpoint's order
+    # .text, .tool_calls: read-only views
+
+@dataclass(frozen=True)
+class ToolResult:
+    call_id: str
+    content: str
+    is_error: bool = False
+
+@dataclass(frozen=True)
+class ToolResults:                         # every result of one assistant turn
+    results: tuple[ToolResult, ...]
+
+TurnMessage = Message | AssistantTurn | ToolResults
+
+@dataclass(frozen=True)
+class TurnReply:
+    turn: AssistantTurn
+    stop: Literal["end", "tool_calls", "length"]
+    provenance: Provenance
+    usage: Usage
+    cached: bool = False
+
+class ToolModel(Protocol):
+    def turn(self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]) -> TurnReply: ...
+
+class AsyncToolModel(Protocol):
+    async def turn(self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]) -> TurnReply: ...
+```
+
+- **单独的协议**，不往 `Model` / `AsyncModel` 里加方法：宿主自己实现 `Model` 的 adapter 和 fake 继续满足原
+  协议。`LiteModel` / `AsyncLiteModel` 两个都实现。`text()`、`structured()`、`Message` 和它们的请求体不变。
+- **`blocks` 保持端点给的顺序**，调用方把 `reply.turn` 原样放回历史。
+- **`stop`**：`length` = 被输出上限截断；否则有 call 就是 `tool_calls`（端点报 `stop` 但带着 call 时也是），
+  没有就是 `end`。
+- **截断不抛 `Truncated`**（与 `text()` 不同）：这一轮带着的 call 不能执行，但下一次请求之前每个 call 都要
+  有一条结果，调用方需要拿到它们的 id。只有"截断且既没有文本也没有 call"才抛 `Truncated`。
+- **参数不是合法的 JSON 对象时不抛错**：`arguments=None`，`raw_arguments` 是原文；由调用方当作无效参数回给
+  模型。重放这一轮时原文照发。
+- 拒答、content filter、`pause_turn`、未知的 stop reason、既没有文本也没有 call：`EmptyReply`（带 usage）。
+  只有 thinking 的回复也是 `EmptyReply`。Chat Completions 的 `finish_reason` 只认 `stop`、`tool_calls`、
+  `function_call`、`length` 和缺省；其它值一律不可用，错误里写 "unexpected"，不回显端点的字符串。（`text()` /
+  `structured()` 在这类端点上只把 `content_filter` 当作不可用，行为没有改。）
+- 这些类型是 frozen 的，但只冻结一层：`Mapping` 字段保留调用方传入的对象（与 `Provenance.via` 相同），交出去之后
+  不要再改。
+- 没有结果的 `ToolResults` 不产生任何消息（Anthropic 拒绝内容为空的 user 消息）。
+- 历史中间的 system `Message`：Chat Completions 原位发送；Anthropic 与开头的一样拼进 `system` 字段（沿用
+  `text()` 的做法）。
+- `tool_choice` 不发（端点默认 auto）。Anthropic 较新的模型拒绝强制的 `tool_choice`（400）。不暴露
+  `parallel_tool_calls`。`tools` 为空时不发 `tools` 字段。
+- **不经过 hook**（§10）。`Bounded` 的槽位照常生效。
+- 后端类型不支持 tools（`BackendProfile.supports_tools`，§5）时，`turn()` 抛 `ConfigError`，不发请求。
+
+两种协议的映射（契约测试 `tests/contract/test_turns.py` 逐字段检查）：
+
+| | Chat Completions（ollama / openai / gateway / litellm） | Anthropic Messages |
+| --- | --- | --- |
+| `ToolSpec` | `{type: function, function: {name, description, parameters}}` | `{name, description, input_schema}` |
+| 历史里的 `AssistantTurn` | 一条 assistant 消息：`content` = 文本（没有则 `null`），`tool_calls[]`（`arguments` 是 JSON 文本） | 一条 assistant 消息，content blocks 按序：`text`、`tool_use`、本协议的 `Opaque` 原样；空文本块不发 |
+| 历史里的 `ToolResults` | 每个结果一条 `{role: tool, tool_call_id, content}`；协议没有错误标志，`is_error` 不发 | **一条** user 消息，每个结果一个 `tool_result`（`is_error: true` 只在出错时带） |
+| 回复 → blocks | `content` → `Text`；`tool_calls` 里 `type == function` 的 → `ToolCall` | `text` → `Text`；`tool_use` → `ToolCall`；其它（`thinking`、`redacted_thinking`……）→ `Opaque("anthropic", 收到的字段)`：SDK 对象的 `to_dict()`，即端点发来的字段和值（含显式的 null 和额外字段），是字典往返，不是保留原始字节 |
+| 截断 | `finish_reason: length` | `stop_reason: max_tokens` / `model_context_window_exceeded` |
+
+**`Opaque` 的重放规则**：`protocol` 与目标后端的协议相同就原样发回，不同就不发（另一种协议里没有它的位置）。
+同协议换模型时不删：Anthropic 的 API 自己丢掉目标模型读不了的 thinking block，不计费；自己删反而可能触发
+签名 / 顺序错误。0.4.0 的 Chat Completions 后端不产生 `Opaque`（见 §15）。
+
+**lite-model 不替调用方处理 Anthropic 的"preserved thinking"历史检查**（较新的模型：`system`、`tools` 或更早
+的消息变了，之后的 thinking block 全部失效，请求 400）：不加 beta header，不做 `drop_block`。历史里带哪些
+`Opaque` 由调用方决定——只追加的历史不受影响；调用方改写了历史（压缩、换 system 或 tools）之后，要自己不再
+带之前的 `Opaque`。这类 400 在这里是 `CallFailed`。
+
+已知限制：跨协议重放时 tool call 的 id 原样使用（没有遇到过不被接受的 id，未系统验证）；另一种协议里没解析
+出来的参数发给 Anthropic 时是空对象 `{}`。
 
 ## 4. 配置
 
@@ -234,6 +340,7 @@ routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connec
 | `ignored_params_header` | 列出被丢弃字段的响应头 | gateway：`X-LLMGW-Ignored-Params` |
 | `request_headers` | 每个请求带的头 | litellm：`x-litellm-num-retries: 0` |
 | `role_tag` | 把 role 作为 `metadata.tags` 发出（§7.3） | litellm：是 |
+| `supports_tools` | 端点接不接受 `tools`（`turn()`，§3.1）；否则 `ConfigError` | 五种类型都是（0.4.0）。实测：ollama `qwen3:1.7b`（2026-11-21，`-m ollama`）；llm-gateway 按它的 `docs/DESIGN.md` §9 支持，未经 lite-model 实测；litellm、openai、anthropic 只有契约测试 |
 
 思考 token 计入输出上限：经 LiteLLM 的 qwen3 开着思考时，`max_tokens` 小会得到空 `content` 和
 `finish_reason: "length"`（应报 `Truncated`，不是 `EmptyReply`）。
@@ -378,6 +485,9 @@ ModelError (base)
 - 错误信息只含 role、`backend:model` 和异常类型，**不含上游原文**（SDK 和代理可能回显 key、auth 头、带凭证
   的 URL；沿用 lite-mem `_failed`），原始异常留在 `__cause__`。
 
+`turn()` 的差别（§3.1）：被截断的一轮是回复（`stop="length"`），不是 `Truncated`，除非它什么都没带；没有
+`BadStructuredReply`（参数不合法是 `ToolCall.arguments=None`）。其余错误、用量和"不含上游原文"的规则相同。
+
 ## 9. 用量与成本
 
 - `Usage`：input、output、reasoning（`completion_tokens_details.reasoning_tokens`，有就记；经 LiteLLM →
@@ -443,11 +553,18 @@ ModelError (base)
     `usage` 算成这次花掉的（lite-cache 的 `after` 待跟进）。
   - 不加 `failed(call, error)` hook：lite-cache 不统计失败的调用（它的设计 §0），失败调用的用量在异常上（§9）。
 
+- **`turn()` 不经过 hook**（0.4.0）：hook 的回复类型是 `TextReply | StructuredReply`，唯一的 hook 是 lite-cache，
+  而 agent 的轮次不缓存（每一轮上下文都不同）。让 hook 看到 `TurnReply` 需要先扩 `Hook` 协议和 lite-cache 的序列化
+  （§15）。`Bounded` / `AsyncBounded` 的槽位对 `turn()` 照常生效。
+
 ## 11. 测试工具
 
 - `lite_model.testing.FakeModel`：按 role 脚本化回复（文本或结构化对象，也可以是要抛的异常；列表按次消费，
   函数按调用计算），记录每次请求（role、messages、schema），实现 `Model`。`AsyncFakeModel` 同样的脚本、同一份
   `calls`，实现 `AsyncModel`（一个类不能让同名方法既同步又异步）。来源为 `backend="fake"`。
+- `FakeModel.turn` / `AsyncFakeModel.turn`（0.4.0）：脚本是 `AssistantTurn`（有 call 时 `stop="tool_calls"`，否则
+  `"end"`）、`(AssistantTurn, stop)`（脚本化 `"length"`）或异常；调用记在 `turn_calls`（`FakeTurnCall`：role、
+  messages、tools），不进 `calls`——`FakeCall.messages` 的类型不变，宿主现有测试不受影响。
 - 契约测试同步、异步各跑一遍（`tests/contract/conftest.py` 的 `connect` fixture）。
 - 契约测试：**真的 SDK**，只把 transport 换成记录请求的假 endpoint（`build(..., http_client=...)`，
   `tests/upstream.py`），检查每个后端实际发出的请求体（参数名、strict schema、强制工具、header）。
@@ -538,10 +655,28 @@ lite-model/
 | **S5** 发布与收尾 | README、`deploy/litellm/`、v0.1.0 release wheel；整个库的最终收尾 review | 宿主可以从 wheel 安装；全量检查绿 |
 | **S6+** 迁移 | 在 lite-mem、lite-rag、llm-steward 各自 repo 里按 §12 迁移 | 见 §12 |
 | **0.3.0** lite-cache 的前置（2026-11-20 实现） | `AsyncHook`；`Bounded` 槽位只包住真正的请求；`Bounded.map` 带调用方 context；litellm 回复带 `x-litellm-cache-key` 时 `cached=True` | `tests/contract/test_bounded_hooks.py`：concurrency 1 时命中不等正在跑的调用（sync、async）；hook 经同一个 `Bounded` 调模型不死锁；`map` 里 hook 看得到 `call_context`；async hook 命中短路且不阻塞其它 task；同步模型拒绝 `AsyncHook`。`test_usage_and_hooks.py`：带缓存头的 litellm 回复 `cached=True`、来源不变，空值或别的后端不算 |
+| **0.4.0** lite-agent 的前置（2026-11-21 实现） | `turn()`（§3.1）：`ToolSpec`、`AssistantTurn`（有序 blocks）、`ToolResults`、`TurnReply`、`ToolModel` / `AsyncToolModel`；两种协议的请求和回复映射；`Opaque` 重放规则；`supports_tools`；`FakeModel.turn` | `tests/contract/test_turns.py`（同步、异步）：带 tools 的请求体；历史里的 call 和结果（OpenAI 每个结果一条 `tool` 消息，Anthropic 一条 user 消息）；多个 call 的顺序和 id；截断返回 `stop="length"` 和它的 call；不合法的参数；thinking block 的字段和值原样往返、位置不变、交错顺序保留；未知的 `finish_reason`；空的 `ToolResults`；历史中间的 system 消息；另一种协议的 `Opaque` 不发；`EmptyReply` / `Truncated` / `CallFailed` / `ProvenanceUnknown` 带对的 usage；不调用 hook；`text()` 请求体不变。`-m ollama`：一个真实的 tool 轮次加结果 |
 
 ### 阶段记录
 
 （每个阶段完成后在这里追加：日期、做了什么、review 结论、被拒的 finding 及理由。）
+
+- **0.4.0（2026-11-21）**：`turn()`（§3.1）。检查：ruff、ruff format、mypy 干净；pytest 全绿；`-m ollama` 5 passed
+  （含一个真实的 tool 轮次，qwen3:1.7b）。新测试先红后绿；事后逐行破坏实现确认断言会失败，其中"回复 block 的顺序"
+  一处最初不红，补了交错顺序的测试。
+  - `/simplify`（reuse / simplification / efficiency / altitude 四路）：采纳——发请求的代码块抽成 `_send` /
+    `_send_async`（原来四份）；两个后端的 `_params` 自己调 `_history`，`request()` 不再另写一遍消息映射；stop 规则
+    抽成 `types.stop_for`，后端和 fake 共用；fake 的 `_reply` 由调用方传入记录列表；测试复用已有的 `Recorder` 和
+    `test_anthropic` 的配置。没采纳——`finish` / `finish_turn` 里重复的三句错误消息（两处检查顺序不同，抽出来更难读）；
+    历史里每个 call 的参数每轮重新 `json.dumps`（代价很小，改法会改变 `raw_arguments` 的含义）；LiteLLM 测试配置复用
+    （会改变断言的值）。
+  - Codex 只读 review（整个阶段的 diff）：1 High、2 Medium、1 Low。修复——Chat Completions 未知的 `finish_reason`
+    被当成正常结束（High，回归测试先红）；空的 `ToolResults` 给 Anthropic 发出内容为空的 user 消息（Medium，回归测试
+    先红）；补了历史中间 system 消息的契约测试（Low）；"逐字节"的说法改成"字段和值原样（字典往返）"。部分否决——
+    "frozen 类型里的 Mapping 可变，应在构造时深拷贝并冻结"：不做深冻结（`Provenance.via` 已是同样的做法，每轮对
+    整段历史深拷贝不值得），改为在类型注释和 §3.1 里写明只冻结一层。
+  - 留给 owner：`supports_tools` 现在五种类型都是 True，拒绝分支只有测试里打补丁才走得到（两路 review 都指出）。
+    它是批准的 plan 里的一项，保留；不需要这个扩展点就删掉。
 
 **S0（2026-11-18）环境与核实。**
 - 骨架：`pyproject.toml`（Python 3.12，uv_build；openai 3.46.0、pydantic 2.14.3、pydantic-settings 2.16.2、
@@ -718,6 +853,14 @@ lite-model/
 `keyless` 就去掉宿主的这两个；同一个条目里两个都写仍然报错。测试先红；生产代码约 6 行、一个文件，按全局规则不做收尾。
 
 ## 15. 待确认
+
+- **`turn()` 与 hook**（0.4.0）：现在不经过 hook。有宿主要缓存或观测 agent 的轮次时，再扩 `Hook` 协议。
+- **Chat Completions 端点的 reasoning 内容**（0.4.0）：Ollama、DeepSeek 等在非标准字段里返回思考内容，有的要求
+  在 tool 轮次之间传回。0.4.0 不采集、不回传（这些后端不产生 `Opaque`）；接入这样的模型做 agent 时要先核实并补上。
+- **Anthropic 后端的 `structured()` 用强制 tool**（`anthropic_messages.py` 的 `tool_choice`）：Claude API 参考写明
+  Opus 5.5、Sonnet 5.5、Fable 5.1 及之后的模型上强制 `tool_choice` 是 400。0.4.0 没动它（会改现有宿主的请求体）；
+  要单独处理（改用 `output_config.format`），未在真实端点上验证。
+- **preserved thinking 的 400**（§3.1）：现在落在 `CallFailed` 里，调用方分不出它和别的失败。需要时加一种专门的错误。
 
 - **llm-gateway 的两处修改**（在 llm-gateway repo 里做，不在本 repo）：
   1. `reasoning_effort` 透传（现在被丢弃；lite-rag graph 和 lite-mem eval 设的 `"none"` 经过 gateway 时不生效，

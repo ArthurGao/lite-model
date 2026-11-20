@@ -13,20 +13,18 @@ def completion(
     model: str = "qwen3:8b",
     finish: str = "stop",
     usage: dict[str, Any] | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """A Chat Completions response body."""
+    reply: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        reply["tool_calls"] = tool_calls
     return {
         "id": "chatcmpl-1",
         "object": "chat.completion",
         "created": 1,
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "finish_reason": finish,
-                "message": {"role": "assistant", "content": content},
-            },
-        ],
+        "choices": [{"index": 0, "finish_reason": finish, "message": reply}],
         "usage": usage or {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
     }
 
@@ -50,8 +48,13 @@ def message(
     }
 
 
-def tool_use(name: str, data: dict[str, Any]) -> dict[str, Any]:
-    return {"type": "tool_use", "id": "toolu_1", "name": name, "input": data}
+def tool_use(name: str, data: dict[str, Any], id: str = "toolu_1") -> dict[str, Any]:
+    return {"type": "tool_use", "id": id, "name": name, "input": data}
+
+
+def function_call(id: str, name: str, arguments: str) -> dict[str, Any]:
+    """One entry of a Chat Completions `tool_calls`; `arguments` is JSON text, as on the wire."""
+    return {"id": id, "type": "function", "function": {"name": name, "arguments": arguments}}
 
 
 Scripted = tuple[int, dict[str, Any] | str] | tuple[int, dict[str, Any] | str, dict[str, str]]

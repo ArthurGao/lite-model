@@ -15,6 +15,9 @@ from lite_model import (
     RoleSpec,
     StructuredReply,
     TextReply,
+    ToolSpec,
+    TurnMessage,
+    TurnReply,
     build,
     build_async,
 )
@@ -49,6 +52,11 @@ class Caller:
         self, role: str, messages: Sequence[Message], schema: type[T]
     ) -> StructuredReply[T]:
         return cast(StructuredReply[T], self._wait(self._model.structured(role, messages, schema)))
+
+    def turn(
+        self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
+    ) -> TurnReply:
+        return cast(TurnReply, self._wait(self._model.turn(role, messages, tools)))
 
 
 class Connect(Protocol):

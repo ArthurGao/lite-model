@@ -1,7 +1,16 @@
 """lite-model: the shared model-call layer for the lite modules (docs/lite-model-design.md)."""
 
 from lite_model.bounded import AsyncBounded, Bounded
-from lite_model.client import AsyncLiteModel, AsyncModel, LiteModel, Model, build, build_async
+from lite_model.client import (
+    AsyncLiteModel,
+    AsyncModel,
+    AsyncToolModel,
+    LiteModel,
+    Model,
+    ToolModel,
+    build,
+    build_async,
+)
 from lite_model.config import (
     BackendConfig,
     ModelsConfig,
@@ -23,14 +32,36 @@ from lite_model.errors import (
 )
 from lite_model.hooks import call_context
 from lite_model.schema import strict_schema
-from lite_model.types import Channel, Message, Provenance, Reply, StructuredReply, TextReply, Usage
+from lite_model.types import (
+    AssistantTurn,
+    Block,
+    Channel,
+    Message,
+    Opaque,
+    Provenance,
+    Reply,
+    Stop,
+    StructuredReply,
+    Text,
+    TextReply,
+    ToolCall,
+    ToolResult,
+    ToolResults,
+    ToolSpec,
+    TurnMessage,
+    TurnReply,
+    Usage,
+)
 
 __all__ = [
+    "AssistantTurn",
     "AsyncBounded",
     "AsyncLiteModel",
     "AsyncModel",
+    "AsyncToolModel",
     "BackendConfig",
     "BadStructuredReply",
+    "Block",
     "Bounded",
     "CallFailed",
     "Channel",
@@ -42,6 +73,7 @@ __all__ = [
     "Model",
     "ModelError",
     "ModelsConfig",
+    "Opaque",
     "Price",
     "Provenance",
     "ProvenanceUnknown",
@@ -49,10 +81,19 @@ __all__ = [
     "RoleConfig",
     "RolePolicy",
     "RoleSpec",
+    "Stop",
     "StructuredReply",
     "Target",
+    "Text",
     "TextReply",
+    "ToolCall",
+    "ToolModel",
+    "ToolResult",
+    "ToolResults",
+    "ToolSpec",
     "Truncated",
+    "TurnMessage",
+    "TurnReply",
     "Usage",
     "build",
     "build_async",
