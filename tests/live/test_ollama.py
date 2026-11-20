@@ -6,7 +6,19 @@ import asyncio
 import pytest
 from pydantic import BaseModel
 
-from lite_model import Message, ModelsConfig, RolePolicy, RoleSpec, Truncated, build, build_async
+from lite_model import (
+    Message,
+    ModelsConfig,
+    RolePolicy,
+    RoleSpec,
+    ToolResult,
+    ToolResults,
+    ToolSpec,
+    Truncated,
+    TurnMessage,
+    build,
+    build_async,
+)
 
 pytestmark = pytest.mark.ollama
 
@@ -50,3 +62,24 @@ def test_async_structured_through_ollama() -> None:
     reply = asyncio.run(build_async(CONFIG, ROLES).structured("answer", ask, Sum))
     assert reply.value == Sum(result=42)
     assert reply.provenance.tag == "ollama:qwen3:1.7b"
+
+
+def test_a_tool_turn_and_its_result_through_ollama() -> None:
+    clock = ToolSpec(
+        name="get_time",
+        description="Returns the current local time. Call it whenever the user asks for the time.",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    )
+    ask: list[TurnMessage] = [Message("user", "What time is it right now? Use the tool.")]
+    model = build(CONFIG, ROLES)
+
+    first = model.turn("answer", ask, [clock])
+    assert first.stop == "tool_calls"
+    (call,) = first.turn.tool_calls
+    assert (call.name, call.arguments) == ("get_time", {})
+    assert first.provenance.tag == "ollama:qwen3:1.7b"
+
+    done = ToolResults((ToolResult(call.id, "The time is 12:34."),))
+    second = model.turn("answer", [*ask, first.turn, done], [clock])
+    assert second.stop == "end"
+    assert "12:34" in second.turn.text

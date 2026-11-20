@@ -35,6 +35,9 @@ class BackendProfile:
     cost_header: str | None = None  # the endpoint's own cost in USD, preferred to prices (§9)
     # Present and non-empty only when the endpoint answered from its own cache (§7.2, §9).
     cached_header: str | None = None
+    # `turn()` is refused on a type whose endpoint cannot take `tools` (design §5). Whether a
+    # given model uses them well is the model's affair, not the type's.
+    supports_tools: bool = True
 
 
 PROFILES: dict[BackendType, BackendProfile] = {
