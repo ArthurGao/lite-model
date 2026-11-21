@@ -2,7 +2,7 @@
 batch and provenance rules, and the config checks. Every call test runs sync and async."""
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import pytest
@@ -20,7 +20,13 @@ from lite_model import (
     build,
     build_async,
 )
-from lite_model.testing import AsyncFakeModel, FakeEmbedCall, FakeModel, hash_vectors
+from lite_model.testing import (
+    AsyncFakeModel,
+    FakeCall,
+    FakeEmbedCall,
+    FakeModel,
+    hash_vectors,
+)
 from tests.configs import local_validate
 from tests.upstream import Upstream, embeddings
 
@@ -245,7 +251,7 @@ def test_chat_settings_on_an_embed_role_are_refused(setting: dict[str, Any]) -> 
 
 
 def test_fake_embed_records_calls_and_hash_vectors_are_deterministic() -> None:
-    fake = FakeModel(vectors={"embed": hash_vectors(4)})
+    fake = FakeModel.with_vectors({"embed": hash_vectors(4)})
     first = fake.embed("embed", ["a", "b"])
     again = fake.embed("embed", ["a"])
     assert first.dim == 4 and len(first.vectors) == 2
@@ -256,10 +262,22 @@ def test_fake_embed_records_calls_and_hash_vectors_are_deterministic() -> None:
 
 
 def test_async_fake_embed() -> None:
-    fake = AsyncFakeModel(vectors={"embed": lambda call: [[float(len(t))] for t in call.texts]})
+    by_length = {"embed": lambda call: [[float(len(t))] for t in call.texts]}
+    fake = AsyncFakeModel.with_vectors(by_length)
     reply = asyncio.run(fake.embed("embed", ["ab", "c"]))
     assert reply.vectors == [[2.0], [1.0]]
     assert fake.embed_calls == [FakeEmbedCall("embed", ("ab", "c"))]
+
+
+def test_scripts_unpacked_from_a_dict_still_type_check() -> None:
+    # 0.5.0's `vectors=` keyword broke hosts that build a fake from a dict (lite-rag testing.py:
+    # `FakeModel(**{role: script})`): mypy matched the dict's values against `vectors` too. The
+    # check is mypy on this file; the run proves the scripts still land as chat scripts.
+    scripts: dict[str, Callable[[FakeCall], str]] = {"answer": lambda call: "ok"}
+    assert FakeModel(**scripts).text("answer", []).text == "ok"
+    assert asyncio.run(AsyncFakeModel(**scripts).text("answer", [])).text == "ok"
+    role_named_vectors = FakeModel.with_vectors({}, vectors="a role called vectors")
+    assert role_named_vectors.text("vectors", []).text == "a role called vectors"
 
 
 def test_an_embed_target_carries_no_chat_settings() -> None:
@@ -279,7 +297,7 @@ def test_bounded_embeds_through_its_slot() -> None:
     up = Upstream((200, embeddings([0.5])))
     reply = Bounded(build(_config(), ROLES, http_client=up.client())).embed("embed", ["x"])
     assert reply.vectors == [[0.5]]
-    fake = AsyncFakeModel(vectors={"embed": hash_vectors(3)})
+    fake = AsyncFakeModel.with_vectors({"embed": hash_vectors(3)})
     assert asyncio.run(AsyncBounded(fake).embed("embed", ["y"])).dim == 3
 
 

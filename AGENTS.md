@@ -23,7 +23,9 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**v0.5.0 (2026-11-21, to release): `embed()` and Anthropic structured output via `output_config.format`** (design §3.2, §15; `tests/contract/test_embed.py`, `test_anthropic.py`). `embed()` is additive (an embed role: `RolePolicy(kind="embed")`, never routable; ollama / openai / litellm). The Anthropic change alters the structured request body for hosts on the `anthropic` backend: newer Claude models reject the forced `tool_choice` it replaced.
+**v0.5.1 (2026-11-22): `FakeModel.with_vectors(...)` replaces 0.5.0's `FakeModel(vectors=...)`**, which broke mypy in hosts that build a fake from a dict (`FakeModel(**scripts)`; design §14 0.5.1 record). Use 0.5.1, not 0.5.0.
+
+**v0.5.0 (2026-11-21): `embed()` and Anthropic structured output via `output_config.format`** (design §3.2, §15; `tests/contract/test_embed.py`, `test_anthropic.py`). `embed()` is additive (an embed role: `RolePolicy(kind="embed")`, never routable; ollama / openai / litellm). The Anthropic change alters the structured request body for hosts on the `anthropic` backend: newer Claude models reject the forced `tool_choice` it replaced.
 
 **v0.4.0 (2026-11-21): `turn()`, one model-chosen tool turn** (design §3.1; `tests/contract/test_turns.py`). Additive: `text()` / `structured()`, `Model` and hooks are unchanged. lite-agent depends on it; the other hosts stay on 0.3.0 until they need it.
 
