@@ -276,7 +276,7 @@ reply.usage        # input = 端点报告的 token 数；output = 0
   - 空输入是 `ValueError`：不发请求，也就没有可以记录的来源。
   - 400 / 413 时把一批拆小重试（lite-rag 的做法），等 lite-rag 迁移时再加。
 - **不经过 hook**：和 `turn()` 一样。hook 的回复类型是文本或结构化回复，lite-cache 也不缓存向量。
-- **测试工具**：`FakeModel(vectors={"embed": hash_vectors(8)})` / `AsyncFakeModel(vectors=...)`。
+- **测试工具**：`FakeModel.with_vectors({"embed": hash_vectors(8)}, **scripts)` / `AsyncFakeModel.with_vectors(...)`（0.5.1 起；0.5.0 的 `vectors=` 关键字会让宿主的 `FakeModel(**scripts)` 过不了 mypy）。
   - embed 的脚本和其他脚本分开放：不放进 `FakeReply` 联合类型，否则宿主测试里已有的 `list` 脚本会推断失败。
   - 每个 role 一个 callable：收到 `FakeEmbedCall(role, texts)`，返回向量；也可以给一个异常让它抛出。
   - 调用记在 `embed_calls` 里。
@@ -707,6 +707,10 @@ lite-model/
 
 （每个阶段完成后在这里追加：日期、做了什么、review 结论、被拒的 finding 及理由。）
 
+- **0.5.1（2026-11-22）**：`FakeModel(vectors=)` 改成 `FakeModel.with_vectors(vectors, /, **scripts)`（`AsyncFakeModel` 同）。
+  - 原因：0.5.0 发布后跨 repo 检查时，用 0.5.0 跑各宿主的 mypy，lite-rag `testing.py:93` 和 lite-mem `testing.py:63` 报错。它们用 `FakeModel(**{role: script})` 建 fake，mypy 会拿 dict 的值去匹配每个关键字参数，`vectors` 也不例外。`__init__` 恢复成 0.4.0 的 `**scripts`；向量放到只收位置参数的 classmethod，名叫 `vectors` 的 role 也不冲突。
+  - 测试：`test_embed.py::test_scripts_unpacked_from_a_dict_still_type_check`，用 mypy 检查（修之前 3 个错误，修之后通过）；pytest 363 passed。
+  - 教训：库改了公开签名之后，跨 repo 检查要连宿主的 mypy 一起跑，只跑 pytest 不够。
 - **0.5.0（2026-11-21）**：`embed()`（§3.2）和 Anthropic `structured()` 改用 `output_config.format`（§15）。
   - 检查：ruff、ruff format、mypy 都通过；pytest 362 passed；`-m ollama` 6 passed（含 `/v1/embeddings` 与 `/api/embed` 向量相等）。
   - 新测试先红后绿，事后又逐行破坏实现，确认断言会失败：`encoding_format`、按 index 排序、跨批来源、chat 设置清空、embed role 不可路由、条数校验、Anthropic 请求形状、`Bounded.embed`。

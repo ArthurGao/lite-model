@@ -4,7 +4,7 @@ recorded; no network."""
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel
 
@@ -72,8 +72,8 @@ FakeReply = (
     str | BaseModel | dict[str, Any] | AssistantTurn | tuple[AssistantTurn, Stop] | BaseException
 )
 Script = FakeReply | list[FakeReply] | Callable[[Any], FakeReply]
-# embed() scripts, by role, apart from the others (`FakeModel(vectors={...})`): the vectors for one
-# call, computed from it (e.g. `hash_vectors(dim)`), or an exception to raise.
+# embed() scripts, by role, apart from the others (`FakeModel.with_vectors({...})`): the vectors
+# for one call, computed from it (e.g. `hash_vectors(dim)`), or an exception to raise.
 EmbedScript = Callable[["FakeEmbedCall"], list[list[float]]] | BaseException
 
 
@@ -81,12 +81,21 @@ class FakeModel:
     """Implements `Model`. Provenance says `backend="fake"`, so a fake answer is never mistaken
     for a model's."""
 
-    def __init__(self, *, vectors: Mapping[str, EmbedScript] | None = None, **scripts: Script):
+    def __init__(self, **scripts: Script):
         self._scripts = {role: list(s) if isinstance(s, list) else s for role, s in scripts.items()}
-        self._vectors = dict(vectors or {})
+        self._vectors: dict[str, EmbedScript] = {}
         self.calls: list[FakeCall] = []
         self.turn_calls: list[FakeTurnCall] = []
         self.embed_calls: list[FakeEmbedCall] = []
+
+    @classmethod
+    def with_vectors(cls, vectors: Mapping[str, EmbedScript], /, **scripts: Script) -> Self:
+        """A fake that also serves `embed()` for `vectors`' roles. Not a keyword of `__init__`
+        (0.5.0 had one): hosts build fakes from a dict of scripts (`FakeModel(**scripts)`), and a
+        keyword parameter is matched against every value of such a dict (0.5.1)."""
+        fake = cls(**scripts)
+        fake._vectors = dict(vectors)
+        return fake
 
     def _reply[C: (FakeCall, FakeTurnCall)](self, call: C, log: list[C]) -> FakeReply:
         log.append(call)
@@ -162,8 +171,15 @@ class FakeModel:
 class AsyncFakeModel:
     """Implements `AsyncModel`, with the same scripts and the same `calls` as `FakeModel`."""
 
-    def __init__(self, *, vectors: Mapping[str, EmbedScript] | None = None, **scripts: Script):
-        self._fake = FakeModel(vectors=vectors, **scripts)
+    def __init__(self, **scripts: Script):
+        self._fake = FakeModel(**scripts)
+
+    @classmethod
+    def with_vectors(cls, vectors: Mapping[str, EmbedScript], /, **scripts: Script) -> Self:
+        """As `FakeModel.with_vectors`."""
+        fake = cls()
+        fake._fake = FakeModel.with_vectors(vectors, **scripts)
+        return fake
 
     @property
     def calls(self) -> list[FakeCall]:
