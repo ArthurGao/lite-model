@@ -38,6 +38,9 @@ class BackendProfile:
     # `turn()` is refused on a type whose endpoint cannot take `tools` (design §5). Whether a
     # given model uses them well is the model's affair, not the type's.
     supports_tools: bool = True
+    # `embed()` on an OpenAI-compatible `/embeddings` (design §3.2). llm-gateway serves none (its
+    # non-goal) and Anthropic has no embedding API.
+    supports_embeddings: bool = True
 
 
 PROFILES: dict[BackendType, BackendProfile] = {
@@ -78,6 +81,7 @@ PROFILES: dict[BackendType, BackendProfile] = {
         requires_max_tokens=True,
         extra="anthropic",
         base_url_is_root=True,
+        supports_embeddings=False,
     ),
     # llm-gateway maps both names to max_tokens (translate.py:58-59) and drops reasoning_effort
     # (it lands in X-LLMGW-Ignored-Params): refused rather than silently lost (design §5).
@@ -94,6 +98,7 @@ PROFILES: dict[BackendType, BackendProfile] = {
         # can tell until llm-gateway passes the upstream model on (design §15).
         via_headers=("x-llmgw-backend", "x-llmgw-structured-output"),
         ignored_params_header="x-llmgw-ignored-params",
+        supports_embeddings=False,
     ),
     # LiteLLM 1.108.9 honours both names and translates per upstream (S0).
     "litellm": BackendProfile(

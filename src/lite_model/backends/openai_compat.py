@@ -7,13 +7,14 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from lite_model.backends import finish, finish_turn, sdk_client
+from lite_model.backends import finish, finish_embed, finish_turn, sdk_client
 from lite_model.config import Target
 from lite_model.profiles import PROFILES
 from lite_model.schema import strict_schema
 from lite_model.types import (
     AssistantTurn,
     Block,
+    EmbedReply,
     Message,
     Reply,
     Text,
@@ -203,4 +204,34 @@ def reply(
         truncated=choice is not None and choice.finish_reason == "length",
         unusable=choice.finish_reason if choice and choice.finish_reason in UNUSABLE else None,
         payload=choice.message.content if choice is not None else None,
+    )
+
+
+# --- embed() (design §3.2): `/embeddings`, the same SDK client ---
+
+
+def embed_endpoint(sdk: Any) -> Any:
+    return sdk.embeddings.with_raw_response
+
+
+def embed_request(target: Target, texts: list[str]) -> dict[str, Any]:
+    # "float" spelled out: left out, openai 3.46.0 asks for base64 and decodes it to float32
+    # (openai/lib/_parsing/_embeddings.py); whether Ollama takes base64 is unverified.
+    params = {"model": target.model, "input": texts, "encoding_format": "float"}
+    return _transport(target, params)
+
+
+def embed_reply(
+    target: Target, response: Any, headers: Mapping[str, str], sent: Mapping[str, Any]
+) -> EmbedReply:
+    data = sorted(response.data or [], key=lambda d: d.index)
+    tokens = getattr(getattr(response, "usage", None), "prompt_tokens", None)
+    return finish_embed(
+        target,
+        sent,
+        headers,
+        body_model=response.model,
+        usage=Usage(input=tokens, output=0),  # an embedding has no output tokens
+        vectors=[d.embedding for d in data],  # the SDK's list[float], not copied
+        indexes=[d.index for d in data],
     )

@@ -8,12 +8,12 @@ import threading
 from collections.abc import Callable, Coroutine, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
 
-from lite_model.client import AsyncModel, Model
-from lite_model.types import Message, StructuredReply, TextReply
+from lite_model.client import AsyncEmbedModel, AsyncModel, EmbedModel, Model
+from lite_model.types import EmbedReply, Message, StructuredReply, TextReply
 
 
 @runtime_checkable
@@ -50,6 +50,11 @@ class Bounded:
         with self._whole:
             return self._model.structured(role, messages, schema)
 
+    def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
+        """`embed()` (design §3.2) of a model that has it; every batch takes a slot."""
+        with self._whole:
+            return cast(EmbedModel, self._model).embed(role, texts)
+
     def map[I, R](self, one: Callable[[I], R], items: Sequence[I]) -> list[R]:
         """`one` over `items`, results in input order, up to `concurrency` at once. `one` calls
         this Bounded (not the wrapped model) so its calls take slots; the first error raises.
@@ -85,6 +90,10 @@ class AsyncBounded:
     ) -> StructuredReply[T]:
         async with self._whole:
             return await self._model.structured(role, messages, schema)
+
+    async def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
+        async with self._whole:
+            return await cast(AsyncEmbedModel, self._model).embed(role, texts)
 
     async def map[I, R](
         self, one: Callable[[I], Coroutine[Any, Any, R]], items: Sequence[I]

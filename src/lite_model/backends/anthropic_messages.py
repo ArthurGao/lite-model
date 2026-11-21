@@ -1,6 +1,7 @@
 """Anthropic Messages over the Anthropic SDK (the `anthropic` extra; design §5). The request is
-built as lite-mem and lite-rag build theirs today, so their bodies are unchanged when they migrate:
-system messages joined into the `system` field, structured output as one forced tool."""
+built as lite-mem and lite-rag built theirs, so their text bodies were unchanged when they migrated:
+system messages joined into the `system` field. Structured output is `output_config.format` since
+0.5.0 (it was one forced tool before; current Claude models reject a forced `tool_choice`)."""
 
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -67,10 +68,10 @@ def request(
     target: Target, messages: Sequence[Message], schema: type[BaseModel] | None
 ) -> dict[str, Any]:
     params = _params(target, messages)
-    if schema is not None:
-        name = schema.__name__
-        params["tools"] = [{"name": name, "input_schema": strict_schema(schema)}]
-        params["tool_choice"] = {"type": "tool", "name": name}
+    if schema is not None:  # anthropic 2.6.0: OutputConfigParam.format = JSONOutputFormatParam
+        params["output_config"] = {
+            "format": {"type": "json_schema", "schema": strict_schema(schema)}
+        }
     return params
 
 
@@ -152,13 +153,8 @@ def reply(
     schema: type[BaseModel] | None,
     sent: Mapping[str, Any],
 ) -> Reply:
-    blocks = response.content
-    payload: str | Mapping[str, Any] | None
-    if schema is None:
-        payload = "".join(b.text for b in blocks if b.type == "text")
-    else:
-        name = schema.__name__  # only the forced tool's input is the reply
-        payload = next((b.input for b in blocks if b.type == "tool_use" and b.name == name), None)
+    # text and structured alike: the text blocks joined (structured output is JSON text)
+    payload = "".join(b.text for b in response.content if b.type == "text")
     return finish(
         target,
         schema,
