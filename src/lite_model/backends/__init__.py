@@ -24,6 +24,7 @@ from lite_model.profiles import PROFILES
 from lite_model.types import (
     AssistantTurn,
     Block,
+    EmbedReply,
     Message,
     Provenance,
     Reply,
@@ -68,6 +69,19 @@ class Backend(Protocol):
     def turn_reply(
         self, target: Target, response: Any, headers: Mapping[str, str], sent: Mapping[str, Any]
     ) -> TurnReply: ...
+
+
+class EmbedBackend(Protocol):
+    """What a protocol module adds for `embed()` (design §3.2): `openai_compat` only, since only
+    OpenAI-compatible types serve embeddings (`supports_embeddings`)."""
+
+    def embed_endpoint(self, sdk: Any) -> Any: ...
+
+    def embed_request(self, target: Target, texts: list[str]) -> dict[str, Any]: ...
+
+    def embed_reply(
+        self, target: Target, response: Any, headers: Mapping[str, str], sent: Mapping[str, Any]
+    ) -> EmbedReply: ...
 
 
 def sdk_client(cls: Any, target: Target, key: str | None, http_client: Any) -> Any:
@@ -171,6 +185,35 @@ def _settle(
     # the endpoint's own cache answered: nothing was spent again (§9)
     cached_header = PROFILES[target.type].cached_header
     return who, usage, bool(cached_header and headers.get(cached_header))
+
+
+def finish_embed(
+    target: Target,
+    sent: Mapping[str, Any],
+    headers: Mapping[str, str],
+    *,
+    body_model: str | None,
+    usage: Usage,
+    vectors: list[list[float]],
+    indexes: list[int],
+) -> EmbedReply:
+    """One batch's reply (design §3.2): who answered, and one vector per input, all of one length.
+    A mismatch is BadStructuredReply (the reply does not answer the request); messages give
+    counts and lengths only, never vector values."""
+    who, usage, _ = _settle(target, sent, headers, body_model, usage)
+    asked = len(sent["input"])
+    if len(vectors) != asked:
+        msg = f"{target.where}: asked for {asked} vectors, got {len(vectors)} ({who.tag})"
+        raise BadStructuredReply(msg, usage=usage)
+    if indexes != list(range(asked)):  # sorted: each input exactly once
+        msg = f"{target.where}: the vectors' indexes do not match the inputs ({who.tag})"
+        raise BadStructuredReply(msg, usage=usage)
+    if len({len(v) for v in vectors}) > 1:
+        msg = f"{target.where}: vectors of different lengths ({who.tag})"
+        raise BadStructuredReply(msg, usage=usage)
+    if not vectors[0]:
+        raise BadStructuredReply(f"{target.where}: empty vectors ({who.tag})", usage=usage)
+    return EmbedReply(vectors, who, usage)
 
 
 def finish_turn(

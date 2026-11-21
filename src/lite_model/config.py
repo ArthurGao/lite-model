@@ -146,11 +146,22 @@ _NO = object()  # no `type` given (or a role, which has none)
 _KEY_SOURCE = {"api_key_env", "keyless"}  # an entry that sets one replaces both (0.2.1)
 
 
+RoleKind = Literal["chat", "embed"]
+# The call settings an embed role has no use for (design §3.2).
+CHAT_ONLY = ("temperature", "max_output_tokens", "reasoning_effort")
+
+
 @dataclass(frozen=True)
 class RolePolicy:
     # May this role use a routing alias? Never for anything that is part of an index's identity,
     # nor for a judge (AGENTS.md rule 5).
     routable: bool = False
+    # "chat": text() / structured() / turn(); "embed": embed() (design §3.2, 0.5.0).
+    kind: RoleKind = "chat"
+
+    def __post_init__(self) -> None:
+        if self.kind == "embed" and self.routable:  # embeddings are index identity (rule 5)
+            raise ValueError("an embed role is never routable")
 
 
 @dataclass(frozen=True)
@@ -167,6 +178,7 @@ class Target:
     role: str
     backend: str  # the backend's name
     type: BackendType
+    kind: RoleKind
     model: str
     base_url: str | None
     api_key_env: str | None
@@ -186,9 +198,12 @@ class Target:
         return f"role {self.role} ({self.backend}:{self.model})"
 
 
-def target(config: ModelsConfig, role: str) -> Target:
-    """`role`'s target from the defaults and its override; no checks beyond resolving."""
+def target(config: ModelsConfig, role: str, kind: RoleKind = "chat") -> Target:
+    """`role`'s target from the defaults and its override; no checks beyond resolving. An embed
+    role's request carries none of the chat settings, inherited or not (design §3.2)."""
     override = config.roles.get(role, RoleConfig()).model_dump(exclude_none=True)
+    if kind == "embed":  # what the role sets itself is refused in _embed_problems
+        override |= dict.fromkeys(CHAT_ONLY)
     c = config.model_copy(update=override)  # a field the role leaves out keeps the default
     if c.backend not in c.backends:
         raise ConfigError(f"role {role}: unknown backend {c.backend!r}")
@@ -198,12 +213,17 @@ def target(config: ModelsConfig, role: str) -> Target:
         role=role,
         backend=c.backend,
         type=backend.type,
+        kind=kind,
         model=c.model,
         base_url=backend.base_url or profile.base_url,
         api_key_env=None if backend.keyless else backend.api_key_env or profile.key_env,
         channel=backend.channel or profile.channel,
         routed=c.model in backend.router_aliases,
-        temperature=c.temperature if c.temperature is not None else profile.default_temperature,
+        temperature=(
+            c.temperature
+            if c.temperature is not None or kind == "embed"
+            else profile.default_temperature
+        ),
         max_output_tokens=c.max_output_tokens,
         reasoning_effort=c.reasoning_effort,
         timeout_s=c.timeout_s,
@@ -215,6 +235,22 @@ def target(config: ModelsConfig, role: str) -> Target:
     )
 
 
+def _embed_problems(config: ModelsConfig, target: Target) -> list[str]:
+    """An embed role's own checks (design §3.2): the type serves embeddings, and the role sets
+    none of the chat settings (inherited ones are dropped, see `target`)."""
+    where = target.where
+    found = []
+    if not PROFILES[target.type].supports_embeddings:
+        found.append(f"{where}: {target.type} does not serve embeddings")
+    own = config.roles.get(target.role, RoleConfig())
+    found += [
+        f"{where}: {name} is not used by embeddings"
+        for name in CHAT_ONLY
+        if getattr(own, name) is not None
+    ]
+    return found
+
+
 def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]:
     where = target.where
     profile = PROFILES[target.type]
@@ -223,12 +259,14 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
         found.append(f"{where}: set {target.api_key_env}")
     if profile.extra and importlib.util.find_spec(profile.extra) is None:
         found.append(f"{where}: install the extra: lite-model[{profile.extra}]")
-    if target.routed and not spec.roles[target.role].routable:
-        found.append(f"{where}: {target.model} is a routing alias and the role is not routable")
-    if target.routed and profile.answered_header is None:
-        found.append(f"{where}: routing through {target.type} cannot tell which model answered")
     if target.channel in config.forbid_channels:
         found.append(f"{where}: channel {target.channel} is forbidden")
+    if target.routed and not spec.roles[target.role].routable:  # an embed role never is
+        found.append(f"{where}: {target.model} is a routing alias and the role is not routable")
+    if target.kind == "embed":  # the chat checks below are about chat parameters
+        return found + _embed_problems(config, target)
+    if target.routed and profile.answered_header is None:
+        found.append(f"{where}: routing through {target.type} cannot tell which model answered")
     if target.temperature is not None and not profile.supports_temperature:
         found.append(f"{where}: temperature is not supported by {target.type}")
     if target.reasoning_effort is not None and not profile.supports_reasoning_effort:
@@ -251,7 +289,7 @@ def resolve(config: ModelsConfig, spec: RoleSpec) -> dict[str, Target]:
     targets: dict[str, Target] = {}
     for role in spec.roles:
         try:
-            resolved = target(config, role)
+            resolved = target(config, role, spec.roles[role].kind)
         except ConfigError as exc:
             problems.append(str(exc))
             continue

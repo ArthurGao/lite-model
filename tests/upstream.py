@@ -2,6 +2,7 @@
 contract tests see the exact request the real SDK sends, and script the response."""
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 import httpx2
@@ -45,6 +46,22 @@ def message(
         "stop_reason": stop,
         "stop_sequence": None,
         "usage": usage or {"input_tokens": 9, "output_tokens": 4},
+    }
+
+
+def embeddings(
+    *vectors: list[float],
+    model: str = "bge-m3:567m",
+    usage: dict[str, int] | None = None,
+    order: Sequence[int] | None = None,
+) -> dict[str, Any]:
+    """An OpenAI `/embeddings` response body; `order` lists the indexes in the order sent."""
+    indexes = list(order) if order is not None else list(range(len(vectors)))
+    return {
+        "object": "list",
+        "model": model,
+        "data": [{"object": "embedding", "index": i, "embedding": vectors[i]} for i in indexes],
+        "usage": usage or {"prompt_tokens": 5, "total_tokens": 5},
     }
 
 

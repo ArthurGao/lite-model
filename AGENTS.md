@@ -23,7 +23,9 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**Current release: v0.4.0 (2026-11-21): `turn()`, one model-chosen tool turn** (design §3.1; `tests/contract/test_turns.py`). Additive: `text()` / `structured()`, `Model` and hooks are unchanged. lite-agent depends on it; the other hosts stay on 0.3.0 until they need it.
+**v0.5.0 (2026-11-21, to release): `embed()` and Anthropic structured output via `output_config.format`** (design §3.2, §15; `tests/contract/test_embed.py`, `test_anthropic.py`). `embed()` is additive (an embed role: `RolePolicy(kind="embed")`, never routable; ollama / openai / litellm). The Anthropic change alters the structured request body for hosts on the `anthropic` backend: newer Claude models reject the forced `tool_choice` it replaced.
+
+**v0.4.0 (2026-11-21): `turn()`, one model-chosen tool turn** (design §3.1; `tests/contract/test_turns.py`). Additive: `text()` / `structured()`, `Model` and hooks are unchanged. lite-agent depends on it; the other hosts stay on 0.3.0 until they need it.
 
 **S5 done 2026-11-18; host migrations (design §12) done 2026-11-19. v0.3.0 (2026-11-20)** (design §14): `AsyncHook`, `Bounded` slot around the request only, `Bounded.map` carries the caller's context, `x-litellm-cache-key` → `cached` (design §10, §7.2).
 

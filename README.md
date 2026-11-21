@@ -26,7 +26,7 @@ lite-model is not on PyPI. Each release attaches a wheel to its
 dependencies = ["lite-model"]          # or "lite-model[anthropic]" for the Anthropic backend
 
 [tool.uv.sources]
-lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.2.1/lite_model-0.2.1-py3-none-any.whl" }
+lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.5.0/lite_model-0.5.0-py3-none-any.whl" }
 ```
 
 Python 3.12. Pinned: `openai==3.46.0`, `pydantic==2.14.3`, `pydantic-settings==2.16.2`, `typer==0.27.3`;
@@ -163,6 +163,20 @@ print(reply.turn.text)
 - `ToolCall.arguments is None`: the endpoint's JSON did not parse (`raw_arguments` has the text).
 - Hooks do not see `turn()`. `ToolModel` / `AsyncToolModel` are the protocols; `FakeModel.turn` scripts
   `AssistantTurn`s and records `turn_calls`.
+
+## Embeddings (0.5.0)
+
+```python
+roles = RoleSpec({"extract": RolePolicy(), "embed": RolePolicy(kind="embed")})
+config = ModelsConfig(backend="ollama", model="qwen3:8b", roles={"embed": {"model": "bge-m3:567m"}})
+reply = build(config, roles).embed("embed", ["Ada lives in Wellington."])
+reply.vectors, reply.dim, reply.provenance.tag      # [[...]], 1024, "ollama:bge-m3:567m"
+```
+
+- An embed role is never routable (an index is bound to its model) and takes no chat settings.
+- Backends: `ollama`, `openai` (any OpenAI-compatible `/embeddings`), `litellm`; not `gateway` or `anthropic`.
+- Texts go in batches of 64; the vectors come back in input order. Hooks do not see `embed()`.
+- Tests: `FakeModel(vectors={"embed": hash_vectors(8)})`; calls are recorded in `embed_calls`.
 
 ## Errors
 

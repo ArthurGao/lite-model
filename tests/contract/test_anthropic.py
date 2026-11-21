@@ -1,6 +1,9 @@
 """Design §5, §8 for the `anthropic` backend type: what the Anthropic SDK sends (system field,
-forced tool for structured output) and what is read back, sync and async. The bodies match what
-lite-mem and lite-rag send today (design §12.2)."""
+structured output as `output_config.format`) and what is read back, sync and async. Text bodies
+match what lite-mem and lite-rag sent before migrating (design §12.2); structured bodies changed in
+0.5.0, because current Claude models reject a forced `tool_choice` with a 400 (design §15)."""
+
+import json
 
 import pytest
 from pydantic import BaseModel
@@ -68,13 +71,21 @@ def test_no_system_message_sends_no_system_field(connect: Connect) -> None:
     assert "system" not in up.body()
 
 
-def test_structured_request_is_one_forced_tool(connect: Connect) -> None:
-    up = Upstream((200, message(tool_use("Fact", {"city": "Wellington", "confidence": None}))))
+def _json(value: dict[str, object]) -> dict[str, str]:
+    return {"type": "text", "text": json.dumps(value)}
+
+
+def test_structured_request_is_an_output_format_without_tools(connect: Connect) -> None:
+    up = Upstream((200, message(_json({"city": "Wellington", "confidence": None}))))
     connect(up, _claude()).structured("answer", ASK, Fact)
     body = up.body()
-    # lite-mem's shape exactly: the tool's input schema is the strict schema, the choice forced.
-    assert body["tools"] == [{"name": "Fact", "input_schema": strict_schema(Fact)}]
-    assert body["tool_choice"] == {"type": "tool", "name": "Fact"}
+    # 0.5.0: newer Claude models (Opus 5.5, Sonnet 5.5, Fable 5.1+) answer a forced tool_choice
+    # with a 400; structured outputs are the replacement, the schema the same strict one.
+    assert body["output_config"] == {
+        "format": {"type": "json_schema", "schema": strict_schema(Fact)}
+    }
+    assert "tools" not in body
+    assert "tool_choice" not in body
     assert "temperature" not in body  # not supported by anthropic 2.6.0
 
 
@@ -98,10 +109,10 @@ def test_text_reply_joins_text_blocks_and_reads_who_answered(connect: Connect) -
     assert (u.input, u.output, u.reasoning, u.cost_usd) == (31, 5, None, None)
 
 
-def test_structured_reply_is_the_tool_input(connect: Connect) -> None:
+def test_structured_reply_is_the_text_json(connect: Connect) -> None:
     body = message(
-        {"type": "text", "text": "Sure."},
-        tool_use("Fact", {"city": "Wellington", "confidence": 0.9}),
+        {"type": "text", "text": '{"city": "Wellington", '},
+        {"type": "text", "text": '"confidence": 0.9}'},
     )
     reply = connect(Upstream((200, body)), _claude()).structured("answer", ASK, Fact)
     assert reply.value == Fact(city="Wellington", confidence=0.9)
@@ -110,7 +121,7 @@ def test_structured_reply_is_the_tool_input(connect: Connect) -> None:
 
 @pytest.mark.parametrize("structured", [False, True])
 def test_stop_at_max_tokens_is_truncated(connect: Connect, structured: bool) -> None:
-    body = message(tool_use("Fact", {"city": "Wel"}), stop="max_tokens")
+    body = message({"type": "text", "text": '{"city": "Wel'}, stop="max_tokens")
     caller = connect(Upstream((200, body)), _claude())
     with pytest.raises(Truncated, match=r"role answer \(anthropic:claude-x\): reply truncated"):
         if structured:
@@ -125,14 +136,14 @@ def test_no_text_block_is_an_empty_reply(connect: Connect) -> None:
         connect(Upstream((200, body)), _claude()).text("answer", ASK)
 
 
-def test_no_tool_use_is_an_empty_structured_reply(connect: Connect) -> None:
-    body = message({"type": "text", "text": "I would rather not."}, stop="refusal")
+def test_no_text_is_an_empty_structured_reply(connect: Connect) -> None:
+    body = message(tool_use("Fact", {"city": "Wellington"}), stop="tool_use")
     with pytest.raises(EmptyReply):
         connect(Upstream((200, body)), _claude()).structured("answer", ASK, Fact)
 
 
-def test_tool_input_not_matching_the_schema_is_bad(connect: Connect) -> None:
-    body = message(tool_use("Fact", {"town": "Wellington"}))
+def test_json_not_matching_the_schema_is_bad(connect: Connect) -> None:
+    body = message(_json({"town": "Wellington"}))
     with pytest.raises(BadStructuredReply, match="reply does not match Fact") as caught:
         connect(Upstream((200, body)), _claude()).structured("answer", ASK, Fact)
     assert "Wellington" not in str(caught.value)
@@ -201,9 +212,7 @@ def test_a_refused_or_paused_turn_is_no_usable_reply(
     connect: Connect, stop: str, structured: bool
 ) -> None:
     # Codex S2: the partial text of a refused or paused turn came back as a successful reply.
-    body = message(
-        {"type": "text", "text": "I can't help"}, tool_use("Fact", {"city": "X"}), stop=stop
-    )
+    body = message({"type": "text", "text": "I can't help"}, _json({"city": "X"}), stop=stop)
     caller = connect(Upstream((200, body)), _claude())
     with pytest.raises(EmptyReply, match=f"no usable reply \\(stop reason {stop}\\)") as caught:
         if structured:
@@ -211,16 +220,6 @@ def test_a_refused_or_paused_turn_is_no_usable_reply(
         else:
             caller.text("answer", ASK)
     assert "help" not in str(caught.value)
-
-
-def test_only_the_forced_tools_input_is_read(connect: Connect) -> None:
-    # Codex S2: the first tool_use block was taken whatever its name.
-    body = message(tool_use("Other", {"city": "Elsewhere"}), stop="tool_use")
-    with pytest.raises(EmptyReply):
-        connect(Upstream((200, body)), _claude()).structured("answer", ASK, Fact)
-    body = message(tool_use("Other", {"city": "No"}), tool_use("Fact", {"city": "Yes"}))
-    value = connect(Upstream((200, body)), _claude()).structured("answer", ASK, Fact).value
-    assert value.city == "Yes"
 
 
 def test_an_unknown_stop_reason_is_not_echoed(connect: Connect) -> None:

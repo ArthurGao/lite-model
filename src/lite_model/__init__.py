@@ -2,9 +2,11 @@
 
 from lite_model.bounded import AsyncBounded, Bounded
 from lite_model.client import (
+    AsyncEmbedModel,
     AsyncLiteModel,
     AsyncModel,
     AsyncToolModel,
+    EmbedModel,
     LiteModel,
     Model,
     ToolModel,
@@ -16,6 +18,7 @@ from lite_model.config import (
     ModelsConfig,
     Price,
     RoleConfig,
+    RoleKind,
     RolePolicy,
     RoleSpec,
     Target,
@@ -36,6 +39,7 @@ from lite_model.types import (
     AssistantTurn,
     Block,
     Channel,
+    EmbedReply,
     Message,
     Opaque,
     Provenance,
@@ -56,6 +60,7 @@ from lite_model.types import (
 __all__ = [
     "AssistantTurn",
     "AsyncBounded",
+    "AsyncEmbedModel",
     "AsyncLiteModel",
     "AsyncModel",
     "AsyncToolModel",
@@ -66,6 +71,8 @@ __all__ = [
     "CallFailed",
     "Channel",
     "ConfigError",
+    "EmbedModel",
+    "EmbedReply",
     "EmptyReply",
     "IgnoredParameter",
     "LiteModel",
@@ -79,6 +86,7 @@ __all__ = [
     "ProvenanceUnknown",
     "Reply",
     "RoleConfig",
+    "RoleKind",
     "RolePolicy",
     "RoleSpec",
     "Stop",
