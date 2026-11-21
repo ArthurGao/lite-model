@@ -26,7 +26,7 @@ lite-model is not on PyPI. Each release attaches a wheel to its
 dependencies = ["lite-model"]          # or "lite-model[anthropic]" for the Anthropic backend
 
 [tool.uv.sources]
-lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.2.1/lite_model-0.2.1-py3-none-any.whl" }
+lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.5.0/lite_model-0.5.0-py3-none-any.whl" }
 ```
 
 Python 3.12. Pinned: `openai==3.46.0`, `pydantic==2.14.3`, `pydantic-settings==2.16.2`, `typer==0.27.3`;
