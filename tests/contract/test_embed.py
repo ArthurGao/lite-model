@@ -2,9 +2,11 @@
 batch and provenance rules, and the config checks. Every call test runs sync and async."""
 
 import asyncio
+import json
 from collections.abc import Callable, Sequence
 from typing import Any
 
+import httpx2
 import pytest
 
 from lite_model import (
@@ -318,3 +320,127 @@ def test_output_tokens_are_zero_even_when_input_usage_is_unknown(mode: str) -> N
     up = Upstream((200, two), (200, one))
     reply = _embedder(mode, up).embed("embed", ["a"] * 65)
     assert (reply.usage.input, reply.usage.output) == (None, 0)
+
+
+# --- 0.6.0: dimensions, batch size, concurrency, halving; closing ---
+
+
+class Sized:
+    """An `/embeddings` endpoint answering each text with `[len(text)]`; a batch larger than
+    `limit` is refused with `status` (as an endpoint does for a request too large)."""
+
+    def __init__(self, limit: int = 10_000, status: int = 413) -> None:
+        self.limit, self.status = limit, status
+        self.sizes: list[int] = []
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        texts = json.loads(request.content)["input"]
+        self.sizes.append(len(texts))
+        if len(texts) > self.limit:
+            return httpx2.Response(self.status, json={"error": {"message": "too large"}})
+        return httpx2.Response(200, json=embeddings(*[[float(len(t))] for t in texts]))
+
+    def embedder(self, mode: str, **embed: Any) -> Any:
+        config = _config(embed=embed)
+        if mode == "sync":
+            return build(
+                config, ROLES, http_client=httpx2.Client(transport=httpx2.MockTransport(self))
+            )
+        return build_async(
+            config, ROLES, http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(self))
+        )
+
+
+def _embed(mode: str, model: Any, texts: list[str]) -> EmbedReply:
+    reply = (
+        model.embed("embed", texts) if mode == "sync" else asyncio.run(model.embed("embed", texts))
+    )
+    assert isinstance(reply, EmbedReply)
+    return reply
+
+
+TEXTS = ["a", "bb", "ccc", "dddd", "eeeee"]
+
+
+def test_dimensions_are_sent(mode: str) -> None:
+    up = Upstream((200, embeddings([0.1, 0.2])))
+    _embedder(mode, up, _config(embed={"dimensions": 256})).embed("embed", ["Ada"])
+    assert up.body()["dimensions"] == 256
+
+
+def test_batch_size_and_concurrency_keep_the_input_order(mode: str) -> None:
+    up = Sized()
+    reply = _embed(mode, up.embedder(mode, batch_size=2, max_concurrency=3), TEXTS)
+    assert reply.vectors == [[1.0], [2.0], [3.0], [4.0], [5.0]]
+    assert sorted(up.sizes) == [1, 2, 2]
+
+
+def test_a_batch_too_large_is_halved_until_it_fits(mode: str) -> None:
+    up = Sized(limit=2)
+    reply = _embed(mode, up.embedder(mode), TEXTS)
+    assert reply.vectors == [[1.0], [2.0], [3.0], [4.0], [5.0]]
+    assert up.sizes == [5, 2, 3, 1, 2]  # 5 refused -> 2 ok + 3 refused -> 1 ok + 2 ok
+
+
+def test_a_single_text_still_too_large_fails(mode: str) -> None:
+    up = Sized(limit=0, status=400)
+    with pytest.raises(CallFailed, match=r"role embed \(ollama:bge-m3:567m\) failed"):
+        _embed(mode, up.embedder(mode), ["a", "b"])
+    assert up.sizes == [2, 1]  # halved once, then the first single text fails
+
+
+@pytest.mark.parametrize("setting", [{"batch_size": 8}, {"max_concurrency": 2}, {"dimensions": 64}])
+def test_embed_settings_on_a_chat_role_are_refused(setting: dict[str, int]) -> None:
+    name = next(iter(setting))
+    with pytest.raises(ConfigError, match=f"role answer .*: {name} is only for embed roles"):
+        build(_config(answer=setting), ROLES)
+
+
+def test_close_releases_the_clients_and_refuses_later_calls() -> None:
+    model = build(_config(), ROLES)
+    with model:
+        pass
+    with pytest.raises(RuntimeError, match="closed"):
+        model.embed("embed", ["x"])
+
+    async def run() -> None:
+        async with build_async(_config(), ROLES) as amodel:
+            pass
+        with pytest.raises(RuntimeError, match="closed"):
+            await amodel.embed("embed", ["x"])
+
+    asyncio.run(run())
+
+
+def test_close_leaves_an_injected_http_client_open() -> None:
+    http = httpx2.Client(transport=httpx2.MockTransport(Sized()))
+    build(_config(), ROLES, http_client=http).close()
+    assert not http.is_closed
+    ahttp = httpx2.AsyncClient(transport=httpx2.MockTransport(Sized()))
+    asyncio.run(build_async(_config(), ROLES, http_client=ahttp).aclose())
+    assert not ahttp.is_closed
+
+
+def test_bounded_and_the_fakes_close_too() -> None:
+    from lite_model import AsyncBounded, Bounded
+
+    model = build(_config(), ROLES)
+    Bounded(model, concurrency=2).close()  # closes the model it wraps
+    with pytest.raises(RuntimeError, match="closed"):
+        model.embed("embed", ["x"])
+    amodel = build_async(_config(), ROLES)
+    asyncio.run(AsyncBounded(amodel, concurrency=2).aclose())
+    with pytest.raises(RuntimeError, match="closed"):
+        asyncio.run(amodel.embed("embed", ["x"]))
+    FakeModel().close()  # nothing to release; the protocol is the same
+    asyncio.run(AsyncFakeModel().aclose())
+
+
+def test_a_failed_batch_stops_the_batches_not_yet_sent() -> None:
+    # simplify 0.6.0: with a pool that waits for every queued batch, a failed call kept
+    # sending (paid) requests after it had already failed
+    up = Sized(limit=0, status=500)
+    model = up.embedder("sync", batch_size=1, max_concurrency=2)
+    with pytest.raises(CallFailed):
+        model.embed("embed", ["a", "b", "c", "d", "e", "f", "g", "h"])
+    assert len(up.sizes) < 8

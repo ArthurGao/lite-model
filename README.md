@@ -26,7 +26,7 @@ lite-model is not on PyPI. Each release attaches a wheel to its
 dependencies = ["lite-model"]          # or "lite-model[anthropic]" for the Anthropic backend
 
 [tool.uv.sources]
-lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.5.1/lite_model-0.5.1-py3-none-any.whl" }
+lite-model = { url = "https://github.com/ArthurGao/lite-model/releases/download/v0.6.0/lite_model-0.6.0-py3-none-any.whl" }
 ```
 
 Python 3.12. Pinned: `openai==3.46.0`, `pydantic==2.14.3`, `pydantic-settings==2.16.2`, `typer==0.27.3`;
@@ -164,7 +164,7 @@ print(reply.turn.text)
 - Hooks do not see `turn()`. `ToolModel` / `AsyncToolModel` are the protocols; `FakeModel.turn` scripts
   `AssistantTurn`s and records `turn_calls`.
 
-## Embeddings (0.5.0)
+## Embeddings (0.5.0; settings and closing 0.6.0)
 
 ```python
 roles = RoleSpec({"extract": RolePolicy(), "embed": RolePolicy(kind="embed")})
@@ -176,6 +176,10 @@ reply.vectors, reply.dim, reply.provenance.tag      # [[...]], 1024, "ollama:bge
 - An embed role is never routable (an index is bound to its model) and takes no chat settings.
 - Backends: `ollama`, `openai` (any OpenAI-compatible `/embeddings`), `litellm`; not `gateway` or `anthropic`.
 - Texts go in batches of 64; the vectors come back in input order. Hooks do not see `embed()`.
+- An embed role may set `dimensions`, `batch_size` and `max_concurrency` (0.6.0); a batch the endpoint
+  refuses as too large (400 / 413) is halved until it fits.
+- `model.close()` / `await model.aclose()` (or `with` / `async with`) closes the SDK clients the model
+  built; an `http_client` you passed stays yours to close.
 - Tests: `FakeModel.with_vectors({"embed": hash_vectors(8)}, **scripts)`; calls are recorded in `embed_calls`.
 
 ## Errors

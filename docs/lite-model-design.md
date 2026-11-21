@@ -285,6 +285,18 @@ reply.usage        # input = 端点报告的 token 数；output = 0
   逐元素相等（中文和英文各一句，1024 维）。所以 lite-mem 迁移后，已经存下的向量仍然可用。
 - **以后（lite-rag 迁移时）**：query / document 前缀、Voyage / Cohere / Gemini、batch 减半。这些都是增量。
 
+#### 3.2.1 embed role 的设置和关闭客户端（0.6.0）
+
+- embed role 自己的三个设置，只能写在 `roles.<embed role>` 上，chat role 设了会在 `build()` 时被拒（和 `CHAT_ONLY` 对称）：
+  - `dimensions`：作为 `dimensions` 参数发出，用于截断。Ollama 的 `/v1/embeddings` 也支持，2026-11-22 实测 bge-m3 截成 256 维。
+  - `batch_size`：每个请求带多少条，默认 64。
+  - `max_concurrency`：同时在途的批数，默认 1，即逐批发送。并发时结果仍按输入顺序合并：sync 用线程池，async 用信号量。
+- 一个批被拒为太大（400 / 413）时就对半拆，一直拆到单条；单条还被拒，整次调用失败。做法取自 lite-rag 的 `_fitting`。
+  拆分只发生在失败的那个批上，其他批不受影响。
+- `LiteModel.close()` / `AsyncLiteModel.aclose()`，以及 `with` / `async with`：关闭 lite-model 自己建的 SDK 客户端。宿主传进来的
+  `http_client` 由宿主自己关。`limited()` 派生出的 model 共用同一组客户端，所以 `Bounded` / `AsyncBounded` 的 close 关的是被包住的那个
+  model。关闭后再调用会抛 `RuntimeError`；`FakeModel` 的 close 什么也不做。
+
 ## 4. 配置
 
 lite-model 提供 pydantic 配置模型，宿主模块把它嵌进自己的设置，环境变量用宿主的前缀
@@ -707,6 +719,19 @@ lite-model/
 
 （每个阶段完成后在这里追加：日期、做了什么、review 结论、被拒的 finding 及理由。）
 
+- **0.6.0（2026-11-22）**：embed role 的 `dimensions` / `batch_size` / `max_concurrency`；400/413 时对半拆批；`close()` / `aclose()`
+  （§3.2.1）。都是增量改动。起因是 lite-rag S19 要把它的 ollama / openai embedder 换过来，而 llm-steward 退出时关不掉 SDK 客户端。
+  - 测试：`test_embed.py` 新增 dimensions 进请求体、分批和并发下的顺序、对半拆的完整请求序列、单条仍被拒就失败、chat role 上设
+    embed 字段被拒、close 之后再调用报错、注入的 http_client 不被关、Bounded 和 fake 的 close。都先看到红；把 `TOO_LARGE` 改成空集
+    之后，对半拆的 4 个测试变红。pytest 378 passed；`-m ollama` 6 passed。各宿主（lite-rag、lite-mem、lite-cache、lite-agent、llm-steward）
+    的 mypy 和 pytest 都用新 build 跑过（KB testing-and-ci §15）。
+  - /simplify 采纳：
+    - 线程池和 `Bounded.map` 共用 `in_threads`。
+    - 一个批失败后，排队中的批不再发出：sync 用 `cancel_futures`；async 改用 `TaskGroup`，并解包成第一个错误。先写了失败的测试。
+    - 两处"role 设了用不上的字段"的检查合成 `_set`。
+    - 关闭的逻辑放进 `_Clients.release()`。
+  - /simplify 不采纳：sync 和 async 的拆批逻辑合并（各约 6 行，强行合并反而更乱）；400 不再算作"太大"（Voyage 超 token 时返回的就是 400）。
+  - Codex：没有 finding。
 - **0.5.1（2026-11-22）**：`FakeModel(vectors=)` 改成 `FakeModel.with_vectors(vectors, /, **scripts)`（`AsyncFakeModel` 同）。
   - 原因：0.5.0 发布后跨 repo 检查时，用 0.5.0 跑各宿主的 mypy，lite-rag `testing.py:93` 和 lite-mem `testing.py:63` 报错。它们用 `FakeModel(**{role: script})` 建 fake，mypy 会拿 dict 的值去匹配每个关键字参数，`vectors` 也不例外。`__init__` 恢复成 0.4.0 的 `**scripts`；向量放到只收位置参数的 classmethod，名叫 `vectors` 的 role 也不冲突。
   - 测试：`test_embed.py::test_scripts_unpacked_from_a_dict_still_type_check`，用 mypy 检查（修之前 3 个错误，修之后通过）；pytest 363 passed。
