@@ -64,6 +64,20 @@ class StructuredReply[T: BaseModel]:
 Reply = TextReply | StructuredReply[Any]
 
 
+@dataclass(frozen=True)
+class EmbedReply:
+    """`embed()`'s reply (design §3.2): one vector per input text, in input order. Frozen only
+    shallowly, like `Provenance.via`: do not mutate the lists."""
+
+    vectors: list[list[float]] = field(hash=False)
+    provenance: Provenance
+    usage: Usage
+
+    @property
+    def dim(self) -> int:
+        return len(self.vectors[0]) if self.vectors else 0
+
+
 # --- One model-chosen tool turn (design §3.1) ---
 # These are frozen like the types above, but only shallowly: a Mapping field keeps the caller's
 # object (as `Provenance.via` does). Do not mutate a mapping after handing it over.

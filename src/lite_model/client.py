@@ -12,12 +12,13 @@ from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 from pydantic import BaseModel
 
-from lite_model.backends import Backend, anthropic_messages, openai_compat
-from lite_model.config import ModelsConfig, RoleSpec, Target, resolve
-from lite_model.errors import CallFailed, ConfigError
+from lite_model.backends import Backend, EmbedBackend, anthropic_messages, openai_compat
+from lite_model.config import ModelsConfig, RoleKind, RoleSpec, Target, resolve
+from lite_model.errors import BadStructuredReply, CallFailed, ConfigError, ProvenanceUnknown
 from lite_model.hooks import AsyncHook, Call, Hook, Hooks
 from lite_model.profiles import PROFILES
 from lite_model.types import (
+    EmbedReply,
     Message,
     Reply,
     StructuredReply,
@@ -25,6 +26,7 @@ from lite_model.types import (
     ToolSpec,
     TurnMessage,
     TurnReply,
+    Usage,
 )
 
 if TYPE_CHECKING:
@@ -64,7 +66,19 @@ class AsyncToolModel(Protocol):
     ) -> TurnReply: ...
 
 
+class EmbedModel(Protocol):
+    """Vectors for texts (design §3.2). A protocol of its own, like `ToolModel`."""
+
+    def embed(self, role: str, texts: Sequence[str]) -> EmbedReply: ...
+
+
+class AsyncEmbedModel(Protocol):
+    async def embed(self, role: str, texts: Sequence[str]) -> EmbedReply: ...
+
+
 Route = tuple[Backend, Any, Target]  # protocol module, SDK client, target
+# Texts per `/embeddings` request, sent one batch after another (lite-mem's batch, design §3.2).
+EMBED_BATCH = 64
 
 
 def _failed(target: Target, exc: Exception) -> CallFailed:
@@ -141,25 +155,26 @@ async def _after_async(call: Call | None, hooks: Sequence[Hook | AsyncHook], rep
     return reply
 
 
-def _send(route: Route, request: dict[str, Any], slot: Slot) -> tuple[Any, Mapping[str, str]]:
-    """Send `request` and return the parsed response and its headers. Only the request waits
-    for a slot: hooks run outside it. Any failure is CallFailed (§8)."""
-    backend, sdk, target = route
+def _send(
+    target: Target, owner: Any, request: dict[str, Any], slot: Slot
+) -> tuple[Any, Mapping[str, str]]:
+    """Send `request` through `owner` (the SDK's raw-response `create` owner: a backend's
+    `endpoint` or `embed_endpoint`) and return the parsed response and its headers. Only the
+    request waits for a slot: hooks run outside it. Any failure is CallFailed (§8)."""
     try:
         with slot:
-            raw = backend.endpoint(sdk).create(**request)
+            raw = owner.create(**request)
             return raw.parse(), raw.headers
     except Exception as exc:
         raise _failed(target, exc) from exc
 
 
 async def _send_async(
-    route: Route, request: dict[str, Any], slot: AsyncSlot
+    target: Target, owner: Any, request: dict[str, Any], slot: AsyncSlot
 ) -> tuple[Any, Mapping[str, str]]:
-    backend, sdk, target = route
     try:
         async with slot:
-            raw = await backend.endpoint(sdk).create(**request)
+            raw = await owner.create(**request)
             response = raw.parse()
             if inspect.isawaitable(response):  # anthropic's async parse() is a coroutine
                 response = await response
@@ -175,12 +190,12 @@ def _run(
     hooks: Sequence[Hook],
     slot: Slot,
 ) -> Reply:
-    backend, _, target = route
+    backend, sdk, target = route
     request = backend.request(target, messages, schema)  # a local error here is not CallFailed
     call = _call(target, messages, request, schema) if hooks else None
     if call is not None and (hit := _hit(call, hooks)) is not None:
         return hit
-    response, headers = _send(route, request, slot)
+    response, headers = _send(target, backend.endpoint(sdk), request, slot)
     return _after(call, hooks, backend.reply(target, response, headers, schema, request))
 
 
@@ -191,12 +206,12 @@ async def _run_async(
     hooks: Sequence[Hook | AsyncHook],
     slot: AsyncSlot,
 ) -> Reply:
-    backend, _, target = route
+    backend, sdk, target = route
     request = backend.request(target, messages, schema)  # a local error here is not CallFailed
     call = _call(target, messages, request, schema) if hooks else None
     if call is not None and (hit := await _hit_async(call, hooks)) is not None:
         return hit
-    response, headers = await _send_async(route, request, slot)
+    response, headers = await _send_async(target, backend.endpoint(sdk), request, slot)
     reply = backend.reply(target, response, headers, schema, request)
     return await _after_async(call, hooks, reply)
 
@@ -215,19 +230,76 @@ def _run_turn(
 ) -> TurnReply:
     """`_run` for `turn()`. No hooks: their replies are text or structured, and nothing caches
     an agent's turns (design §10)."""
-    backend, _, target = route
+    backend, sdk, target = route
     request = _turn_request(route, messages, tools)
-    response, headers = _send(route, request, slot)
+    response, headers = _send(target, backend.endpoint(sdk), request, slot)
     return backend.turn_reply(target, response, headers, request)
 
 
 async def _run_turn_async(
     route: Route, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec], slot: AsyncSlot
 ) -> TurnReply:
-    backend, _, target = route
+    backend, sdk, target = route
     request = _turn_request(route, messages, tools)
-    response, headers = await _send_async(route, request, slot)
+    response, headers = await _send_async(target, backend.endpoint(sdk), request, slot)
     return backend.turn_reply(target, response, headers, request)
+
+
+def _batches(target: Target, texts: Sequence[str]) -> list[list[str]]:
+    if not texts:  # nothing to send, so no provenance to record (design §3.2)
+        raise ValueError(f"{target.where}: no texts to embed")
+    return [list(texts[i : i + EMBED_BATCH]) for i in range(0, len(texts), EMBED_BATCH)]
+
+
+def _total(values: Sequence[float | None]) -> float | None:
+    return None if None in values else sum(v for v in values if v is not None)
+
+
+def _merged(target: Target, replies: Sequence[EmbedReply]) -> EmbedReply:
+    """The batches as one reply: one answering model, one vector length, usage summed (None
+    when any batch did not report it)."""
+    first = replies[0]
+    if len(replies) == 1:
+        return first
+    if len({r.provenance.answered for r in replies}) > 1:
+        raise ProvenanceUnknown(f"{target.where}: the batches were answered by more than one model")
+    if len({r.dim for r in replies}) > 1:
+        raise BadStructuredReply(f"{target.where}: vectors of different lengths across batches")
+    tokens = _total([r.usage.input for r in replies])
+    usage = Usage(
+        input=None if tokens is None else int(tokens),
+        output=0,  # an embedding has no output tokens
+        cost_usd=_total([r.usage.cost_usd for r in replies]),
+    )
+    return EmbedReply([v for r in replies for v in r.vectors], first.provenance, usage)
+
+
+def _embedding(route: Route) -> tuple[EmbedBackend, Any, Target]:
+    # build() admits an embed role only on a type that serves embeddings (supports_embeddings),
+    # all of them OpenAI-compatible: their protocol module is an EmbedBackend.
+    backend, sdk, target = route
+    return cast(EmbedBackend, backend), cast(EmbedBackend, backend).embed_endpoint(sdk), target
+
+
+def _run_embed(route: Route, texts: Sequence[str], slot: Slot) -> EmbedReply:
+    """`embed()` (design §3.2): batches in order, no hooks."""
+    backend, owner, target = _embedding(route)
+    replies = []
+    for batch in _batches(target, texts):
+        request = backend.embed_request(target, batch)
+        response, headers = _send(target, owner, request, slot)
+        replies.append(backend.embed_reply(target, response, headers, request))
+    return _merged(target, replies)
+
+
+async def _run_embed_async(route: Route, texts: Sequence[str], slot: AsyncSlot) -> EmbedReply:
+    backend, owner, target = _embedding(route)
+    replies = []
+    for batch in _batches(target, texts):
+        request = backend.embed_request(target, batch)
+        response, headers = await _send_async(target, owner, request, slot)
+        replies.append(backend.embed_reply(target, response, headers, request))
+    return _merged(target, replies)
 
 
 class _Routes:
@@ -248,16 +320,22 @@ class _Routes:
     def target(self, role: str) -> Target:
         """`role`'s resolved target (model, backend, endpoint): what a host records before any
         call, e.g. as part of an index's identity (design §12.1)."""
-        return self._route(role)[2]
-
-    def _route(self, role: str) -> Route:
         if role not in self._routes:
             raise ConfigError(f"role {role}: not declared by the host")
+        return self._routes[role][2]  # any kind of role
+
+    def _route(self, role: str, method: str = "text") -> Route:
+        """`role`'s route, checked to be of the kind `method` needs (design §3.2)."""
+        kind: RoleKind = "embed" if method == "embed" else "chat"
+        have = self.target(role).kind
+        if have != kind:
+            article = "an" if have == "embed" else "a"
+            raise ConfigError(f"role {role}: {article} {have} role; {method}() needs a {kind} role")
         return self._routes[role]
 
 
 class LiteModel(_Routes):
-    """What `build()` returns: a `Model` and a `ToolModel`, with `.hooks`."""
+    """What `build()` returns: a `Model`, a `ToolModel` and an `EmbedModel`, with `.hooks`."""
 
     def _hooks(self) -> Sequence[Hook]:
         return cast(Sequence[Hook], self.hooks.snapshot())  # Hooks refuses an AsyncHook here
@@ -269,13 +347,17 @@ class LiteModel(_Routes):
     def structured[T: BaseModel](
         self, role: str, messages: Sequence[Message], schema: type[T]
     ) -> StructuredReply[T]:
-        reply = _run(self._route(role), messages, schema, self._hooks(), self._slot)
+        route = self._route(role, "structured")
+        reply = _run(route, messages, schema, self._hooks(), self._slot)
         return cast(StructuredReply[T], reply)
 
     def turn(
         self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
     ) -> TurnReply:
-        return _run_turn(self._route(role), messages, tools, self._slot)
+        return _run_turn(self._route(role, "turn"), messages, tools, self._slot)
+
+    def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
+        return _run_embed(self._route(role, "embed"), texts, self._slot)
 
 
 class AsyncLiteModel(_Routes):
@@ -296,13 +378,17 @@ class AsyncLiteModel(_Routes):
         self, role: str, messages: Sequence[Message], schema: type[T]
     ) -> StructuredReply[T]:
         hooks = self.hooks.snapshot()
-        reply = await _run_async(self._route(role), messages, schema, hooks, self._slot)
+        route = self._route(role, "structured")
+        reply = await _run_async(route, messages, schema, hooks, self._slot)
         return cast(StructuredReply[T], reply)
 
     async def turn(
         self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]
     ) -> TurnReply:
-        return await _run_turn_async(self._route(role), messages, tools, self._slot)
+        return await _run_turn_async(self._route(role, "turn"), messages, tools, self._slot)
+
+    async def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
+        return await _run_embed_async(self._route(role, "embed"), texts, self._slot)
 
 
 def _routes(

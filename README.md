@@ -164,6 +164,20 @@ print(reply.turn.text)
 - Hooks do not see `turn()`. `ToolModel` / `AsyncToolModel` are the protocols; `FakeModel.turn` scripts
   `AssistantTurn`s and records `turn_calls`.
 
+## Embeddings (0.5.0)
+
+```python
+roles = RoleSpec({"extract": RolePolicy(), "embed": RolePolicy(kind="embed")})
+config = ModelsConfig(backend="ollama", model="qwen3:8b", roles={"embed": {"model": "bge-m3:567m"}})
+reply = build(config, roles).embed("embed", ["Ada lives in Wellington."])
+reply.vectors, reply.dim, reply.provenance.tag      # [[...]], 1024, "ollama:bge-m3:567m"
+```
+
+- An embed role is never routable (an index is bound to its model) and takes no chat settings.
+- Backends: `ollama`, `openai` (any OpenAI-compatible `/embeddings`), `litellm`; not `gateway` or `anthropic`.
+- Texts go in batches of 64; the vectors come back in input order. Hooks do not see `embed()`.
+- Tests: `FakeModel(vectors={"embed": hash_vectors(8)})`; calls are recorded in `embed_calls`.
+
 ## Errors
 
 ```

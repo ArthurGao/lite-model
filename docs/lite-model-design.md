@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S5 完成（v0.1.0，2026-11-18）；宿主迁移完成（2026-11-19）；0.3.0 已发布（2026-11-20：`AsyncHook`、`Bounded` 槽位只包请求、`map` 带 context、Proxy 缓存头，Proxy 实测通过）。阶段与验收见 §14。
+状态：S5 完成（v0.1.0，2026-11-18）；宿主迁移完成（2026-11-19）；0.3.0 已发布（2026-11-20：`AsyncHook`、`Bounded` 槽位只包请求、`map` 带 context、Proxy 缓存头，Proxy 实测通过）；0.4.0 已发布（2026-11-21：`turn()`，见 §3.1，lite-agent 在用）。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -45,8 +45,8 @@ LiteLLM Proxy 做，lite-model 只把它当作一个后端，并在客户端补�
 - 不管 prompt 模板（留在各模块的 `prompts/`），不做缓存本身（交给 lite-cache）。
 - 不做 streaming（4 个模块都没用到）。
 - embedding 留到 v2（lite-rag、lite-mem 各有一份 embedding 客户端，见 §15 待确认）。
-- lite-eval 的 judge 暂不迁移：它故意用 httpx2 直连、走 Ollama 原生 `/api/chat`，judge 作为测量工具要固定、
-  隔离。
+- lite-eval 的 judge 不迁移（2026-11-21 owner 定）：它故意用 httpx2 直连、走 Ollama 原生 `/api/chat`，judge
+  作为测量工具要固定、隔离（lite-eval 设计 §9）。
 
 ## 2. 位置与调用链
 
@@ -240,6 +240,51 @@ class AsyncToolModel(Protocol):
 已知限制：跨协议重放时 tool call 的 id 原样使用（没有遇到过不被接受的 id，未系统验证）；另一种协议里没解析
 出来的参数发给 Anthropic 时是空对象 `{}`。
 
+### 3.2 向量：`embed()`（0.5.0）
+
+为什么现在加：lite-rag、lite-mem、lite-cache 各有一份 embedding 客户端，其中 lite-rag 和 lite-mem 的 Ollama、
+OpenAI 两条路径几乎一样。它们的调用也该和 LLM 调用一样：按 role 配置，记录来源，失败时不 fallback（§15 的
+待确认项，2026-11-21 owner 定）。只收 HTTP 端点；fastembed、sentence-transformers 这类进程内模型留在各引擎里，
+否则每个宿主都要带上 onnx 或 torch（和规则 1 不 import litellm 的理由相同）。
+
+```python
+EMBED = RoleSpec({"embed": RolePolicy(kind="embed")})
+reply = model.embed("embed", ["Ada lives in Wellington.", "..."])   # EmbedReply
+reply.vectors      # list[list[float]]，和输入一一对应、顺序相同
+reply.dim          # 向量长度
+reply.provenance   # 和 text() 一样：answered 取自响应
+reply.usage        # input = 端点报告的 token 数；output = 0
+```
+
+- **role 的种类**：`RolePolicy(kind="chat" | "embed")`，默认 `"chat"`。规则如下：
+  - embed role 永远不可路由：`kind="embed", routable=True` 在构造时就报错（规则 5：embedding 是索引身份的一部分）。
+  - 对 embed role 调 `text()` / `structured()` / `turn()`，或对 chat role 调 `embed()`，都是 `ConfigError`。
+- **后端**：`supports_embeddings` 是 profile 数据。
+  - ollama、openai、litellm 支持：走 OpenAI SDK 的 `embeddings.create`，Ollama 用它的 `/v1/embeddings`。
+  - gateway 不支持（llm-gateway 的非目标）；anthropic 也不支持（Anthropic 没有 embedding API）。
+  - embed role 配到不支持的类型上，`build()` 时报错。
+- **请求体**：`{model, input: [...], encoding_format: "float"}`。显式写出 `"float"`：不写时 openai 3.46.0 会发
+  `base64`，再在本地解码成 float32（`openai/lib/_parsing/_embeddings.py`），而 Ollama 是否接受 base64 没有核实过。
+  不发 `dimensions`，宿主需要时再加。
+- **调用设置**：embed role 不用 chat 参数。
+  - 在 embed role 上显式设置 `temperature`、`max_output_tokens`、`reasoning_effort` 是 `ConfigError`。
+  - 从顶层继承来的这三项不发送、不报错：宿主的顶层是给 chat role 配的。
+  - `timeout_s`、`connect_timeout_s`、`max_retries` 照常生效。重试由 SDK 在同一 target 上做（§8），不 fallback。
+- **分批**：每批最多 64 条（lite-mem 原来的 `BATCH`），按顺序逐批发。
+  - 每批都检查两件事：向量条数等于输入条数；所有向量长度一致。不符合是 `BadStructuredReply`（回复和请求对不上），消息里不带向量内容。
+  - 各批的 `answered` 必须相同，否则是 `ProvenanceUnknown`。usage 按批相加，任何一批不知道就是 `None`。
+  - 空输入是 `ValueError`：不发请求，也就没有可以记录的来源。
+  - 400 / 413 时把一批拆小重试（lite-rag 的做法），等 lite-rag 迁移时再加。
+- **不经过 hook**：和 `turn()` 一样。hook 的回复类型是文本或结构化回复，lite-cache 也不缓存向量。
+- **测试工具**：`FakeModel(vectors={"embed": hash_vectors(8)})` / `AsyncFakeModel(vectors=...)`。
+  - embed 的脚本和其他脚本分开放：不放进 `FakeReply` 联合类型，否则宿主测试里已有的 `list` 脚本会推断失败。
+  - 每个 role 一个 callable：收到 `FakeEmbedCall(role, texts)`，返回向量；也可以给一个异常让它抛出。
+  - 调用记在 `embed_calls` 里。
+  - `hash_vectors(dim)` 按文本的 sha256 生成确定的向量。
+- **实测**（`-m ollama`，2026-11-21）：bge-m3:567m 经 `/v1/embeddings` 返回的向量，和原生 `/api/embed` 返回的
+  逐元素相等（中文和英文各一句，1024 维）。所以 lite-mem 迁移后，已经存下的向量仍然可用。
+- **以后（lite-rag 迁移时）**：query / document 前缀、Voyage / Cohere / Gemini、batch 减半。这些都是增量。
+
 ## 4. 配置
 
 lite-model 提供 pydantic 配置模型，宿主模块把它嵌进自己的设置，环境变量用宿主的前缀
@@ -322,7 +367,7 @@ routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connec
 | --- | --- | --- | --- | --- |
 | `ollama` | OpenAI SDK → Ollama `/v1` | local | strict `json_schema` | 响应 `model` |
 | `openai` | OpenAI SDK，任意 OpenAI-compatible 端点 | api | strict `json_schema` | 响应 `model` |
-| `anthropic` | Anthropic SDK Messages（system 消息用 `\n\n` 拼进 `system` 字段；`max_tokens` / `model_context_window_exceeded` → `Truncated`；`end_turn` / `stop_sequence` / `tool_use` 是完整回复；其他 stop_reason（`refusal`、`pause_turn`……）→ `EmptyReply`；结构化回复只读被强制的那个工具的 input） | api | 一个强制工具，`input_schema` = strict schema，`tool_choice` 指定它（与 lite-mem 相同） | 响应 `model` |
+| `anthropic` | Anthropic SDK Messages（system 消息用 `\n\n` 拼进 `system` 字段；`max_tokens` / `model_context_window_exceeded` → `Truncated`；`end_turn` / `stop_sequence` / `tool_use` 是完整回复；其他 stop_reason（`refusal`、`pause_turn`……）→ `EmptyReply`；结构化回复是 text block 拼接后的 JSON） | api | `output_config.format = {type: json_schema, schema: <strict schema>}`，不发 tools / `tool_choice`（0.5.0；之前是一个强制工具） | 响应 `model` |
 | `gateway` | OpenAI SDK → llm-gateway | subscription（可按 profile 覆盖） | strict `json_schema`；gateway 对 DeepSeek / Qwen 降级为 prompted，响应头 `X-LLMGW-Structured-Output: prompted` 记进来源 | 见 §6.2 |
 | `litellm` | OpenAI SDK → LiteLLM Proxy | api | strict `json_schema`（S0 经 `ollama_chat/` 核实；其他上游接入时再核实） | 见 §6.3 |
 
@@ -655,11 +700,38 @@ lite-model/
 | **S5** 发布与收尾 | README、`deploy/litellm/`、v0.1.0 release wheel；整个库的最终收尾 review | 宿主可以从 wheel 安装；全量检查绿 |
 | **S6+** 迁移 | 在 lite-mem、lite-rag、llm-steward 各自 repo 里按 §12 迁移 | 见 §12 |
 | **0.3.0** lite-cache 的前置（2026-11-20 实现） | `AsyncHook`；`Bounded` 槽位只包住真正的请求；`Bounded.map` 带调用方 context；litellm 回复带 `x-litellm-cache-key` 时 `cached=True` | `tests/contract/test_bounded_hooks.py`：concurrency 1 时命中不等正在跑的调用（sync、async）；hook 经同一个 `Bounded` 调模型不死锁；`map` 里 hook 看得到 `call_context`；async hook 命中短路且不阻塞其它 task；同步模型拒绝 `AsyncHook`。`test_usage_and_hooks.py`：带缓存头的 litellm 回复 `cached=True`、来源不变，空值或别的后端不算 |
+| **0.5.0** 向量与 Anthropic 结构化输出（2026-11-21 实现） | `embed()`（§3.2）：`RolePolicy(kind=)`、`EmbedReply`、`EmbedModel` / `AsyncEmbedModel`、`supports_embeddings`、分批与校验、`FakeModel(vectors=)`、`hash_vectors`；Anthropic `structured()` 改用 `output_config.format`（§15） | `tests/contract/test_embed.py`（同步、异步）：请求体（`encoding_format: "float"`，不带 chat 参数）；按 index 排回输入顺序；来源与 usage；64 条一批、顺序和 usage 合计；条数、维度不对，以及批与批之间不一致；不同批由不同模型回答；空输入不发请求；同一 target 重试、错误不带上游文本；不调用 hook；role 种类不对、不支持的后端、embed role 上的 chat 参数被拒。`test_anthropic.py`：结构化请求只有 `output_config`，没有 tools / `tool_choice`；回复从 text JSON 读。`-m ollama`：`/v1/embeddings` 与 `/api/embed` 的向量相等 |
 | **0.4.0** lite-agent 的前置（2026-11-21 实现） | `turn()`（§3.1）：`ToolSpec`、`AssistantTurn`（有序 blocks）、`ToolResults`、`TurnReply`、`ToolModel` / `AsyncToolModel`；两种协议的请求和回复映射；`Opaque` 重放规则；`supports_tools`；`FakeModel.turn` | `tests/contract/test_turns.py`（同步、异步）：带 tools 的请求体；历史里的 call 和结果（OpenAI 每个结果一条 `tool` 消息，Anthropic 一条 user 消息）；多个 call 的顺序和 id；截断返回 `stop="length"` 和它的 call；不合法的参数；thinking block 的字段和值原样往返、位置不变、交错顺序保留；未知的 `finish_reason`；空的 `ToolResults`；历史中间的 system 消息；另一种协议的 `Opaque` 不发；`EmptyReply` / `Truncated` / `CallFailed` / `ProvenanceUnknown` 带对的 usage；不调用 hook；`text()` 请求体不变。`-m ollama`：一个真实的 tool 轮次加结果 |
 
 ### 阶段记录
 
 （每个阶段完成后在这里追加：日期、做了什么、review 结论、被拒的 finding 及理由。）
+
+- **0.5.0（2026-11-21）**：`embed()`（§3.2）和 Anthropic `structured()` 改用 `output_config.format`（§15）。
+  - 检查：ruff、ruff format、mypy 都通过；pytest 362 passed；`-m ollama` 6 passed（含 `/v1/embeddings` 与 `/api/embed` 向量相等）。
+  - 新测试先红后绿，事后又逐行破坏实现，确认断言会失败：`encoding_format`、按 index 排序、跨批来源、chat 设置清空、embed role 不可路由、条数校验、Anthropic 请求形状、`Bounded.embed`。
+  - 有意改的旧测试：`test_anthropic.py` 里断言强制工具的四个测试，按新请求形状重写。
+  - 删除的旧测试：`test_only_the_forced_tools_input_is_read`。这个测试检查"只读被强制的那个工具"，现在已经没有强制工具了。
+  - `/simplify`（reuse / simplification / efficiency / altitude 四路）采纳：
+    - embed 经 `EmbedBackend` 协议调用，`_send` 改为必须传 endpoint owner（原来是 `owner=None` 的补丁参数）。
+    - `_route` 从方法名推出 role 种类。
+    - `_merged` 单批时直接返回；usage 合计用 `_total`。
+    - 向量和输入不再各复制一份。
+    - 路由别名检查只留一处。
+    - `target()` 真的清掉 embed role 的 chat 设置，docstring 因此成立。
+    - "空向量"单独一条检查。
+    - `Bounded` / `AsyncBounded` 补上 `embed()`，原来漏了。
+    - `embeddings()` 响应构造放到 `tests/upstream.py`。
+    - `FakeReply` 不收向量：放进去会让宿主测试里已有的 `list` 脚本类型推断失败（mypy 在 `test_bounded.py` 上报了）。改成独立的 `vectors=`。
+  - `/simplify` 不采纳：
+    - embed 测试并进 `conftest.Caller`：要把 embed role 加进所有契约测试的 `ROLES`，anthropic / gateway 配置的测试会多出 embed 的错误。
+    - `FakeModel` 的 embed 支持列表脚本：没有用到。
+    - async 的批并行发：设计定为逐批发，失败时不浪费其他批。
+    - `strict_schema` 缓存：不是这次的改动。
+  - Codex（`codex exec -s read-only`）两条都采纳，每条先写了红的回归测试：
+    - 只按 index 排序、不检查 index，重复或缺失的 index 会把向量配给错的输入。现在要求排序后正好是 `0..n-1`。
+    - 端点不报 usage 时，`output` 也成了 `None`。embedding 没有输出 token，现在固定为 0。
+    - 宿主现有的 `text` / `structured` / `turn` / hook / `FakeModel` 调用路径没有发现回退。
 
 - **0.4.0（2026-11-21）**：`turn()`（§3.1）。检查：ruff、ruff format、mypy 干净；pytest 全绿；`-m ollama` 5 passed
   （含一个真实的 tool 轮次，qwen3:1.7b）。新测试先红后绿；事后逐行破坏实现确认断言会失败，其中"回复 block 的顺序"
@@ -857,9 +929,10 @@ lite-model/
 - **`turn()` 与 hook**（0.4.0）：现在不经过 hook。有宿主要缓存或观测 agent 的轮次时，再扩 `Hook` 协议。
 - **Chat Completions 端点的 reasoning 内容**（0.4.0）：Ollama、DeepSeek 等在非标准字段里返回思考内容，有的要求
   在 tool 轮次之间传回。0.4.0 不采集、不回传（这些后端不产生 `Opaque`）；接入这样的模型做 agent 时要先核实并补上。
-- **Anthropic 后端的 `structured()` 用强制 tool**（`anthropic_messages.py` 的 `tool_choice`）：Claude API 参考写明
-  Opus 5.5、Sonnet 5.5、Fable 5.1 及之后的模型上强制 `tool_choice` 是 400。0.4.0 没动它（会改现有宿主的请求体）；
-  要单独处理（改用 `output_config.format`），未在真实端点上验证。
+- ~~**Anthropic 后端的 `structured()` 用强制 tool**~~：0.5.0 改用 `output_config.format`（json_schema，schema 仍是
+  strict schema；回复读 text block 拼成的 JSON）。原因：Claude API 参考写明 Opus 5.5、Sonnet 5.5、Fable 5.1 及之后的
+  模型上强制 `tool_choice` 是 400；结构化输出在当前所有模型（含 4.6 系列）上可用。宿主的 Anthropic 结构化请求体因此
+  改变（lite-mem `tests/unit/test_llm_requests.py` 跟着改）。只有契约测试，未在真实端点上验证（不调用付费 API）。
 - **preserved thinking 的 400**（§3.1）：现在落在 `CallFailed` 里，调用方分不出它和别的失败。需要时加一种专门的错误。
 
 - **llm-gateway 的两处修改**（在 llm-gateway repo 里做，不在本 repo）：
@@ -869,7 +942,8 @@ lite-model/
   在这之前，lite-model 对 gateway 后端：配置了 `reasoning_effort` 就拒绝（§5），gateway + 路由别名拒绝（§6.2）。
 - embedding 是否在 v2 收进来（lite-rag、lite-mem 各有一份 httpx2 embedding 客户端）。embedding 和索引绑定，
   永远不路由。
-- lite-eval 的 judge 以后是否迁移。
+- ~~lite-eval 的 judge 以后是否迁移~~：2026-11-21 owner 定，不迁移。judge 是测量仪器，保持直连，写成工作区的
+  明确例外（lite-eval 设计 §9、lite-eval AGENTS.md 规则 9）。
 - ~~hook 只有 `before` / `after`，失败的调用不经过 hook~~：2026-11-19 定，不加 `failed()`。lite-cache 改为 hook
   接入，失败的调用不计数，`skip:<reason>` 只来自它自己的 `accept` 谓词（lite-cache 设计 §0、§3.4）。
 - ~~`Call` 缺 lite-cache 的 scope / policy~~：S5 定为 `call_context()`（§10）。lite-cache 的 hook 必须在没有

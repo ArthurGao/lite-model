@@ -83,3 +83,22 @@ def test_a_tool_turn_and_its_result_through_ollama() -> None:
     second = model.turn("answer", [*ask, first.turn, done], [clock])
     assert second.stop == "end"
     assert "12:34" in second.turn.text
+
+
+def test_embed_through_ollama_v1_matches_the_native_api() -> None:
+    # Design §3.2: lite-mem moves from Ollama's /api/embed to lite-model's /v1/embeddings; its
+    # stored vectors stay valid only if both return the same numbers for the same model.
+    import httpx2
+
+    data = CONFIG.model_dump(exclude_unset=True) | {"roles": {"embed": {"model": "bge-m3:567m"}}}
+    config = ModelsConfig.model_validate(data)
+    texts = ["Ada lives in Wellington.", "艾达住在惠灵顿。"]
+    reply = build(config, RoleSpec({"embed": RolePolicy(kind="embed")})).embed("embed", texts)
+    native = httpx2.post(
+        "http://127.0.0.1:11434/api/embed",
+        json={"model": "bge-m3:567m", "input": texts},
+        timeout=60,
+    ).json()["embeddings"]
+    assert reply.dim == 1024
+    assert reply.provenance.answered == "bge-m3:567m"
+    assert reply.vectors == native
