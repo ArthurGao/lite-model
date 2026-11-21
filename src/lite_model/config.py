@@ -86,6 +86,10 @@ class RoleConfig(_CallSettings):
 
     backend: Name | None = None
     model: Name | None = None
+    # An embed role's own settings (design §3.2, 0.6.0); refused on a chat role.
+    dimensions: int | None = Field(default=None, gt=0)  # sent as `dimensions` (truncation)
+    batch_size: int | None = Field(default=None, gt=0)  # texts per request; None: EMBED_BATCH
+    max_concurrency: int | None = Field(default=None, gt=0)  # batches in flight; None: 1
 
 
 class ModelsConfig(_CallSettings):
@@ -149,6 +153,9 @@ _KEY_SOURCE = {"api_key_env", "keyless"}  # an entry that sets one replaces both
 RoleKind = Literal["chat", "embed"]
 # The call settings an embed role has no use for (design §3.2).
 CHAT_ONLY = ("temperature", "max_output_tokens", "reasoning_effort")
+# And the ones only an embed role has (0.6.0).
+EMBED_ONLY = ("dimensions", "batch_size", "max_concurrency")
+EMBED_BATCH = 64  # texts per `/embeddings` request unless the role sets `batch_size`
 
 
 @dataclass(frozen=True)
@@ -191,6 +198,10 @@ class Target:
     connect_timeout_s: float
     max_retries: int
     prices: Mapping[str, Price]  # this backend's entries of ModelsConfig.prices, by model
+    # embed roles only (0.6.0); a chat role has the defaults
+    dimensions: int | None = None
+    batch_size: int = EMBED_BATCH
+    max_concurrency: int = 1
 
     @property
     def where(self) -> str:
@@ -201,7 +212,8 @@ class Target:
 def target(config: ModelsConfig, role: str, kind: RoleKind = "chat") -> Target:
     """`role`'s target from the defaults and its override; no checks beyond resolving. An embed
     role's request carries none of the chat settings, inherited or not (design §3.2)."""
-    override = config.roles.get(role, RoleConfig()).model_dump(exclude_none=True)
+    own = config.roles.get(role, RoleConfig())
+    override = own.model_dump(exclude_none=True, exclude=set(EMBED_ONLY))
     if kind == "embed":  # what the role sets itself is refused in _embed_problems
         override |= dict.fromkeys(CHAT_ONLY)
     c = config.model_copy(update=override)  # a field the role leaves out keeps the default
@@ -232,6 +244,10 @@ def target(config: ModelsConfig, role: str, kind: RoleKind = "chat") -> Target:
         prices={
             k.split(":", 1)[1]: v for k, v in c.prices.items() if k.startswith(f"{c.backend}:")
         },
+        # a chat role that sets these is refused in _problems
+        dimensions=own.dimensions,
+        batch_size=own.batch_size or EMBED_BATCH,
+        max_concurrency=own.max_concurrency or 1,
     )
 
 
@@ -242,19 +258,23 @@ def _embed_problems(config: ModelsConfig, target: Target) -> list[str]:
     found = []
     if not PROFILES[target.type].supports_embeddings:
         found.append(f"{where}: {target.type} does not serve embeddings")
-    own = config.roles.get(target.role, RoleConfig())
     found += [
-        f"{where}: {name} is not used by embeddings"
-        for name in CHAT_ONLY
-        if getattr(own, name) is not None
+        f"{where}: {name} is not used by embeddings" for name in _set(config, target, CHAT_ONLY)
     ]
     return found
+
+
+def _set(config: ModelsConfig, target: Target, names: tuple[str, ...]) -> list[str]:
+    """Which of `names` the role sets itself (not inherited)."""
+    own = config.roles.get(target.role, RoleConfig())
+    return [name for name in names if getattr(own, name, None) is not None]
 
 
 def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]:
     where = target.where
     profile = PROFILES[target.type]
     found = []
+
     if target.api_key_env is not None and not os.environ.get(target.api_key_env):
         found.append(f"{where}: set {target.api_key_env}")
     if profile.extra and importlib.util.find_spec(profile.extra) is None:
@@ -265,6 +285,9 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
         found.append(f"{where}: {target.model} is a routing alias and the role is not routable")
     if target.kind == "embed":  # the chat checks below are about chat parameters
         return found + _embed_problems(config, target)
+    found += [
+        f"{where}: {name} is only for embed roles" for name in _set(config, target, EMBED_ONLY)
+    ]
     if target.routed and profile.answered_header is None:
         found.append(f"{where}: routing through {target.type} cannot tell which model answered")
     if target.temperature is not None and not profile.supports_temperature:

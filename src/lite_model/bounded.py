@@ -3,16 +3,14 @@ in input order (design §10; lite-rag's `BoundedCalls`). A model shared by sever
 ingesting documents in parallel) stays within what the endpoint and the quota can take."""
 
 import asyncio
-import contextvars
 import threading
 from collections.abc import Callable, Coroutine, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from typing import Any, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
 
-from lite_model.client import AsyncEmbedModel, AsyncModel, EmbedModel, Model
+from lite_model.client import AsyncEmbedModel, AsyncModel, EmbedModel, Model, in_threads
 from lite_model.types import EmbedReply, Message, StructuredReply, TextReply
 
 
@@ -55,17 +53,18 @@ class Bounded:
         with self._whole:
             return cast(EmbedModel, self._model).embed(role, texts)
 
+    def close(self) -> None:
+        """Close the wrapped model's clients, when it has any (0.6.0)."""
+        close = getattr(self._model, "close", None)
+        if close is not None:
+            close()
+
     def map[I, R](self, one: Callable[[I], R], items: Sequence[I]) -> list[R]:
         """`one` over `items`, results in input order, up to `concurrency` at once. `one` calls
         this Bounded (not the wrapped model) so its calls take slots; the first error raises.
         Each item runs in a copy of the caller's context, so `call_context()` reaches the hooks
         of calls made in the worker threads (0.3.0)."""
-        if self._concurrency == 1 or len(items) <= 1:
-            return [one(i) for i in items]
-        context = contextvars.copy_context()
-        with ThreadPoolExecutor(min(self._concurrency, len(items))) as pool:
-            # a fresh copy per item: one Context cannot be entered by two threads at once
-            return list(pool.map(lambda i: context.copy().run(one, i), items))
+        return in_threads(one, items, self._concurrency)
 
 
 class AsyncBounded:
@@ -94,6 +93,12 @@ class AsyncBounded:
     async def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
         async with self._whole:
             return await cast(AsyncEmbedModel, self._model).embed(role, texts)
+
+    async def aclose(self) -> None:
+        """Close the wrapped model's clients, when it has any (0.6.0)."""
+        aclose = getattr(self._model, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     async def map[I, R](
         self, one: Callable[[I], Coroutine[Any, Any, R]], items: Sequence[I]

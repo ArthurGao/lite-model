@@ -1,10 +1,13 @@
 """`build()` and `build_async()` (design §3): validate the config, resolve each role to a target,
 and run calls the same way for every protocol, sync or async."""
 
+import asyncio
+import contextvars
 import copy
 import inspect
 import os
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from dataclasses import replace
 from types import MappingProxyType
@@ -77,8 +80,6 @@ class AsyncEmbedModel(Protocol):
 
 
 Route = tuple[Backend, Any, Target]  # protocol module, SDK client, target
-# Texts per `/embeddings` request, sent one batch after another (lite-mem's batch, design §3.2).
-EMBED_BATCH = 64
 
 
 def _failed(target: Target, exc: Exception) -> CallFailed:
@@ -248,7 +249,35 @@ async def _run_turn_async(
 def _batches(target: Target, texts: Sequence[str]) -> list[list[str]]:
     if not texts:  # nothing to send, so no provenance to record (design §3.2)
         raise ValueError(f"{target.where}: no texts to embed")
-    return [list(texts[i : i + EMBED_BATCH]) for i in range(0, len(texts), EMBED_BATCH)]
+    size = target.batch_size
+    return [list(texts[i : i + size]) for i in range(0, len(texts), size)]
+
+
+def in_threads[I, R](one: Callable[[I], R], items: Sequence[I], concurrency: int) -> list[R]:
+    """`one` over `items` on up to `concurrency` threads, results in input order, each item in
+    a copy of the caller's context (so `call_context()` reaches the hooks). The first error
+    raises, and items not started yet are cancelled: no request after the call has failed."""
+    if concurrency == 1 or len(items) <= 1:
+        return [one(i) for i in items]
+    context = contextvars.copy_context()
+    pool = ThreadPoolExecutor(min(concurrency, len(items)))
+    try:
+        # a fresh copy per item: one Context cannot be entered by two threads at once
+        return list(pool.map(lambda i: context.copy().run(one, i), items))
+    except BaseException:
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    finally:
+        pool.shutdown(wait=True)
+
+
+# What endpoints answer a request over their input limit. 400 too: Voyage, for one, answers a
+# batch over its token limit with 400; a 400 for another reason costs log2(batch) extra requests.
+TOO_LARGE = frozenset({400, 413})
+
+
+def _too_large(exc: CallFailed) -> bool:
+    return getattr(exc.__cause__, "status_code", None) in TOO_LARGE
 
 
 def _total(values: Sequence[float | None]) -> float | None:
@@ -282,40 +311,87 @@ def _embedding(route: Route) -> tuple[EmbedBackend, Any, Target]:
 
 
 def _run_embed(route: Route, texts: Sequence[str], slot: Slot) -> EmbedReply:
-    """`embed()` (design §3.2): batches in order, no hooks."""
+    """`embed()` (design §3.2): batches of `batch_size`, `max_concurrency` at a time, merged in
+    input order; no hooks. A batch the endpoint refuses as too large (400 / 413) is halved until
+    it fits; a single text it still refuses fails the call (0.6.0)."""
     backend, owner, target = _embedding(route)
-    replies = []
-    for batch in _batches(target, texts):
+
+    def fitting(batch: list[str]) -> list[EmbedReply]:
         request = backend.embed_request(target, batch)
-        response, headers = _send(target, owner, request, slot)
-        replies.append(backend.embed_reply(target, response, headers, request))
-    return _merged(target, replies)
+        try:
+            response, headers = _send(target, owner, request, slot)
+        except CallFailed as exc:
+            if len(batch) == 1 or not _too_large(exc):
+                raise
+            half = len(batch) // 2
+            return fitting(batch[:half]) + fitting(batch[half:])
+        return [backend.embed_reply(target, response, headers, request)]
+
+    parts = in_threads(fitting, _batches(target, texts), target.max_concurrency)
+    return _merged(target, [r for part in parts for r in part])
 
 
 async def _run_embed_async(route: Route, texts: Sequence[str], slot: AsyncSlot) -> EmbedReply:
     backend, owner, target = _embedding(route)
-    replies = []
-    for batch in _batches(target, texts):
+    limit = asyncio.Semaphore(target.max_concurrency)
+
+    async def fitting(batch: list[str]) -> list[EmbedReply]:
         request = backend.embed_request(target, batch)
-        response, headers = await _send_async(target, owner, request, slot)
-        replies.append(backend.embed_reply(target, response, headers, request))
-    return _merged(target, replies)
+        try:
+            async with limit:
+                response, headers = await _send_async(target, owner, request, slot)
+        except CallFailed as exc:
+            if len(batch) == 1 or not _too_large(exc):
+                raise
+            half = len(batch) // 2
+            return [*await fitting(batch[:half]), *await fitting(batch[half:])]
+        return [backend.embed_reply(target, response, headers, request)]
+
+    batches = _batches(target, texts)
+    try:
+        async with asyncio.TaskGroup() as group:  # a failure cancels the batches still waiting
+            tasks = [group.create_task(fitting(b)) for b in batches]
+    except ExceptionGroup as failed:  # the caller sees the error itself, as from one batch
+        raise failed.exceptions[0] from None
+    return _merged(target, [r for t in tasks for r in t.result()])
+
+
+class _Clients:
+    """The SDK clients a model built, shared by the models `limited()` derives from it. Closed
+    once; a client built over the caller's `http_client` is the caller's to close (0.6.0)."""
+
+    def __init__(self, routes: dict[str, Route], owned: bool) -> None:
+        self._sdks = list({id(r[1]): r[1] for r in routes.values()}.values()) if owned else []
+        self.closed = False
+
+    def release(self) -> list[Any]:
+        """The clients to close now: all of them the first time, none after (idempotent)."""
+        if self.closed:
+            return []
+        self.closed = True
+        return self._sdks
 
 
 class _Routes:
     def __init__(
-        self, routes: dict[str, Route], hooks: Hooks | None = None, slot: Any = None
+        self,
+        routes: dict[str, Route],
+        hooks: Hooks | None = None,
+        slot: Any = None,
+        *,
+        clients: _Clients | None = None,
     ) -> None:
         self._routes = routes  # role -> route; one SDK client per endpoint
         self.hooks = hooks if hooks is not None else Hooks()  # design §10
         # Taken around the request only (`Bounded`, design §10): a Slot for LiteModel, an
         # AsyncSlot for AsyncLiteModel.
         self._slot = slot if slot is not None else nullcontext()
+        self._clients = clients if clients is not None else _Clients(routes, owned=False)
 
     def limited(self, slot: Any) -> Self:
         """The same routes and hooks with each request taking `slot` (`Bounded` / `AsyncBounded`,
         design §10)."""
-        return type(self)(self._routes, self.hooks, slot)
+        return type(self)(self._routes, self.hooks, slot, clients=self._clients)
 
     def target(self, role: str) -> Target:
         """`role`'s resolved target (model, backend, endpoint): what a host records before any
@@ -326,6 +402,8 @@ class _Routes:
 
     def _route(self, role: str, method: str = "text") -> Route:
         """`role`'s route, checked to be of the kind `method` needs (design §3.2)."""
+        if self._clients.closed:
+            raise RuntimeError(f"{type(self).__name__} is closed: {method}() on role {role}")
         kind: RoleKind = "embed" if method == "embed" else "chat"
         have = self.target(role).kind
         if have != kind:
@@ -336,6 +414,18 @@ class _Routes:
 
 class LiteModel(_Routes):
     """What `build()` returns: a `Model`, a `ToolModel` and an `EmbedModel`, with `.hooks`."""
+
+    def close(self) -> None:
+        """Close the SDK clients this model built (not an `http_client` the caller passed);
+        calls after it raise. Also `with build(...) as model:` (0.6.0)."""
+        for sdk in self._clients.release():
+            sdk.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def _hooks(self) -> Sequence[Hook]:
         return cast(Sequence[Hook], self.hooks.snapshot())  # Hooks refuses an AsyncHook here
@@ -365,9 +455,26 @@ class AsyncLiteModel(_Routes):
     design §10)."""
 
     def __init__(
-        self, routes: dict[str, Route], hooks: Hooks | None = None, slot: Any = None
+        self,
+        routes: dict[str, Route],
+        hooks: Hooks | None = None,
+        slot: Any = None,
+        *,
+        clients: _Clients | None = None,
     ) -> None:
-        super().__init__(routes, hooks if hooks is not None else Hooks(allow_async=True), slot)
+        hooks = hooks if hooks is not None else Hooks(allow_async=True)
+        super().__init__(routes, hooks, slot, clients=clients)
+
+    async def aclose(self) -> None:
+        """`LiteModel.close()` for asyncio callers; also `async with build_async(...)`."""
+        for sdk in self._clients.release():
+            await sdk.close()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
 
     async def text(self, role: str, messages: Sequence[Message]) -> TextReply:
         hooks = self.hooks.snapshot()
@@ -412,13 +519,13 @@ def build(
     """The model for `roles`, or ConfigError before any call (design §4).
 
     `http_client` replaces the SDK's transport (a proxy, or a test's recording transport)."""
-    return LiteModel(_routes(config, roles, lambda b, t, k: b.connect(t, k, http_client)))
+    routes = _routes(config, roles, lambda b, t, k: b.connect(t, k, http_client))
+    return LiteModel(routes, clients=_Clients(routes, owned=http_client is None))
 
 
 def build_async(
     config: ModelsConfig, roles: RoleSpec, *, http_client: "httpx2.AsyncClient | None" = None
 ) -> AsyncLiteModel:
     """`build()` for asyncio callers."""
-    return AsyncLiteModel(
-        _routes(config, roles, lambda b, t, k: b.connect_async(t, k, http_client))
-    )
+    routes = _routes(config, roles, lambda b, t, k: b.connect_async(t, k, http_client))
+    return AsyncLiteModel(routes, clients=_Clients(routes, owned=http_client is None))

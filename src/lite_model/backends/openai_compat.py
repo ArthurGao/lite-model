@@ -217,7 +217,9 @@ def embed_endpoint(sdk: Any) -> Any:
 def embed_request(target: Target, texts: list[str]) -> dict[str, Any]:
     # "float" spelled out: left out, openai 3.46.0 asks for base64 and decodes it to float32
     # (openai/lib/_parsing/_embeddings.py); whether Ollama takes base64 is unverified.
-    params = {"model": target.model, "input": texts, "encoding_format": "float"}
+    params: dict[str, Any] = {"model": target.model, "input": texts, "encoding_format": "float"}
+    if target.dimensions is not None:
+        params["dimensions"] = target.dimensions
     return _transport(target, params)
 
 

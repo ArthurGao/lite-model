@@ -97,6 +97,9 @@ class FakeModel:
         fake._vectors = dict(vectors)
         return fake
 
+    def close(self) -> None:
+        """Nothing to release; `LiteModel.close()`'s counterpart (0.6.0)."""
+
     def _reply[C: (FakeCall, FakeTurnCall)](self, call: C, log: list[C]) -> FakeReply:
         log.append(call)
         if call.role not in self._scripts:
@@ -180,6 +183,9 @@ class AsyncFakeModel:
         fake = cls()
         fake._fake = FakeModel.with_vectors(vectors, **scripts)
         return fake
+
+    async def aclose(self) -> None:
+        """Nothing to release; `AsyncLiteModel.aclose()`'s counterpart (0.6.0)."""
 
     @property
     def calls(self) -> list[FakeCall]:
