@@ -259,7 +259,7 @@ reply.usage        # input = 端点报告的 token 数；output = 0
 - **role 的种类**：`RolePolicy(kind="chat" | "embed")`，默认 `"chat"`。规则如下：
   - embed role 永远不可路由：`kind="embed", routable=True` 在构造时就报错（规则 5：embedding 是索引身份的一部分）。
   - 对 embed role 调 `text()` / `structured()` / `turn()`，或对 chat role 调 `embed()`，都是 `ConfigError`。
-- **后端**：`supports_embeddings` 是 profile 数据。
+- **后端**：`supports_embeddings` 是 profile 数据（0.7.0 起是 `serves` 集合，§3.3）。
   - ollama、openai、litellm 支持：走 OpenAI SDK 的 `embeddings.create`，Ollama 用它的 `/v1/embeddings`。
   - gateway 不支持（llm-gateway 的非目标）；anthropic 也不支持（Anthropic 没有 embedding API）。
   - embed role 配到不支持的类型上，`build()` 时报错。
@@ -297,6 +297,30 @@ reply.usage        # input = 端点报告的 token 数；output = 0
   `http_client` 由宿主自己关。`limited()` 派生出的 model 共用同一组客户端，所以 `Bounded` / `AsyncBounded` 的 close 关的是被包住的那个
   model。关闭后再调用会抛 `RuntimeError`；`FakeModel` 的 close 什么也不做。
 
+### 3.3 Voyage 与 `rerank()`（0.7.0）
+
+Voyage AI 是 Anthropic 文档推荐的 embedding 提供方（Anthropic 自己没有 embedding 模型）。它只有 embedding 和 rerank，没有 chat。
+
+- 内置 backend 类型 `voyage`：`https://api.voyageai.com/v1`，`VOYAGE_API_KEY`，channel `api`。走 OpenAI 协议模块，因为 `/v1/embeddings` 是
+  OpenAI 的格式。和 OpenAI 的差别写在 profile 里（规则 7），客户端里没有按名字的分支：
+  - `serves={embed, rerank}`：profile 的 `serves` 列出这个类型服务的 role 种类（0.7.0 起替代 `supports_embeddings`），chat role 配到 voyage 上，`build()` 时拒绝。
+  - `embed_dimensions_field="output_dimension"`：embed role 的 `dimensions` 以这个字段名发出（经 SDK 的 `extra_body`）。
+  - `embed_encoding_format=None`：Voyage 的 `encoding_format` 只接受 null 或 base64，不发 `"float"`，交给 SDK 用 base64 并解码。
+  - `embed_input_type=True`。
+- `embed(role, texts, *, input_type=None)`：`"query"` / `"document"`，告诉模型这批文本是查询还是文档。只有 `embed_input_type` 的类型接受，
+  其他类型传了就报 `ConfigError`，不悄悄丢掉。对半拆批时每个子批都带同样的 `input_type`。usage 读 `prompt_tokens`，没有就读
+  `total_tokens`（Voyage）。
+- `rerank(role, query, documents, *, top_k=None) -> RerankReply(scores, provenance, usage)`：
+  - 新的 role 种类 `RolePolicy(kind="rerank")`，和 embed 一样不可路由：reranker 决定宿主留下什么，要记录，不能被路由器换掉。
+  - 只在 `serves` 含 rerank 的类型上（目前只有 voyage）；rerank role 设了 chat 或 embed 的字段，`build()` 时拒绝。
+  - 请求 `POST /rerank`，`{query, documents, model, return_documents: false[, top_k]}`，经 SDK 的通用 `post`，所以重试、超时、鉴权和别的调用一样。
+  - 回复按相关度排序；lite-model 按 `index` 排回输入顺序，`scores[i]` 是第 i 个文档的分，`top_k` 之外的文档是 `None`。
+    index 越界、重复、分数不是有限数、条数多于 `top_k` 或少于 `min(top_k, 文档数)`，都是 `BadStructuredReply`。
+  - 一次请求，不拆批，不调用 hook。空文档列表报 `ValueError`，不发请求。
+  - `RerankModel` / `AsyncRerankModel` 协议；`Bounded` 透传；`FakeModel.with_scores({...})` 和 `rerank_calls`。
+- 请求和回复的格式取自 Voyage 的 API 参考（docs.voyageai.com，2025-12-10），契约测试按它手写；还没有和真实接口核对过，
+  `-m voyage`（要 `VOYAGE_API_KEY`，按 token 收费，两次很小的调用）是核对它的那一步。
+
 ## 4. 配置
 
 lite-model 提供 pydantic 配置模型，宿主模块把它嵌进自己的设置，环境变量用宿主的前缀
@@ -327,6 +351,7 @@ backends:                   # named endpoints; the five built-ins are always the
   #   anthropic SDK default URL, ANTHROPIC_API_KEY, channel api
   #   gateway   http://127.0.0.1:8787/v1, no key, channel subscription
   #   litellm   http://127.0.0.1:4400/v1, LITELLM_API_KEY, channel api, router_aliases [smart-router]
+  #   voyage    https://api.voyageai.com/v1, VOYAGE_API_KEY, channel api; embed and rerank only (§3.3)
 forbid_channels: []         # tests / CI set [subscription, api]
 prices: {}                  # S4: "backend:model" -> {input_per_mtok, output_per_mtok}
 ```
@@ -719,6 +744,22 @@ lite-model/
 
 （每个阶段完成后在这里追加：日期、做了什么、review 结论、被拒的 finding 及理由。）
 
+- **0.7.0（2026-11-22）**：`voyage` 类型、`embed(input_type=)`、`rerank()`（§3.3）。都是增量改动；`EmbedModel` 协议多了一个仅限关键字、
+  有默认值的参数，自己实现这个协议的宿主要跟着加。起因：lite-rag 的 `VoyageEmbedder` 是它自己写的 HTTP 调用，Voyage rerank 没有地方放。
+  - 测试：`tests/contract/test_voyage.py`（同步、异步）：请求的 URL、鉴权、`input_type`、`output_dimension`、不发 `encoding_format: "float"`；
+    base64 向量解码；没有 input_type 就不发；400 时对半拆且子批带同样的 input_type；不接受 input_type 的类型报错且不发请求；chat role
+    配到 voyage 上被拒；rerank 排回输入顺序、`top_k` 之外是 None、请求体、来源和 usage；三种不匹配的回复；rerank role 放在不支持的
+    类型上、chat/embed role 调 rerank 被拒；rerank role 不可路由；fake 和 Bounded 透传。导入失败时全部红；后补的对半拆和 Bounded 两条，
+    分别去掉子批的 input_type、Bounded 不传参数，确认变红后恢复。`tests/live/test_voyage.py`（`-m voyage`）写好，没有 key，这次没跑。
+  - /simplify 采纳：profile 的三个布尔值合成 `serves` 集合，配置检查用一张 `UNUSED` 表（每种 role 不用的字段），`_embed_problems` 并入
+    `_problems`；`embed_encoding_format`；一个 `_RerankOwner` 同时服务 sync / async（看 `post` 的返回值是否 awaitable）；rerank 请求也走
+    `_transport`；条数检查合成一条；`InputType` / `RoleKind` 放到 `types.py`；fake 的 rerank 按 `top_k` 在之外填 None；测试用
+    `local_validate`、`Upstream.body`、`embeddings(b64=)`、`ranked()`。拒绝：dimensions 一律走 `extra_body`（改变 0.6.0 宿主的请求体，规则 13）；
+    测试共用 `Caller`、合并 `with_vectors` / `with_scores`（超出本次范围）。
+  - Codex 三条都成立，都先写了失败的测试：非 dict 的条目被滤掉后不计数（`top_k=1` 时一条坏的加一条好的被当成有效）；布尔值通过了
+    index 和分数的检查；`top_k=0` 被当成没有上限。改为坏条目计入条数并拒绝、排除 bool、`top_k < 1` 在发请求前报 `ValueError`。
+    Codex 也确认了：SDK 不带 `encoding_format` 时请求 base64 并解码；其他类型的请求体不变。
+  - pytest 401 passed；`-m ollama` 6 passed。
 - **0.6.0（2026-11-22）**：embed role 的 `dimensions` / `batch_size` / `max_concurrency`；400/413 时对半拆批；`close()` / `aclose()`
   （§3.2.1）。都是增量改动。起因是 lite-rag S19 要把它的 ollama / openai embedder 换过来，而 llm-steward 退出时关不掉 SDK 客户端。
   - 测试：`test_embed.py` 新增 dimensions 进请求体、分批和并发下的顺序、对半拆的完整请求序列、单条仍被拒就失败、chat role 上设

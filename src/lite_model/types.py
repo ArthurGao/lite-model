@@ -78,6 +78,24 @@ class EmbedReply:
         return len(self.vectors[0]) if self.vectors else 0
 
 
+# What a role is for (design §3.2, §3.3): "chat": text() / structured() / turn(); "embed":
+# embed(); "rerank": rerank().
+RoleKind = Literal["chat", "embed", "rerank"]
+# What texts sent to embed() are, on a type that takes it (Voyage, design §3.3).
+InputType = Literal["query", "document"]
+
+
+@dataclass(frozen=True)
+class RerankReply:
+    """`rerank()`'s reply (design §3.3): one relevance score per document, in input order; None
+    for a document the endpoint did not score (past `top_k`). Higher is more relevant; scores
+    compare within one reply only."""
+
+    scores: list[float | None] = field(hash=False)
+    provenance: Provenance
+    usage: Usage
+
+
 # --- One model-chosen tool turn (design §3.1) ---
 # These are frozen like the types above, but only shallowly: a Mapping field keeps the caller's
 # object (as `Provenance.via` does). Do not mutate a mapping after handing it over.

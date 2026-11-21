@@ -2,7 +2,7 @@
 
 lite-model is the **shared model-call layer for the lite modules** (lite-rag, lite-mem, llm-steward, later
 lite-cache): call sites name a role, configuration maps each role to a model on a backend (`ollama`, `openai` —
-any OpenAI-compatible endpoint —, `anthropic`, `gateway` — llm-gateway —, `litellm` — LiteLLM Proxy), and every
+any OpenAI-compatible endpoint —, `anthropic`, `gateway` — llm-gateway —, `litellm` — LiteLLM Proxy, `voyage` — embeddings and rerank only), and every
 reply says which model actually answered. Routing by request difficulty is done by an optional LiteLLM Proxy;
 lite-model treats it as one more backend and adds the client-side guards and provenance routing needs.
 
@@ -22,6 +22,8 @@ Naming: repo `lite-model`, Python package `lite_model`, CLI `litemodel`, env pre
 If a change must contradict the design, update the design in the same change and say why in the commit.
 
 ## Current stage
+
+**v0.7.0 (2026-11-22): the `voyage` backend type (embeddings with `input_type` / `output_dimension`, `rerank()` with `RolePolicy(kind="rerank")`)** (design §3.3; additive; `-m voyage` is opt-in and paid).
 
 **v0.6.0 (2026-11-22): embed role settings (`dimensions`, `batch_size`, `max_concurrency`), 400/413 batch halving, `close()` / `aclose()`** (design §3.2.1; additive).
 

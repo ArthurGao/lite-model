@@ -4,9 +4,9 @@ S0 (2026-11-18) unless noted; `KB/global/litellm/README.md` holds the LiteLLM ev
 from dataclasses import dataclass
 from typing import Literal
 
-from lite_model.types import Channel
+from lite_model.types import Channel, RoleKind
 
-BackendType = Literal["ollama", "openai", "anthropic", "gateway", "litellm"]
+BackendType = Literal["ollama", "openai", "anthropic", "gateway", "litellm", "voyage"]
 
 
 @dataclass(frozen=True)
@@ -38,9 +38,16 @@ class BackendProfile:
     # `turn()` is refused on a type whose endpoint cannot take `tools` (design §5). Whether a
     # given model uses them well is the model's affair, not the type's.
     supports_tools: bool = True
-    # `embed()` on an OpenAI-compatible `/embeddings` (design §3.2). llm-gateway serves none (its
-    # non-goal) and Anthropic has no embedding API.
-    supports_embeddings: bool = True
+    # The role kinds the type serves. `embed()` goes to an OpenAI-compatible `/embeddings`
+    # (design §3.2): llm-gateway serves none (its non-goal), Anthropic has no embedding API.
+    # `rerank()` goes to `/rerank`: Voyage's API only; Voyage has no chat (§3.3).
+    serves: frozenset[RoleKind] = frozenset({"chat", "embed"})
+    # How `/embeddings` takes an embed role's `dimensions`, whether it takes an input type
+    # (`query` / `document`), and the `encoding_format` sent (None: left to the SDK, which asks
+    # for base64 and decodes it) (§3.3).
+    embed_dimensions_field: str = "dimensions"
+    embed_input_type: bool = False
+    embed_encoding_format: str | None = "float"
 
 
 PROFILES: dict[BackendType, BackendProfile] = {
@@ -81,7 +88,7 @@ PROFILES: dict[BackendType, BackendProfile] = {
         requires_max_tokens=True,
         extra="anthropic",
         base_url_is_root=True,
-        supports_embeddings=False,
+        serves=frozenset({"chat"}),
     ),
     # llm-gateway maps both names to max_tokens (translate.py:58-59) and drops reasoning_effort
     # (it lands in X-LLMGW-Ignored-Params): refused rather than silently lost (design §5).
@@ -98,7 +105,7 @@ PROFILES: dict[BackendType, BackendProfile] = {
         # can tell until llm-gateway passes the upstream model on (design §15).
         via_headers=("x-llmgw-backend", "x-llmgw-structured-output"),
         ignored_params_header="x-llmgw-ignored-params",
-        supports_embeddings=False,
+        serves=frozenset({"chat"}),
     ),
     # LiteLLM 1.108.9 honours both names and translates per upstream (S0).
     "litellm": BackendProfile(
@@ -122,5 +129,23 @@ PROFILES: dict[BackendType, BackendProfile] = {
         # params in its cache-hit branches only, and drops empty header values (0.3.0, KB
         # global/litellm). The Proxy's cache stays off (§7.2); this keeps the usage honest if on.
         cached_header="x-litellm-cache-key",
+    ),
+    # Voyage AI (Anthropic's recommended embedding vendor): an OpenAI-shaped `/embeddings` with
+    # `input_type` and `output_dimension`, which takes `encoding_format` null or base64 only, and
+    # `/rerank`. No chat API. API reference 2025-12-10 (design §3.3).
+    "voyage": BackendProfile(
+        protocol="openai",
+        channel="api",
+        base_url="https://api.voyageai.com/v1",
+        key_env="VOYAGE_API_KEY",
+        max_tokens_param="max_tokens",
+        default_temperature=None,
+        supports_temperature=False,
+        supports_reasoning_effort=False,
+        supports_tools=False,
+        serves=frozenset({"embed", "rerank"}),
+        embed_dimensions_field="output_dimension",
+        embed_input_type=True,
+        embed_encoding_format=None,
     ),
 }

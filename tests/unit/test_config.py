@@ -79,7 +79,15 @@ def test_switching_backend_never_reuses_the_default_backends_endpoint_or_key() -
 
 def test_built_in_backends_stay_when_the_config_adds_one() -> None:
     config = local(backends={"corp": BackendConfig(type="openai")})
-    assert set(config.backends) == {"ollama", "openai", "anthropic", "gateway", "litellm", "corp"}
+    assert set(config.backends) == {
+        "ollama",
+        "openai",
+        "anthropic",
+        "gateway",
+        "litellm",
+        "voyage",
+        "corp",
+    }
     replaced = local(backends={"ollama": BackendConfig(type="ollama", base_url="http://gpu:1/v1")})
     assert target(replaced, "answer").base_url == "http://gpu:1/v1"
 

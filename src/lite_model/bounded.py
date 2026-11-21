@@ -10,8 +10,16 @@ from typing import Any, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
 
-from lite_model.client import AsyncEmbedModel, AsyncModel, EmbedModel, Model, in_threads
-from lite_model.types import EmbedReply, Message, StructuredReply, TextReply
+from lite_model.client import (
+    AsyncEmbedModel,
+    AsyncModel,
+    AsyncRerankModel,
+    EmbedModel,
+    Model,
+    RerankModel,
+    in_threads,
+)
+from lite_model.types import EmbedReply, InputType, Message, RerankReply, StructuredReply, TextReply
 
 
 @runtime_checkable
@@ -48,10 +56,18 @@ class Bounded:
         with self._whole:
             return self._model.structured(role, messages, schema)
 
-    def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
+    def rerank(
+        self, role: str, query: str, documents: Sequence[str], *, top_k: int | None = None
+    ) -> RerankReply:
+        with self._whole:
+            return cast(RerankModel, self._model).rerank(role, query, documents, top_k=top_k)
+
+    def embed(
+        self, role: str, texts: Sequence[str], *, input_type: InputType | None = None
+    ) -> EmbedReply:
         """`embed()` (design §3.2) of a model that has it; every batch takes a slot."""
         with self._whole:
-            return cast(EmbedModel, self._model).embed(role, texts)
+            return cast(EmbedModel, self._model).embed(role, texts, input_type=input_type)
 
     def close(self) -> None:
         """Close the wrapped model's clients, when it has any (0.6.0)."""
@@ -90,9 +106,19 @@ class AsyncBounded:
         async with self._whole:
             return await self._model.structured(role, messages, schema)
 
-    async def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
+    async def rerank(
+        self, role: str, query: str, documents: Sequence[str], *, top_k: int | None = None
+    ) -> RerankReply:
         async with self._whole:
-            return await cast(AsyncEmbedModel, self._model).embed(role, texts)
+            model = cast(AsyncRerankModel, self._model)
+            return await model.rerank(role, query, documents, top_k=top_k)
+
+    async def embed(
+        self, role: str, texts: Sequence[str], *, input_type: InputType | None = None
+    ) -> EmbedReply:
+        async with self._whole:
+            model = cast(AsyncEmbedModel, self._model)
+            return await model.embed(role, texts, input_type=input_type)
 
     async def aclose(self) -> None:
         """Close the wrapped model's clients, when it has any (0.6.0)."""

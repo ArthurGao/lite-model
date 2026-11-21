@@ -11,8 +11,10 @@ from pydantic import BaseModel
 from lite_model.types import (
     AssistantTurn,
     EmbedReply,
+    InputType,
     Message,
     Provenance,
+    RerankReply,
     Stop,
     StructuredReply,
     TextReply,
@@ -47,6 +49,21 @@ class FakeEmbedCall:
 
     role: str
     texts: tuple[str, ...]
+    input_type: InputType | None = None  # 0.7.0
+
+
+@dataclass(frozen=True)
+class FakeRerankCall:
+    """One `rerank()` call (design §3.3), recorded in `rerank_calls`."""
+
+    role: str
+    query: str
+    documents: tuple[str, ...]
+    top_k: int | None
+
+
+# rerank() scripts, by role (`FakeModel.with_scores({...})`): one score per document, or raise.
+RerankScript = Callable[[FakeRerankCall], list[float]] | BaseException
 
 
 def hash_vectors(dim: int) -> Callable[[FakeEmbedCall], list[list[float]]]:
@@ -87,6 +104,34 @@ class FakeModel:
         self.calls: list[FakeCall] = []
         self.turn_calls: list[FakeTurnCall] = []
         self.embed_calls: list[FakeEmbedCall] = []
+        self._scores: dict[str, RerankScript] = {}
+        self.rerank_calls: list[FakeRerankCall] = []
+
+    @classmethod
+    def with_scores(cls, scores: Mapping[str, RerankScript], /, **scripts: Script) -> Self:
+        """A fake that also serves `rerank()` for `scores`' roles (0.7.0); like `with_vectors`."""
+        fake = cls(**scripts)
+        fake._scores = dict(scores)
+        return fake
+
+    def rerank(
+        self, role: str, query: str, documents: Sequence[str], *, top_k: int | None = None
+    ) -> RerankReply:
+        call = FakeRerankCall(role, query, tuple(documents), top_k)
+        self.rerank_calls.append(call)
+        if role not in self._scores:
+            raise AssertionError(f"FakeModel has no scores scripted for role {role!r}")
+        script = self._scores[role]
+        if isinstance(script, BaseException):
+            raise script
+        scores = script(call)
+        if len(scores) != len(documents):
+            raise AssertionError(f"FakeModel: role {role!r} gave {len(scores)} scores")
+        kept: list[float | None] = list(scores)
+        if top_k is not None:  # as the real reply: None past the top_k best
+            best = set(sorted(range(len(kept)), key=lambda i: -scores[i])[:top_k])
+            kept = [s if i in best else None for i, s in enumerate(kept)]
+        return RerankReply(kept, self._provenance(role), Usage())
 
     @classmethod
     def with_vectors(cls, vectors: Mapping[str, EmbedScript], /, **scripts: Script) -> Self:
@@ -135,8 +180,10 @@ class FakeModel:
         turn, stop = reply
         return TurnReply(turn, stop, self._provenance(role), Usage())
 
-    def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
-        call = FakeEmbedCall(role, tuple(texts))
+    def embed(
+        self, role: str, texts: Sequence[str], *, input_type: InputType | None = None
+    ) -> EmbedReply:
+        call = FakeEmbedCall(role, tuple(texts), input_type)
         self.embed_calls.append(call)
         if role not in self._vectors:
             raise AssertionError(f"FakeModel has no vectors scripted for role {role!r}")
@@ -184,6 +231,22 @@ class AsyncFakeModel:
         fake._fake = FakeModel.with_vectors(vectors, **scripts)
         return fake
 
+    @classmethod
+    def with_scores(cls, scores: Mapping[str, RerankScript], /, **scripts: Script) -> Self:
+        """As `FakeModel.with_scores`."""
+        fake = cls()
+        fake._fake = FakeModel.with_scores(scores, **scripts)
+        return fake
+
+    @property
+    def rerank_calls(self) -> list[FakeRerankCall]:
+        return self._fake.rerank_calls
+
+    async def rerank(
+        self, role: str, query: str, documents: Sequence[str], *, top_k: int | None = None
+    ) -> RerankReply:
+        return self._fake.rerank(role, query, documents, top_k=top_k)
+
     async def aclose(self) -> None:
         """Nothing to release; `AsyncLiteModel.aclose()`'s counterpart (0.6.0)."""
 
@@ -199,8 +262,10 @@ class AsyncFakeModel:
     def embed_calls(self) -> list[FakeEmbedCall]:
         return self._fake.embed_calls
 
-    async def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
-        return self._fake.embed(role, texts)
+    async def embed(
+        self, role: str, texts: Sequence[str], *, input_type: InputType | None = None
+    ) -> EmbedReply:
+        return self._fake.embed(role, texts, input_type=input_type)
 
     async def text(self, role: str, messages: Sequence[Message]) -> TextReply:
         return self._fake.text(role, messages)
