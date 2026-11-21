@@ -1,13 +1,14 @@
 """Chat Completions over the OpenAI SDK: Ollama `/v1`, OpenAI and any OpenAI-compatible endpoint
 (design §5). What differs between backend types comes from `profiles.py`."""
 
+import inspect
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel
 
-from lite_model.backends import finish, finish_embed, finish_turn, sdk_client
+from lite_model.backends import finish, finish_embed, finish_rerank, finish_turn, sdk_client
 from lite_model.config import Target
 from lite_model.profiles import PROFILES
 from lite_model.schema import strict_schema
@@ -15,8 +16,10 @@ from lite_model.types import (
     AssistantTurn,
     Block,
     EmbedReply,
+    InputType,
     Message,
     Reply,
+    RerankReply,
     Text,
     ToolCall,
     ToolSpec,
@@ -214,20 +217,37 @@ def embed_endpoint(sdk: Any) -> Any:
     return sdk.embeddings.with_raw_response
 
 
-def embed_request(target: Target, texts: list[str]) -> dict[str, Any]:
+def embed_request(
+    target: Target, texts: list[str], input_type: InputType | None = None
+) -> dict[str, Any]:
+    profile = PROFILES[target.type]
+    params: dict[str, Any] = {"model": target.model, "input": texts}
     # "float" spelled out: left out, openai 3.46.0 asks for base64 and decodes it to float32
-    # (openai/lib/_parsing/_embeddings.py); whether Ollama takes base64 is unverified.
-    params: dict[str, Any] = {"model": target.model, "input": texts, "encoding_format": "float"}
+    # (openai/lib/_parsing/_embeddings.py); whether Ollama takes base64 is unverified. Voyage
+    # takes null or base64 only: left to the SDK there (§3.3).
+    if profile.embed_encoding_format is not None:
+        params["encoding_format"] = profile.embed_encoding_format
+    vendor: dict[str, Any] = {}  # fields the OpenAI SDK has no parameter for
     if target.dimensions is not None:
-        params["dimensions"] = target.dimensions
-    return _transport(target, params)
+        if profile.embed_dimensions_field == "dimensions":
+            params["dimensions"] = target.dimensions
+        else:
+            vendor[profile.embed_dimensions_field] = target.dimensions
+    if input_type is not None:
+        vendor["input_type"] = input_type  # checked against the profile by the client
+    params = _transport(target, params)
+    if vendor:
+        params["extra_body"] = {**params.get("extra_body", {}), **vendor}
+    return params
 
 
 def embed_reply(
     target: Target, response: Any, headers: Mapping[str, str], sent: Mapping[str, Any]
 ) -> EmbedReply:
     data = sorted(response.data or [], key=lambda d: d.index)
-    tokens = getattr(getattr(response, "usage", None), "prompt_tokens", None)
+    usage = getattr(response, "usage", None)
+    # OpenAI reports prompt_tokens; Voyage total_tokens (an embedding has no output)
+    tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "total_tokens", None)
     return finish_embed(
         target,
         sent,
@@ -236,4 +256,79 @@ def embed_reply(
         usage=Usage(input=tokens, output=0),  # an embedding has no output tokens
         vectors=[d.embedding for d in data],  # the SDK's list[float], not copied
         indexes=[d.index for d in data],
+    )
+
+
+# --- rerank() (design §3.3): `/rerank` (Voyage), through the same SDK client ---
+
+
+class _Raw:
+    """An httpx response in the raw-response shape `_send` reads: `.headers`, `.parse()`."""
+
+    def __init__(self, response: Any) -> None:
+        self.headers = response.headers
+        self._response = response
+
+    def parse(self) -> Any:
+        return self._response.json()
+
+
+class _RerankOwner:
+    """`/rerank` as the `create(**request)` owner `_send` / `_send_async` take: the SDK's generic
+    `post`, with its retries, timeout and auth. On an async SDK `post` returns an awaitable, and
+    so does `create`."""
+
+    def __init__(self, sdk: Any) -> None:
+        self._sdk = sdk
+
+    def create(self, **request: Any) -> Any:
+        import httpx2
+
+        sent = self._sdk.post("/rerank", body=request, cast_to=httpx2.Response)
+        if not inspect.isawaitable(sent):
+            return _Raw(sent)
+
+        async def answered() -> _Raw:
+            return _Raw(await sent)
+
+        return answered()
+
+
+def rerank_endpoint(sdk: Any) -> Any:
+    return _RerankOwner(sdk)
+
+
+def rerank_request(
+    target: Target, query: str, documents: list[str], top_k: int | None
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "query": query,
+        "documents": documents,
+        "model": target.model,
+        "return_documents": False,  # the host has them; the reply stays small
+    }
+    if top_k is not None:
+        params["top_k"] = top_k
+    return _transport(target, params)
+
+
+def rerank_reply(
+    target: Target, response: Any, headers: Mapping[str, str], sent: Mapping[str, Any]
+) -> RerankReply:
+    body = response if isinstance(response, dict) else {}
+    data = body.get("data") or []
+    # a malformed entry stays in the count, as (None, None): finish_rerank refuses it
+    items = [
+        (d.get("index"), d.get("relevance_score")) if isinstance(d, dict) else (None, None)
+        for d in data
+    ]
+    usage = body.get("usage")
+    tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+    return finish_rerank(
+        target,
+        sent,
+        headers,
+        body_model=body.get("model"),
+        usage=Usage(input=tokens if isinstance(tokens, int) else None, output=0),
+        scored=items,
     )

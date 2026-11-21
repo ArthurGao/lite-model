@@ -15,15 +15,24 @@ from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 from pydantic import BaseModel
 
-from lite_model.backends import Backend, EmbedBackend, anthropic_messages, openai_compat
-from lite_model.config import ModelsConfig, RoleKind, RoleSpec, Target, resolve
+from lite_model.backends import (
+    Backend,
+    EmbedBackend,
+    RerankBackend,
+    anthropic_messages,
+    openai_compat,
+)
+from lite_model.config import ModelsConfig, RoleSpec, Target, resolve
 from lite_model.errors import BadStructuredReply, CallFailed, ConfigError, ProvenanceUnknown
 from lite_model.hooks import AsyncHook, Call, Hook, Hooks
 from lite_model.profiles import PROFILES
 from lite_model.types import (
     EmbedReply,
+    InputType,
     Message,
     Reply,
+    RerankReply,
+    RoleKind,
     StructuredReply,
     TextReply,
     ToolSpec,
@@ -70,16 +79,36 @@ class AsyncToolModel(Protocol):
 
 
 class EmbedModel(Protocol):
-    """Vectors for texts (design §3.2). A protocol of its own, like `ToolModel`."""
+    """Vectors for texts (design §3.2). A protocol of its own, like `ToolModel`. `input_type`
+    (0.7.0): what the texts are, on a type that takes it (Voyage); refused elsewhere."""
 
-    def embed(self, role: str, texts: Sequence[str]) -> EmbedReply: ...
+    def embed(
+        self, role: str, texts: Sequence[str], *, input_type: InputType | None = None
+    ) -> EmbedReply: ...
 
 
 class AsyncEmbedModel(Protocol):
-    async def embed(self, role: str, texts: Sequence[str]) -> EmbedReply: ...
+    async def embed(
+        self, role: str, texts: Sequence[str], *, input_type: InputType | None = None
+    ) -> EmbedReply: ...
+
+
+class RerankModel(Protocol):
+    """Relevance scores of documents for a query (design §3.3, 0.7.0)."""
+
+    def rerank(
+        self, role: str, query: str, documents: Sequence[str], *, top_k: int | None = None
+    ) -> RerankReply: ...
+
+
+class AsyncRerankModel(Protocol):
+    async def rerank(
+        self, role: str, query: str, documents: Sequence[str], *, top_k: int | None = None
+    ) -> RerankReply: ...
 
 
 Route = tuple[Backend, Any, Target]  # protocol module, SDK client, target
+_KIND: dict[str, RoleKind] = {"embed": "embed", "rerank": "rerank"}  # method -> kind; else chat
 
 
 def _failed(target: Target, exc: Exception) -> CallFailed:
@@ -304,20 +333,29 @@ def _merged(target: Target, replies: Sequence[EmbedReply]) -> EmbedReply:
 
 
 def _embedding(route: Route) -> tuple[EmbedBackend, Any, Target]:
-    # build() admits an embed role only on a type that serves embeddings (supports_embeddings),
+    # build() admits an embed role only on a type that serves embeddings (`serves`),
     # all of them OpenAI-compatible: their protocol module is an EmbedBackend.
     backend, sdk, target = route
     return cast(EmbedBackend, backend), cast(EmbedBackend, backend).embed_endpoint(sdk), target
 
 
-def _run_embed(route: Route, texts: Sequence[str], slot: Slot) -> EmbedReply:
+def _input_type(target: Target, input_type: InputType | None) -> InputType | None:
+    if input_type is not None and not PROFILES[target.type].embed_input_type:
+        raise ConfigError(f"{target.where}: {target.type} takes no input_type (design §3.3)")
+    return input_type
+
+
+def _run_embed(
+    route: Route, texts: Sequence[str], slot: Slot, input_type: InputType | None = None
+) -> EmbedReply:
     """`embed()` (design §3.2): batches of `batch_size`, `max_concurrency` at a time, merged in
     input order; no hooks. A batch the endpoint refuses as too large (400 / 413) is halved until
     it fits; a single text it still refuses fails the call (0.6.0)."""
     backend, owner, target = _embedding(route)
+    kind = _input_type(target, input_type)
 
     def fitting(batch: list[str]) -> list[EmbedReply]:
-        request = backend.embed_request(target, batch)
+        request = backend.embed_request(target, batch, kind)
         try:
             response, headers = _send(target, owner, request, slot)
         except CallFailed as exc:
@@ -331,12 +369,15 @@ def _run_embed(route: Route, texts: Sequence[str], slot: Slot) -> EmbedReply:
     return _merged(target, [r for part in parts for r in part])
 
 
-async def _run_embed_async(route: Route, texts: Sequence[str], slot: AsyncSlot) -> EmbedReply:
+async def _run_embed_async(
+    route: Route, texts: Sequence[str], slot: AsyncSlot, input_type: InputType | None = None
+) -> EmbedReply:
     backend, owner, target = _embedding(route)
+    kind = _input_type(target, input_type)
     limit = asyncio.Semaphore(target.max_concurrency)
 
     async def fitting(batch: list[str]) -> list[EmbedReply]:
-        request = backend.embed_request(target, batch)
+        request = backend.embed_request(target, batch, kind)
         try:
             async with limit:
                 response, headers = await _send_async(target, owner, request, slot)
@@ -354,6 +395,37 @@ async def _run_embed_async(route: Route, texts: Sequence[str], slot: AsyncSlot) 
     except ExceptionGroup as failed:  # the caller sees the error itself, as from one batch
         raise failed.exceptions[0] from None
     return _merged(target, [r for t in tasks for r in t.result()])
+
+
+def _rerank_request(
+    route: Route, query: str, documents: Sequence[str], top_k: int | None
+) -> tuple[RerankBackend, Any, Target, dict[str, Any]]:
+    # build() admits a rerank role only on a type that serves it (`serves`)
+    module, sdk, target = route
+    if not documents:
+        raise ValueError(f"{target.where}: no documents to rerank")
+    if top_k is not None and top_k < 1:
+        raise ValueError(f"{target.where}: top_k must be at least 1, not {top_k}")
+    backend = cast(RerankBackend, module)
+    request = backend.rerank_request(target, query, list(documents), top_k)
+    return backend, backend.rerank_endpoint(sdk), target, request
+
+
+def _run_rerank(
+    route: Route, query: str, documents: Sequence[str], top_k: int | None, slot: Slot
+) -> RerankReply:
+    """`rerank()` (design §3.3): one request, no hooks; scores in input order."""
+    backend, owner, target, request = _rerank_request(route, query, documents, top_k)
+    response, headers = _send(target, owner, request, slot)
+    return backend.rerank_reply(target, response, headers, request)
+
+
+async def _run_rerank_async(
+    route: Route, query: str, documents: Sequence[str], top_k: int | None, slot: AsyncSlot
+) -> RerankReply:
+    backend, owner, target, request = _rerank_request(route, query, documents, top_k)
+    response, headers = await _send_async(target, owner, request, slot)
+    return backend.rerank_reply(target, response, headers, request)
 
 
 class _Clients:
@@ -404,7 +476,7 @@ class _Routes:
         """`role`'s route, checked to be of the kind `method` needs (design §3.2)."""
         if self._clients.closed:
             raise RuntimeError(f"{type(self).__name__} is closed: {method}() on role {role}")
-        kind: RoleKind = "embed" if method == "embed" else "chat"
+        kind = _KIND.get(method, "chat")
         have = self.target(role).kind
         if have != kind:
             article = "an" if have == "embed" else "a"
@@ -446,8 +518,15 @@ class LiteModel(_Routes):
     ) -> TurnReply:
         return _run_turn(self._route(role, "turn"), messages, tools, self._slot)
 
-    def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
-        return _run_embed(self._route(role, "embed"), texts, self._slot)
+    def embed(
+        self, role: str, texts: Sequence[str], *, input_type: InputType | None = None
+    ) -> EmbedReply:
+        return _run_embed(self._route(role, "embed"), texts, self._slot, input_type)
+
+    def rerank(
+        self, role: str, query: str, documents: Sequence[str], *, top_k: int | None = None
+    ) -> RerankReply:
+        return _run_rerank(self._route(role, "rerank"), query, documents, top_k, self._slot)
 
 
 class AsyncLiteModel(_Routes):
@@ -494,8 +573,16 @@ class AsyncLiteModel(_Routes):
     ) -> TurnReply:
         return await _run_turn_async(self._route(role, "turn"), messages, tools, self._slot)
 
-    async def embed(self, role: str, texts: Sequence[str]) -> EmbedReply:
-        return await _run_embed_async(self._route(role, "embed"), texts, self._slot)
+    async def embed(
+        self, role: str, texts: Sequence[str], *, input_type: InputType | None = None
+    ) -> EmbedReply:
+        return await _run_embed_async(self._route(role, "embed"), texts, self._slot, input_type)
+
+    async def rerank(
+        self, role: str, query: str, documents: Sequence[str], *, top_k: int | None = None
+    ) -> RerankReply:
+        route = self._route(role, "rerank")
+        return await _run_rerank_async(route, query, documents, top_k, self._slot)
 
 
 def _routes(

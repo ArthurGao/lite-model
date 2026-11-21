@@ -20,7 +20,7 @@ from pydantic import (
 
 from lite_model.errors import ConfigError
 from lite_model.profiles import PROFILES, BackendType
-from lite_model.types import Channel
+from lite_model.types import Channel, RoleKind
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high"]
 # An empty string is refused, never read as "use the default".
@@ -56,6 +56,7 @@ DEFAULT_BACKENDS: dict[str, BackendConfig] = {
     "anthropic": BackendConfig(type="anthropic"),
     "gateway": BackendConfig(type="gateway"),
     "litellm": BackendConfig(type="litellm", router_aliases=("smart-router",)),
+    "voyage": BackendConfig(type="voyage"),
 }
 
 
@@ -150,11 +151,17 @@ _NO = object()  # no `type` given (or a role, which has none)
 _KEY_SOURCE = {"api_key_env", "keyless"}  # an entry that sets one replaces both (0.2.1)
 
 
-RoleKind = Literal["chat", "embed"]
-# The call settings an embed role has no use for (design §3.2).
+# The settings only a chat role uses (design §3.2), and the ones only an embed role has (0.6.0).
 CHAT_ONLY = ("temperature", "max_output_tokens", "reasoning_effort")
-# And the ones only an embed role has (0.6.0).
 EMBED_ONLY = ("dimensions", "batch_size", "max_concurrency")
+# Per kind: the settings it has no use for, refused when the role sets them itself (and dropped
+# when inherited, see `target`), and what the kind is called in messages.
+UNUSED: dict[RoleKind, tuple[str, ...]] = {
+    "chat": EMBED_ONLY,
+    "embed": CHAT_ONLY,
+    "rerank": CHAT_ONLY + EMBED_ONLY,
+}
+NOUN: dict[RoleKind, str] = {"chat": "chat", "embed": "embeddings", "rerank": "rerank"}
 EMBED_BATCH = 64  # texts per `/embeddings` request unless the role sets `batch_size`
 
 
@@ -167,8 +174,9 @@ class RolePolicy:
     kind: RoleKind = "chat"
 
     def __post_init__(self) -> None:
-        if self.kind == "embed" and self.routable:  # embeddings are index identity (rule 5)
-            raise ValueError("an embed role is never routable")
+        if self.kind != "chat" and self.routable:  # embeddings are index identity (rule 5);
+            # a reranker decides what a host keeps: recorded, never swapped by a router
+            raise ValueError(f"an {self.kind} role is never routable")
 
 
 @dataclass(frozen=True)
@@ -214,7 +222,7 @@ def target(config: ModelsConfig, role: str, kind: RoleKind = "chat") -> Target:
     role's request carries none of the chat settings, inherited or not (design §3.2)."""
     own = config.roles.get(role, RoleConfig())
     override = own.model_dump(exclude_none=True, exclude=set(EMBED_ONLY))
-    if kind == "embed":  # what the role sets itself is refused in _embed_problems
+    if kind != "chat":  # what the role sets itself is refused in _problems
         override |= dict.fromkeys(CHAT_ONLY)
     c = config.model_copy(update=override)  # a field the role leaves out keeps the default
     if c.backend not in c.backends:
@@ -233,7 +241,7 @@ def target(config: ModelsConfig, role: str, kind: RoleKind = "chat") -> Target:
         routed=c.model in backend.router_aliases,
         temperature=(
             c.temperature
-            if c.temperature is not None or kind == "embed"
+            if c.temperature is not None or kind != "chat"
             else profile.default_temperature
         ),
         max_output_tokens=c.max_output_tokens,
@@ -249,19 +257,6 @@ def target(config: ModelsConfig, role: str, kind: RoleKind = "chat") -> Target:
         batch_size=own.batch_size or EMBED_BATCH,
         max_concurrency=own.max_concurrency or 1,
     )
-
-
-def _embed_problems(config: ModelsConfig, target: Target) -> list[str]:
-    """An embed role's own checks (design §3.2): the type serves embeddings, and the role sets
-    none of the chat settings (inherited ones are dropped, see `target`)."""
-    where = target.where
-    found = []
-    if not PROFILES[target.type].supports_embeddings:
-        found.append(f"{where}: {target.type} does not serve embeddings")
-    found += [
-        f"{where}: {name} is not used by embeddings" for name in _set(config, target, CHAT_ONLY)
-    ]
-    return found
 
 
 def _set(config: ModelsConfig, target: Target, names: tuple[str, ...]) -> list[str]:
@@ -283,11 +278,13 @@ def _problems(config: ModelsConfig, spec: RoleSpec, target: Target) -> list[str]
         found.append(f"{where}: channel {target.channel} is forbidden")
     if target.routed and not spec.roles[target.role].routable:  # an embed role never is
         found.append(f"{where}: {target.model} is a routing alias and the role is not routable")
-    if target.kind == "embed":  # the chat checks below are about chat parameters
-        return found + _embed_problems(config, target)
-    found += [
-        f"{where}: {name} is only for embed roles" for name in _set(config, target, EMBED_ONLY)
-    ]
+    kind = target.kind
+    if kind not in profile.serves:
+        found.append(f"{where}: {target.type} does not serve {NOUN[kind]}")
+    unused = "is only for embed roles" if kind == "chat" else f"is not used by {NOUN[kind]}"
+    found += [f"{where}: {name} {unused}" for name in _set(config, target, UNUSED[kind])]
+    if kind != "chat":  # the checks below are about chat parameters
+        return found
     if target.routed and profile.answered_header is None:
         found.append(f"{where}: routing through {target.type} cannot tell which model answered")
     if target.temperature is not None and not profile.supports_temperature:

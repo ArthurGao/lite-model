@@ -1,7 +1,9 @@
 """A recording stand-in for an OpenAI-compatible endpoint, plugged in as the SDK's transport:
 contract tests see the exact request the real SDK sends, and script the response."""
 
+import base64
 import json
+from array import array
 from collections.abc import Sequence
 from typing import Any
 
@@ -54,15 +56,29 @@ def embeddings(
     model: str = "bge-m3:567m",
     usage: dict[str, int] | None = None,
     order: Sequence[int] | None = None,
+    b64: bool = False,
 ) -> dict[str, Any]:
-    """An OpenAI `/embeddings` response body; `order` lists the indexes in the order sent."""
+    """An OpenAI `/embeddings` response body; `order` lists the indexes in the order sent; `b64`
+    sends each vector as base64 float32, as for `encoding_format: "base64"`."""
     indexes = list(order) if order is not None else list(range(len(vectors)))
+
+    def one(v: list[float]) -> Any:
+        return base64.b64encode(array("f", v).tobytes()).decode() if b64 else v
+
     return {
         "object": "list",
         "model": model,
-        "data": [{"object": "embedding", "index": i, "embedding": vectors[i]} for i in indexes],
+        "data": [
+            {"object": "embedding", "index": i, "embedding": one(vectors[i])} for i in indexes
+        ],
         "usage": usage or {"prompt_tokens": 5, "total_tokens": 5},
     }
+
+
+def ranked(*pairs: tuple[int, float], model: str = "rerank-2.5") -> dict[str, Any]:
+    """A Voyage `/rerank` response body: (index, relevance_score) pairs, in the order sent."""
+    data = [{"index": i, "relevance_score": s} for i, s in pairs]
+    return {"object": "list", "data": data, "model": model, "usage": {"total_tokens": 21}}
 
 
 def tool_use(name: str, data: dict[str, Any], id: str = "toolu_1") -> dict[str, Any]:

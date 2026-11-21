@@ -25,9 +25,11 @@ from lite_model.types import (
     AssistantTurn,
     Block,
     EmbedReply,
+    InputType,
     Message,
     Provenance,
     Reply,
+    RerankReply,
     StructuredReply,
     TextReply,
     ToolSpec,
@@ -73,15 +75,32 @@ class Backend(Protocol):
 
 class EmbedBackend(Protocol):
     """What a protocol module adds for `embed()` (design §3.2): `openai_compat` only, since only
-    OpenAI-compatible types serve embeddings (`supports_embeddings`)."""
+    OpenAI-compatible types serve embeddings (`serves`)."""
 
     def embed_endpoint(self, sdk: Any) -> Any: ...
 
-    def embed_request(self, target: Target, texts: list[str]) -> dict[str, Any]: ...
+    def embed_request(
+        self, target: Target, texts: list[str], input_type: InputType | None = None
+    ) -> dict[str, Any]: ...
 
     def embed_reply(
         self, target: Target, response: Any, headers: Mapping[str, str], sent: Mapping[str, Any]
     ) -> EmbedReply: ...
+
+
+class RerankBackend(Protocol):
+    """What a protocol module adds for `rerank()` (design §3.3): `openai_compat`, on the types
+    that serve it (`serves`: Voyage)."""
+
+    def rerank_endpoint(self, sdk: Any) -> Any: ...
+
+    def rerank_request(
+        self, target: Target, query: str, documents: list[str], top_k: int | None
+    ) -> dict[str, Any]: ...
+
+    def rerank_reply(
+        self, target: Target, response: Any, headers: Mapping[str, str], sent: Mapping[str, Any]
+    ) -> RerankReply: ...
 
 
 def sdk_client(cls: Any, target: Target, key: str | None, http_client: Any) -> Any:
@@ -214,6 +233,38 @@ def finish_embed(
     if not vectors[0]:
         raise BadStructuredReply(f"{target.where}: empty vectors ({who.tag})", usage=usage)
     return EmbedReply(vectors, who, usage)
+
+
+def finish_rerank(
+    target: Target,
+    sent: Mapping[str, Any],
+    headers: Mapping[str, str],
+    *,
+    body_model: str | None,
+    usage: Usage,
+    scored: list[tuple[Any, Any]],
+) -> RerankReply:
+    """A rerank reply (design §3.3): who answered, and each document's score in input order.
+    Each scored index names one document, once; `top_k` bounds how many. Anything else is
+    BadStructuredReply."""
+    who, usage, _ = _settle(target, sent, headers, body_model, usage)
+    asked = len(sent["documents"])
+    limit = sent.get("top_k") or asked
+    indexes = [i for i, _ in scored]
+    # bool is an int subclass: True is neither an index nor a score
+    valid = all(isinstance(i, int) and not isinstance(i, bool) and 0 <= i < asked for i in indexes)
+    numbers = all(
+        isinstance(s, int | float) and not isinstance(s, bool) and math.isfinite(s)
+        for _, s in scored
+    )
+    unique = len(set(indexes)) == len(indexes)
+    if not (valid and numbers and unique and len(scored) == min(limit, asked)):
+        msg = f"{target.where}: the rerank scores do not match the documents ({who.tag})"
+        raise BadStructuredReply(msg, usage=usage)
+    scores: list[float | None] = [None] * asked
+    for index, score in scored:
+        scores[index] = float(score)
+    return RerankReply(scores, who, usage)
 
 
 def finish_turn(
