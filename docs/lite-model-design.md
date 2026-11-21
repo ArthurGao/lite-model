@@ -1,6 +1,6 @@
 # lite-model 设计文档
 
-状态：S5 完成（v0.1.0，2026-11-18）；宿主迁移完成（2026-11-19）；0.3.0 已发布（2026-11-20：`AsyncHook`、`Bounded` 槽位只包请求、`map` 带 context、Proxy 缓存头，Proxy 实测通过）。阶段与验收见 §14。
+状态：S5 完成（v0.1.0，2026-11-18）；宿主迁移完成（2026-11-19）；0.3.0 已发布（2026-11-20：`AsyncHook`、`Bounded` 槽位只包请求、`map` 带 context、Proxy 缓存头，Proxy 实测通过）；0.4.0 已发布（2026-11-21：`turn()`，见 §3.1，lite-agent 在用）。阶段与验收见 §14。
 
 ## 1. 概述
 
@@ -45,8 +45,8 @@ LiteLLM Proxy 做，lite-model 只把它当作一个后端，并在客户端补�
 - 不管 prompt 模板（留在各模块的 `prompts/`），不做缓存本身（交给 lite-cache）。
 - 不做 streaming（4 个模块都没用到）。
 - embedding 留到 v2（lite-rag、lite-mem 各有一份 embedding 客户端，见 §15 待确认）。
-- lite-eval 的 judge 暂不迁移：它故意用 httpx2 直连、走 Ollama 原生 `/api/chat`，judge 作为测量工具要固定、
-  隔离。
+- lite-eval 的 judge 不迁移（2026-11-21 owner 定）：它故意用 httpx2 直连、走 Ollama 原生 `/api/chat`，judge
+  作为测量工具要固定、隔离（lite-eval 设计 §9）。
 
 ## 2. 位置与调用链
 
@@ -869,7 +869,8 @@ lite-model/
   在这之前，lite-model 对 gateway 后端：配置了 `reasoning_effort` 就拒绝（§5），gateway + 路由别名拒绝（§6.2）。
 - embedding 是否在 v2 收进来（lite-rag、lite-mem 各有一份 httpx2 embedding 客户端）。embedding 和索引绑定，
   永远不路由。
-- lite-eval 的 judge 以后是否迁移。
+- ~~lite-eval 的 judge 以后是否迁移~~：2026-11-21 owner 定，不迁移。judge 是测量仪器，保持直连，写成工作区的
+  明确例外（lite-eval 设计 §9、lite-eval AGENTS.md 规则 9）。
 - ~~hook 只有 `before` / `after`，失败的调用不经过 hook~~：2026-11-19 定，不加 `failed()`。lite-cache 改为 hook
   接入，失败的调用不计数，`skip:<reason>` 只来自它自己的 `accept` 谓词（lite-cache 设计 §0、§3.4）。
 - ~~`Call` 缺 lite-cache 的 scope / policy~~：S5 定为 `call_context()`（§10）。lite-cache 的 hook 必须在没有
