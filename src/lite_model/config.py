@@ -57,6 +57,8 @@ DEFAULT_BACKENDS: dict[str, BackendConfig] = {
     "gateway": BackendConfig(type="gateway"),
     "litellm": BackendConfig(type="litellm", router_aliases=("smart-router",)),
     "voyage": BackendConfig(type="voyage"),
+    "cohere": BackendConfig(type="cohere"),
+    "gemini": BackendConfig(type="gemini"),
 }
 
 

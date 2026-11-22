@@ -20,6 +20,8 @@ from lite_model.backends import (
     EmbedBackend,
     RerankBackend,
     anthropic_messages,
+    cohere_embed,
+    gemini_embed,
     openai_compat,
 )
 from lite_model.config import ModelsConfig, RoleSpec, Target, resolve
@@ -44,7 +46,14 @@ from lite_model.types import (
 if TYPE_CHECKING:
     import httpx2
 
-BACKENDS: dict[str, Backend] = {"openai": openai_compat, "anthropic": anthropic_messages}
+# Embed-only protocol modules (0.8.0) implement EmbedBackend only: build() admits no chat role
+# on their types (`serves`), so the chat half of Backend is never called on them.
+BACKENDS: dict[str, Backend] = {
+    "openai": openai_compat,
+    "anthropic": anthropic_messages,
+    "cohere": cast(Backend, cohere_embed),
+    "gemini": cast(Backend, gemini_embed),
+}
 
 
 class Model(Protocol):
@@ -333,8 +342,8 @@ def _merged(target: Target, replies: Sequence[EmbedReply]) -> EmbedReply:
 
 
 def _embedding(route: Route) -> tuple[EmbedBackend, Any, Target]:
-    # build() admits an embed role only on a type that serves embeddings (`serves`),
-    # all of them OpenAI-compatible: their protocol module is an EmbedBackend.
+    # build() admits an embed role only on a type that serves embeddings (`serves`): its
+    # protocol module is an EmbedBackend (OpenAI-compatible, or an embed-only one over `rest`).
     backend, sdk, target = route
     return cast(EmbedBackend, backend), cast(EmbedBackend, backend).embed_endpoint(sdk), target
 

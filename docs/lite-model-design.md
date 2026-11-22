@@ -321,6 +321,23 @@ Voyage AI 是 Anthropic 文档推荐的 embedding 提供方（Anthropic 自己�
 - 请求和回复的格式取自 Voyage 的 API 参考（docs.voyageai.com，2025-12-10），契约测试按它手写；还没有和真实接口核对过，
   `-m voyage`（要 `VOYAGE_API_KEY`，按 token 收费，两次很小的调用）是核对它的那一步。
 
+### 3.4 Cohere 与 Gemini 的 embedding（0.8.0）
+
+两家的 embedding API 都不是 OpenAI 的格式（路径、字段、回复结构、Gemini 的鉴权头都不同），所以各有一个只实现 embed 的协议模块
+（`backends/cohere_embed.py`、`backends/gemini_embed.py`），底下是一个小的 JSON-over-HTTP 客户端 `backends/rest.py`。
+它在客户端依赖 SDK 的地方和 SDK 行为一致：408 / 409 / 429 / 5xx 和网络错误在同一目标上重试 `max_retries` 次（尊重 `retry-after-ms` /
+`retry-after`，否则 0.5 秒起倍增到 8 秒）；HTTP 错误带 `status_code` 抛出（400 / 413 对半拆读它），信息只有状态码；只关闭自己建的客户端。
+
+- `cohere`：`https://api.cohere.com/v2`，`CO_API_KEY`（Bearer）。`POST /embed`，`{model, texts, input_type, embedding_types: ["float"],
+  output_dimension?}`；`input_type` 映射成 `search_query` / `search_document`。回复 `embeddings.float` 按输入顺序，`meta.billed_units.input_tokens` 是 usage。
+- `gemini`：`https://generativelanguage.googleapis.com/v1beta`，`GEMINI_API_KEY`，放在 `x-goog-api-key` 头里（不是 Bearer）。
+  `POST /models/{model}:batchEmbedContents`，每条文本一个 Content；`input_type` 映射成 `taskType`（`RETRIEVAL_QUERY` / `RETRIEVAL_DOCUMENT`），
+  不传就不发（gemini-embedding-2 这类用文本前缀的模型，由宿主决定不传）；维度是 `outputDimensionality`。回复 `embeddings[].values`，没有 usage。
+- 两家的回复都不说是哪个模型回答的：`Provenance.answered` 为 None，不猜（规则 4）。两个类型都只服务 embed（`serves`），chat role 配上去 `build()` 时拒绝。
+- 请求和回复的格式取自 lite-rag 按 API 参考记录的格式（2026-11-08），契约测试按它写；`-m cohere` / `-m gemini` 要 key，按 token 收费，等有 key 再跑。
+- 不迁进来的：进程内的 embedder（fastembed 的 ONNX、sentence-transformers 的 torch）。lite-model 是 HTTP 调用层；把它们放进来会让每个宿主都背上
+  这些重依赖，而它们没有 provenance、重试、usage 可言。它们留在宿主里（lite-rag）。
+
 ## 4. 配置
 
 lite-model 提供 pydantic 配置模型，宿主模块把它嵌进自己的设置，环境变量用宿主的前缀
@@ -352,6 +369,8 @@ backends:                   # named endpoints; the five built-ins are always the
   #   gateway   http://127.0.0.1:8787/v1, no key, channel subscription
   #   litellm   http://127.0.0.1:4400/v1, LITELLM_API_KEY, channel api, router_aliases [smart-router]
   #   voyage    https://api.voyageai.com/v1, VOYAGE_API_KEY, channel api; embed and rerank only (§3.3)
+  #   cohere    https://api.cohere.com/v2, CO_API_KEY, channel api; embed only (§3.4)
+  #   gemini    https://generativelanguage.googleapis.com/v1beta, GEMINI_API_KEY, channel api; embed only (§3.4)
 forbid_channels: []         # tests / CI set [subscription, api]
 prices: {}                  # S4: "backend:model" -> {input_per_mtok, output_per_mtok}
 ```
@@ -744,6 +763,18 @@ lite-model/
 
 （每个阶段完成后在这里追加：日期、做了什么、review 结论、被拒的 finding 及理由。）
 
+- **0.8.0（2026-11-22）**：`cohere`、`gemini` 两个只做 embed 的类型，和它们用的 `rest` 客户端（§3.4）。增量改动。起因：lite-rag 剩下的
+  两个 HTTP embedder 是它自己实现的（重试、对半拆、错误映射各写了一份）。进程内的 embedder 不迁（理由见 §3.4）。
+  - 测试：`tests/contract/test_rest_embed.py`（同步、异步）：两家的 URL、鉴权头（Gemini 不发 Authorization）、请求体、input_type 映射、维度、
+    回复解析和 usage；不传 input_type 时 Gemini 不发 taskType；503 / 429 重试后成功；400 对半拆且不重试；401 不重试、错误只有类型名；
+    条数不对是 BadStructuredReply；chat role 被拒；注入的 http_client 不被关。导入失败时全部红。`tests/live/test_rest_embed.py`
+    （`-m cohere` / `-m gemini`）写好，没有 key，没跑。
+  - /simplify 采纳：sync / async 的重试循环共用 `_outcome`（每次尝试的结论：回复、等多久、还是报错）；`rest.Raw` 替代 openai_compat 里同样的 `_Raw`；
+    两家厂商共用 `rest.connectors(auth)`，没 key 时一律传空串；两处过时的注释（"embed 类型都是 OpenAI 兼容的"）改了。不采纳：`BACKENDS`
+    去掉 `cast`（chat 路径按 `Backend` 写类型，换成联合类型会把 cast 推到每个 chat 调用点）。
+  - Codex 两条都成立，先写失败的测试再修：`retry-after` 是 HTTP 日期时被当成读不懂、用了自己的退避（SDK 会读）；网络错误把原始异常挂在
+    cause 链上，原始异常可能写着请求头（Gemini 的 key 在头里）。现在网络错误换成只有类型名的 `TransportFailure`，并切断 cause 链。
+  - pytest 420 passed；mypy、ruff 干净。
 - **0.7.0（2026-11-22）**：`voyage` 类型、`embed(input_type=)`、`rerank()`（§3.3）。都是增量改动；`EmbedModel` 协议多了一个仅限关键字、
   有默认值的参数，自己实现这个协议的宿主要跟着加。起因：lite-rag 的 `VoyageEmbedder` 是它自己写的 HTTP 调用，Voyage rerank 没有地方放。
   - 测试：`tests/contract/test_voyage.py`（同步、异步）：请求的 URL、鉴权、`input_type`、`output_dimension`、不发 `encoding_format: "float"`；

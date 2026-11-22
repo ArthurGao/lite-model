@@ -1,6 +1,6 @@
 [project]
 name = "lite-model"
-version = "0.7.0"
+version = "0.8.0"
 description = "The shared model-call layer for the lite modules: roles, backends, provenance, routing guards"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -55,9 +55,11 @@ mypy_path = "src"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Opt-in, deselected by default (AGENTS.md rule 11).
-addopts = "-m 'not ollama and not litellm and not voyage'"
+addopts = "-m 'not ollama and not litellm and not voyage and not cohere and not gemini'"
 markers = [
     "ollama: talks to the real Ollama server on the host (opt-in: uv run pytest -m ollama)",
     "litellm: talks to the local LiteLLM Proxy, Ollama-backed aliases only (opt-in: uv run pytest -m litellm)",
     "voyage: the real Voyage AI API, paid per token (opt-in: VOYAGE_API_KEY=... uv run pytest -m voyage)",
+    "cohere: the real Cohere embed API, paid per token (opt-in: CO_API_KEY=... uv run pytest -m cohere)",
+    "gemini: the real Gemini embedding API, paid per token (opt-in: GEMINI_API_KEY=... uv run pytest -m gemini)",
 ]
