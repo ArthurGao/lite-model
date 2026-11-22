@@ -6,12 +6,15 @@ from typing import Literal
 
 from lite_model.types import Channel, RoleKind
 
-BackendType = Literal["ollama", "openai", "anthropic", "gateway", "litellm", "voyage"]
+BackendType = Literal[
+    "ollama", "openai", "anthropic", "gateway", "litellm", "voyage", "cohere", "gemini"
+]
 
 
 @dataclass(frozen=True)
 class BackendProfile:
-    protocol: Literal["openai", "anthropic"]  # which SDK speaks to it
+    # which protocol module speaks to it: an SDK's, or `rest` for an embed-only vendor (0.8.0)
+    protocol: Literal["openai", "anthropic", "cohere", "gemini"]
     channel: Channel  # the default; a configured backend may override it
     base_url: str | None  # None: the SDK's own
     key_env: str | None  # the usual key variable; None: no key needed
@@ -145,6 +148,37 @@ PROFILES: dict[BackendType, BackendProfile] = {
         supports_tools=False,
         serves=frozenset({"embed", "rerank"}),
         embed_dimensions_field="output_dimension",
+        embed_input_type=True,
+        embed_encoding_format=None,
+    ),
+    # Cohere's /v2/embed and Gemini's batchEmbedContents are not OpenAI-shaped: each has its own
+    # protocol module over `rest` (design §3.4, 0.8.0). Embeddings only; formats as lite-rag
+    # recorded them from the API references (2026-11-08).
+    "cohere": BackendProfile(
+        protocol="cohere",
+        channel="api",
+        base_url="https://api.cohere.com/v2",
+        key_env="CO_API_KEY",
+        max_tokens_param="max_tokens",
+        default_temperature=None,
+        supports_temperature=False,
+        supports_reasoning_effort=False,
+        supports_tools=False,
+        serves=frozenset({"embed"}),
+        embed_input_type=True,
+        embed_encoding_format=None,
+    ),
+    "gemini": BackendProfile(
+        protocol="gemini",
+        channel="api",
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        key_env="GEMINI_API_KEY",
+        max_tokens_param="max_tokens",
+        default_temperature=None,
+        supports_temperature=False,
+        supports_reasoning_effort=False,
+        supports_tools=False,
+        serves=frozenset({"embed"}),
         embed_input_type=True,
         embed_encoding_format=None,
     ),

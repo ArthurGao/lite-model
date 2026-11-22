@@ -75,7 +75,7 @@ class Backend(Protocol):
 
 class EmbedBackend(Protocol):
     """What a protocol module adds for `embed()` (design §3.2): `openai_compat` only, since only
-    OpenAI-compatible types serve embeddings (`serves`)."""
+    OpenAI-compatible types (`openai_compat`) and the embed-only vendors over `rest` (0.8.0)."""
 
     def embed_endpoint(self, sdk: Any) -> Any: ...
 

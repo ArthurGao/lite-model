@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from lite_model.backends import finish, finish_embed, finish_rerank, finish_turn, sdk_client
+from lite_model.backends.rest import Raw
 from lite_model.config import Target
 from lite_model.profiles import PROFILES
 from lite_model.schema import strict_schema
@@ -262,17 +263,6 @@ def embed_reply(
 # --- rerank() (design §3.3): `/rerank` (Voyage), through the same SDK client ---
 
 
-class _Raw:
-    """An httpx response in the raw-response shape `_send` reads: `.headers`, `.parse()`."""
-
-    def __init__(self, response: Any) -> None:
-        self.headers = response.headers
-        self._response = response
-
-    def parse(self) -> Any:
-        return self._response.json()
-
-
 class _RerankOwner:
     """`/rerank` as the `create(**request)` owner `_send` / `_send_async` take: the SDK's generic
     `post`, with its retries, timeout and auth. On an async SDK `post` returns an awaitable, and
@@ -286,10 +276,10 @@ class _RerankOwner:
 
         sent = self._sdk.post("/rerank", body=request, cast_to=httpx2.Response)
         if not inspect.isawaitable(sent):
-            return _Raw(sent)
+            return Raw(sent)
 
-        async def answered() -> _Raw:
-            return _Raw(await sent)
+        async def answered() -> Raw:
+            return Raw(await sent)
 
         return answered()
 

@@ -86,6 +86,8 @@ def test_built_in_backends_stay_when_the_config_adds_one() -> None:
         "gateway",
         "litellm",
         "voyage",
+        "cohere",  # 0.8.0
+        "gemini",
         "corp",
     }
     replaced = local(backends={"ollama": BackendConfig(type="ollama", base_url="http://gpu:1/v1")})
