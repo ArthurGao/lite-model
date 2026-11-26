@@ -1,54 +1,56 @@
-# lite-model 设计文档
+# lite-model Design Document
 
-状态：S5 完成（v0.1.0，2026-11-18）；宿主迁移完成（2026-11-19）；0.3.0 已发布（2026-11-20：`AsyncHook`、`Bounded` 槽位只包请求、`map` 带 context、Proxy 缓存头，Proxy 实测通过）；0.4.0 已发布（2026-11-21：`turn()`，见 §3.1，lite-agent 在用）。阶段与验收见 §14。
+Status: S5 done (v0.1.0, 2026-11-18); host migration done (2026-11-19); 0.3.0 released (2026-11-20: `AsyncHook`, `Bounded` slot wraps only the request, `map` carries context, Proxy cache headers, measured against the Proxy and passed); 0.4.0 released (2026-11-21: `turn()`, see §3.1, used by lite-agent). Stages and acceptance are in §14.
 
-## 1. 概述
+## 1. Overview
 
-lite-model 是 lite 系列模块（lite-rag、lite-mem、llm-steward，以后的 lite-cache）**共用的模型调用层**：
-调用点只说 role（`answer`、`extract`……），配置把 role 指向某个后端上的某个模型；lite-model 负责发请求、
-处理各家参数差异、拿回结构化结果，并记录**实际是谁回答的**。路由（按请求难度自动选模型）由可选的
-LiteLLM Proxy 做，lite-model 只把它当作一个后端，并在客户端补上路由需要的护栏和来源记录。
+lite-model is the **shared model-call layer** of the lite modules (lite-rag, lite-mem, llm-steward, and later lite-cache):
+a call site names only a role (`answer`, `extract`, ...), and the config points the role at a model on a
+backend. lite-model sends the request, handles the parameter differences between vendors, gets a structured result
+back, and records **who actually answered**. Routing (choosing a model automatically by request difficulty) is done by the optional
+LiteLLM Proxy. lite-model treats it as just one backend and adds, on the client side, the guards and
+provenance records that routing needs.
 
-命名：repo `lite-model`，Python 包 `lite_model`，CLI `litemodel`，环境变量前缀 `LITEMODEL_`。
+Names: repo `lite-model`, Python package `lite_model`, CLI `litemodel`, environment variable prefix `LITEMODEL_`.
 
-### 来源
+### Origin
 
-- 2026-11-18 的讨论：4 个模块各有一份几乎相同的 LLM 客户端（lite-rag `llm.py` 178 行、lite-mem `llm.py`
-  198 行、llm-steward `llm/client.py`、lite-eval `judges/client.py`），都在做 provider 差异、来源记录、
-  错误包装和用量统计；引入 router 会再让每份各加一遍。
-- 主人的决定（§15）：LiteLLM 只用 Proxy 模式，作为可选后端；lite 模块可以单独使用，没有 LiteLLM 时走原来的
-  配置方式。
-- 起点代码：lite-mem `src/lite_mem/llm.py`（role、strict schema、Anthropic 强制工具、来源取自响应）和
-  lite-rag `src/lite_rag/llm.py`（`PROVIDERS` 数据表、`BoundedCalls`、空回复报错）。
-- 规则来源：`KB/global/llm-app-architecture.md` §1（role 层）、§3.2（不做 fallback 链）、§10（共享模块的
-  可插拔扩展）；`KB/global/tech-selection/01b-llm-gateway-litellm.md`（LiteLLM 选型，未核实）。
+- The discussion of 2026-11-18: each of the 4 modules has a nearly identical LLM client (lite-rag `llm.py` 178 lines, lite-mem `llm.py`
+  198 lines, llm-steward `llm/client.py`, lite-eval `judges/client.py`). All of them handle provider differences, provenance records,
+  error wrapping and usage counting, and adding a router would make each of them add it again.
+- The owner's decision (§15): LiteLLM is used only in Proxy mode, as an optional backend; the lite modules can be used alone, and without LiteLLM they use the original
+  way of configuring.
+- Starting code: lite-mem `src/lite_mem/llm.py` (role, strict schema, Anthropic forced tool, provenance taken from the response)
+  and lite-rag `src/lite_rag/llm.py` (the `PROVIDERS` data table, `BoundedCalls`, an error on empty replies).
+- Rule sources: `KB/global/llm-app-architecture.md` §1 (role layer), §3.2 (no fallback chain), §10 (pluggable
+  extension of shared modules); `KB/global/tech-selection/01b-llm-gateway-litellm.md` (LiteLLM selection, not verified).
 
-### 目标
+### Goals
 
-1. 一套接口：`text()` 与 `structured(schema)`，同步和异步。
-2. role 配置：默认值 + 每个 role 的覆盖；启动时校验，配置错就拒绝启动。
-3. 后端：`ollama`、`openai`（任意 OpenAI-compatible 端点）、`anthropic`、`gateway`（llm-gateway）、
-   `litellm`（LiteLLM Proxy）。各家差异是数据，不是分支。
-4. 来源：每次回答记录 role、请求的别名、**实际回答的模型**、后端、通道（本地 / API / 订阅）。
-5. 路由支持：只有声明为可路由的 role 能用路由别名；路由别名的回答记录实际模型。
-6. 错误：不做 fallback；一个错误层级；截断、空回复、结构不符都报错；错误信息不带密钥。
-7. 用量：input / output / reasoning token，失败的调用也记录；可选按价格表算成本。
-8. 扩展点：调用前后的 hook（lite-cache 用它做缓存），注册可撤销、可按名字寻址。
-9. 测试工具：`FakeModel`（按 role 脚本化回复、记录收到的请求）。
+1. One interface: `text()` and `structured(schema)`, sync and async.
+2. Role config: defaults + per-role overrides; validated at startup, and a config error refuses to start.
+3. Backends: `ollama`, `openai` (any OpenAI-compatible endpoint), `anthropic`, `gateway` (llm-gateway),
+   `litellm` (LiteLLM Proxy). The differences between vendors are data, not branches.
+4. Provenance: every answer records the role, the requested alias, **the model that actually answered**, the backend, and the channel (local / API / subscription).
+5. Routing support: only a role declared routable can use a routing alias; for a routing alias the answer records the actual model.
+6. Errors: no fallback; one error hierarchy; truncation, an empty reply and a result that does not match the schema all raise; error messages carry no keys.
+7. Usage: input / output / reasoning tokens, also recorded for failed calls; optionally compute cost from a price table.
+8. Extension point: hooks before and after a call (lite-cache uses them for caching); registration is revocable and addressable by name.
+9. Test tool: `FakeModel` (scripted replies per role, records the requests it receives).
 
-### 非目标（v1）
+### Non-goals (v1)
 
-- **不包装 `litellm` Python 包**，也不在进程里跑路由。路由只在 LiteLLM Proxy 里做（理由见 §7.1）。
-- 不做换模型的 fallback；不做同一模型简单重试以外的重试。
-- 不执行工具、不跑 agent loop、不管会话状态。0.4.0 起提供"带 tools 的一轮调用"（§3.1）：只是一次请求和
-  回复，loop 在调用方（lite-agent）。
-- 不管 prompt 模板（留在各模块的 `prompts/`），不做缓存本身（交给 lite-cache）。
-- 不做 streaming（4 个模块都没用到）。
-- embedding 留到 v2（lite-rag、lite-mem 各有一份 embedding 客户端，见 §15 待确认）。
-- lite-eval 的 judge 不迁移（2026-11-21 owner 定）：它故意用 httpx2 直连、走 Ollama 原生 `/api/chat`，judge
-  作为测量工具要固定、隔离（lite-eval 设计 §9）。
+- **Does not wrap the `litellm` Python package**, and does not run routing in the process. Routing is done only in the LiteLLM Proxy (reasons in §7.1).
+- No fallback to another model; no retries other than a simple retry of the same model.
+- Does not execute tools, run an agent loop or manage session state. Since 0.4.0 it offers "one call round with tools" (§3.1): it is only one request and
+  reply, and the loop stays with the caller (lite-agent).
+- Does not manage prompt templates (they stay in each module's `prompts/`), and is not the cache itself (that is left to lite-cache).
+- No streaming (none of the 4 modules uses it).
+- Embedding is left to v2 (lite-rag and lite-mem each have an embedding client, see the open questions in §15).
+- lite-eval's judge is not migrated (decided by the owner on 2026-11-21): it deliberately uses httpx2 directly and goes to Ollama's native `/api/chat`; the judge,
+  as a measuring tool, must be fixed and isolated (lite-eval design §9).
 
-## 2. 位置与调用链
+## 2. Position and call chain
 
 ```
 app (lite-rag / lite-mem / llm-steward / later lite-cache)
@@ -60,15 +62,15 @@ app (lite-rag / lite-mem / llm-steward / later lite-cache)
                    └─ may forward to llm-gateway or vendors
 ```
 
-- **依赖方向**：lite 模块 → lite-model。lite-model 不依赖任何 lite 模块，也不依赖 llm-gateway 或 LiteLLM
-  的代码；它们只是 HTTP 端点。
-- **llm-gateway 不 import lite-model**：gateway 是服务端（协议转换、订阅后端），lite-model 是客户端；
-  互相 import 会让客户端接口的改动牵动服务端。两边只重复了一张小的参数差异表，可以接受。
-- **lite-cache 反向接入**：lite-model 提供 hook 协议（§10），lite-cache 实现它；lite-model 不依赖 lite-cache。
-- **可选**：不配 `gateway` / `litellm` 时，lite-model 就是直连 Ollama / OpenAI / Anthropic，与各模块现在的
-  行为一致。配了 `litellm` 而 proxy 不可用时**报错**，不会退回别的后端（no silent fallback）。
+- **Dependency direction**: lite modules → lite-model. lite-model depends on no lite module, and not on llm-gateway or LiteLLM
+  code either; they are only HTTP endpoints.
+- **llm-gateway does not import lite-model**: the gateway is a server (protocol conversion, subscription backends) and lite-model is a client;
+  importing each other would let a change to the client interface drag in the server. The two sides only duplicate one small table of parameter differences, which is acceptable.
+- **lite-cache plugs in from the other side**: lite-model provides the hook protocol (§10) and lite-cache implements it; lite-model does not depend on lite-cache.
+- **Optional**: when `gateway` / `litellm` is not configured, lite-model connects directly to Ollama / OpenAI / Anthropic, the same as
+  each module's behavior today. When `litellm` is configured and the proxy is unavailable it **raises an error** and does not fall back to another backend (no silent fallback).
 
-## 3. 接口
+## 3. Interface
 
 ```python
 @dataclass(frozen=True)
@@ -120,12 +122,12 @@ def build(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.Client |
 def build_async(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.AsyncClient | None = None) -> AsyncLiteModel: ...
 ```
 
-- 调用方只传 role 和 messages；model、endpoint、key、参数都来自配置。
-- `http_client`（S1 加）：替换 SDK 的 transport。宿主迁移时的契约测试（§12.2）用它记录真实 SDK 发出的请求体；
-  也可以用来接代理。lite-model 自己的契约测试同样这样做（`tests/upstream.py`）。
-- 各模块可以保留自己的 `LLM` Protocol（lite-rag 规则 1），用一个薄 adapter 包 lite-model；也可以直接
-  依赖 `lite_model.Model`。迁移时各模块自己选（§12）。
-- `RoleSpec`：宿主模块声明自己有哪些 role、哪些可路由（§7.3）、哪些需要结构化输出。例：
+- The caller passes only a role and messages; the model, endpoint, key and parameters all come from the config.
+- `http_client` (added in S1): replaces the SDK's transport. The contract tests used when migrating hosts (§12.2) use it to record the request body the real SDK sends;
+  it can also be used to connect a proxy. lite-model's own contract tests do the same (`tests/upstream.py`).
+- Each module may keep its own `LLM` Protocol (lite-rag rule 1) and wrap lite-model with a thin adapter; it may also depend
+  on `lite_model.Model` directly. Each module chooses for itself when migrating (§12).
+- `RoleSpec`: the host module declares which roles it has, which are routable (§7.3), and which need structured output. Example:
 
   ```python
   ROLES = RoleSpec({
@@ -135,10 +137,10 @@ def build_async(config: ModelsConfig, roles: RoleSpec, *, http_client: httpx2.As
   })
   ```
 
-### 3.1 带 tools 的一轮：`turn()`（0.4.0）
+### 3.1 One round with tools: `turn()` (0.4.0)
 
-给 lite-agent 的 loop 用：模型自己决定调不调 tool、调哪个。lite-model 只负责**这一轮**的请求和回复；
-执行 tool、决定是否继续、保存历史都是调用方的事（§1 非目标不变）。
+For lite-agent's loop: the model itself decides whether to call a tool and which one. lite-model handles only the request and reply of **this one round**;
+executing tools, deciding whether to continue, and saving the history are the caller's job (the §1 non-goals are unchanged).
 
 ```python
 @dataclass(frozen=True)
@@ -195,153 +197,153 @@ class AsyncToolModel(Protocol):
     async def turn(self, role: str, messages: Sequence[TurnMessage], tools: Sequence[ToolSpec]) -> TurnReply: ...
 ```
 
-- **单独的协议**，不往 `Model` / `AsyncModel` 里加方法：宿主自己实现 `Model` 的 adapter 和 fake 继续满足原
-  协议。`LiteModel` / `AsyncLiteModel` 两个都实现。`text()`、`structured()`、`Message` 和它们的请求体不变。
-- **`blocks` 保持端点给的顺序**，调用方把 `reply.turn` 原样放回历史。
-- **`stop`**：`length` = 被输出上限截断；否则有 call 就是 `tool_calls`（端点报 `stop` 但带着 call 时也是），
-  没有就是 `end`。
-- **截断不抛 `Truncated`**（与 `text()` 不同）：这一轮带着的 call 不能执行，但下一次请求之前每个 call 都要
-  有一条结果，调用方需要拿到它们的 id。只有"截断且既没有文本也没有 call"才抛 `Truncated`。
-- **参数不是合法的 JSON 对象时不抛错**：`arguments=None`，`raw_arguments` 是原文；由调用方当作无效参数回给
-  模型。重放这一轮时原文照发。
-- 拒答、content filter、`pause_turn`、未知的 stop reason、既没有文本也没有 call：`EmptyReply`（带 usage）。
-  只有 thinking 的回复也是 `EmptyReply`。Chat Completions 的 `finish_reason` 只认 `stop`、`tool_calls`、
-  `function_call`、`length` 和缺省；其它值一律不可用，错误里写 "unexpected"，不回显端点的字符串。（`text()` /
-  `structured()` 在这类端点上只把 `content_filter` 当作不可用，行为没有改。）
-- 这些类型是 frozen 的，但只冻结一层：`Mapping` 字段保留调用方传入的对象（与 `Provenance.via` 相同），交出去之后
-  不要再改。
-- 没有结果的 `ToolResults` 不产生任何消息（Anthropic 拒绝内容为空的 user 消息）。
-- 历史中间的 system `Message`：Chat Completions 原位发送；Anthropic 与开头的一样拼进 `system` 字段（沿用
-  `text()` 的做法）。
-- `tool_choice` 不发（端点默认 auto）。Anthropic 较新的模型拒绝强制的 `tool_choice`（400）。不暴露
-  `parallel_tool_calls`。`tools` 为空时不发 `tools` 字段。
-- **不经过 hook**（§10）。`Bounded` 的槽位照常生效。
-- 后端类型不支持 tools（`BackendProfile.supports_tools`，§5）时，`turn()` 抛 `ConfigError`，不发请求。
+- **A separate protocol**, with no methods added to `Model` / `AsyncModel`: the adapters and fakes that hosts implement for `Model` keep satisfying the original
+  protocol. `LiteModel` / `AsyncLiteModel` both implement it. `text()`, `structured()`, `Message` and their request bodies are unchanged.
+- **`blocks` keep the order the endpoint gave**, and the caller puts `reply.turn` back into the history as it is.
+- **`stop`**: `length` = cut off by the output limit; otherwise it is `tool_calls` if there is a call (also when the endpoint reports `stop` but carries calls),
+  and `end` if there is none.
+- **Truncation does not raise `Truncated`** (unlike `text()`): the calls carried by this round cannot be executed, but before the next request every call needs
+  a result, so the caller needs their ids. `Truncated` is raised only for "truncated with neither text nor a call".
+- **No error when the arguments are not a valid JSON object**: `arguments=None` and `raw_arguments` is the original text; the caller returns it to the
+  model as invalid arguments. When this round is replayed, the original text is sent as it is.
+- Refusal, content filter, `pause_turn`, an unknown stop reason, neither text nor a call: `EmptyReply` (with usage).
+  A reply with only thinking is also `EmptyReply`. For Chat Completions, `finish_reason` accepts only `stop`, `tool_calls`,
+  `function_call`, `length` and absent; any other value is unusable, the error says "unexpected", and it does not echo the endpoint's string. (On such endpoints `text()` /
+  `structured()` treat only `content_filter` as unusable; that behavior is unchanged.)
+- These types are frozen, but only one level deep: `Mapping` fields keep the object the caller passed in (the same as `Provenance.via`); do not
+  change them after handing them over.
+- A `ToolResults` with no results produces no message (Anthropic rejects a user message with empty content).
+- A system `Message` in the middle of the history: Chat Completions sends it in place; Anthropic merges it into the `system` field like the one at the start (following
+  what `text()` does).
+- `tool_choice` is not sent (the endpoint defaults to auto). Newer Anthropic models reject a forced `tool_choice` (400). `parallel_tool_calls` is not
+  exposed. When `tools` is empty the `tools` field is not sent.
+- **Does not go through hooks** (§10). The `Bounded` slot still applies as usual.
+- When the backend type does not support tools (`BackendProfile.supports_tools`, §5), `turn()` raises `ConfigError` and sends no request.
 
-两种协议的映射（契约测试 `tests/contract/test_turns.py` 逐字段检查）：
+The mapping of the two protocols (the contract test `tests/contract/test_turns.py` checks it field by field):
 
-| | Chat Completions（ollama / openai / gateway / litellm） | Anthropic Messages |
+| | Chat Completions (ollama / openai / gateway / litellm) | Anthropic Messages |
 | --- | --- | --- |
 | `ToolSpec` | `{type: function, function: {name, description, parameters}}` | `{name, description, input_schema}` |
-| 历史里的 `AssistantTurn` | 一条 assistant 消息：`content` = 文本（没有则 `null`），`tool_calls[]`（`arguments` 是 JSON 文本） | 一条 assistant 消息，content blocks 按序：`text`、`tool_use`、本协议的 `Opaque` 原样；空文本块不发 |
-| 历史里的 `ToolResults` | 每个结果一条 `{role: tool, tool_call_id, content}`；协议没有错误标志，`is_error` 不发 | **一条** user 消息，每个结果一个 `tool_result`（`is_error: true` 只在出错时带） |
-| 回复 → blocks | `content` → `Text`；`tool_calls` 里 `type == function` 的 → `ToolCall` | `text` → `Text`；`tool_use` → `ToolCall`；其它（`thinking`、`redacted_thinking`……）→ `Opaque("anthropic", 收到的字段)`：SDK 对象的 `to_dict()`，即端点发来的字段和值（含显式的 null 和额外字段），是字典往返，不是保留原始字节 |
-| 截断 | `finish_reason: length` | `stop_reason: max_tokens` / `model_context_window_exceeded` |
+| `AssistantTurn` in the history | One assistant message: `content` = the text (`null` if none), `tool_calls[]` (`arguments` is JSON text) | One assistant message, content blocks in order: `text`, `tool_use`, and this protocol's `Opaque` as it is; an empty text block is not sent |
+| `ToolResults` in the history | One `{role: tool, tool_call_id, content}` per result; the protocol has no error flag, so `is_error` is not sent | **One** user message, with one `tool_result` per result (`is_error: true` is carried only on an error) |
+| Reply → blocks | `content` → `Text`; the entries in `tool_calls` with `type == function` → `ToolCall` | `text` → `Text`; `tool_use` → `ToolCall`; the rest (`thinking`, `redacted_thinking`, ...) → `Opaque("anthropic", received fields)`: the SDK object's `to_dict()`, i.e. the fields and values the endpoint sent (including explicit nulls and extra fields); it is a dict round trip, not a preservation of the original bytes |
+| Truncation | `finish_reason: length` | `stop_reason: max_tokens` / `model_context_window_exceeded` |
 
-**`Opaque` 的重放规则**：`protocol` 与目标后端的协议相同就原样发回，不同就不发（另一种协议里没有它的位置）。
-同协议换模型时不删：Anthropic 的 API 自己丢掉目标模型读不了的 thinking block，不计费；自己删反而可能触发
-签名 / 顺序错误。0.4.0 的 Chat Completions 后端不产生 `Opaque`（见 §15）。
+**Replay rule for `Opaque`**: if `protocol` is the same as the target backend's protocol it is sent back as it is; if different it is not sent (the other protocol has no place for it).
+It is not deleted when the model changes within the same protocol: Anthropic's API itself drops the thinking blocks that the target model cannot read, without billing; deleting them
+ourselves could trigger a signature / order error. The Chat Completions backend in 0.4.0 produces no `Opaque` (see §15).
 
-**lite-model 不替调用方处理 Anthropic 的"preserved thinking"历史检查**（较新的模型：`system`、`tools` 或更早
-的消息变了，之后的 thinking block 全部失效，请求 400）：不加 beta header，不做 `drop_block`。历史里带哪些
-`Opaque` 由调用方决定——只追加的历史不受影响；调用方改写了历史（压缩、换 system 或 tools）之后，要自己不再
-带之前的 `Opaque`。这类 400 在这里是 `CallFailed`。
+**lite-model does not handle Anthropic's "preserved thinking" history check for the caller** (newer models: when `system`, `tools` or earlier
+messages change, all later thinking blocks become invalid and the request fails with 400): it adds no beta header and does no `drop_block`. Which
+`Opaque` blocks the history carries is decided by the caller. An append-only history is not affected; after the caller rewrites the history (compaction, a new system or tools), it has to
+stop carrying the earlier `Opaque` blocks itself. Such a 400 is `CallFailed` here.
 
-已知限制：跨协议重放时 tool call 的 id 原样使用（没有遇到过不被接受的 id，未系统验证）；另一种协议里没解析
-出来的参数发给 Anthropic 时是空对象 `{}`。
+Known limits: when replaying across protocols the tool call id is used as it is (no id has been seen to be rejected; not verified systematically); arguments that were not parsed
+in the other protocol are an empty object `{}` when sent to Anthropic.
 
-### 3.2 向量：`embed()`（0.5.0）
+### 3.2 Vectors: `embed()` (0.5.0)
 
-为什么现在加：lite-rag、lite-mem、lite-cache 各有一份 embedding 客户端，其中 lite-rag 和 lite-mem 的 Ollama、
-OpenAI 两条路径几乎一样。它们的调用也该和 LLM 调用一样：按 role 配置，记录来源，失败时不 fallback（§15 的
-待确认项，2026-11-21 owner 定）。只收 HTTP 端点；fastembed、sentence-transformers 这类进程内模型留在各引擎里，
-否则每个宿主都要带上 onnx 或 torch（和规则 1 不 import litellm 的理由相同）。
+Why add it now: lite-rag, lite-mem and lite-cache each have an embedding client, and the Ollama and
+OpenAI paths of lite-rag and lite-mem are nearly the same. Their calls should also work like LLM calls: configured by role, provenance recorded, no fallback on failure (the open
+question in §15, decided by the owner on 2026-11-21). Only HTTP endpoints are accepted; in-process models such as fastembed and sentence-transformers stay in each engine,
+otherwise every host would have to carry onnx or torch (the same reason as rule 1, no import of litellm).
 
 ```python
 EMBED = RoleSpec({"embed": RolePolicy(kind="embed")})
 reply = model.embed("embed", ["Ada lives in Wellington.", "..."])   # EmbedReply
-reply.vectors      # list[list[float]]，和输入一一对应、顺序相同
-reply.dim          # 向量长度
-reply.provenance   # 和 text() 一样：answered 取自响应
-reply.usage        # input = 端点报告的 token 数；output = 0
+reply.vectors      # list[list[float]], one per input, in the same order
+reply.dim          # vector length
+reply.provenance   # as for text(): answered comes from the response
+reply.usage        # input = the tokens the endpoint reports; output = 0
 ```
 
-- **role 的种类**：`RolePolicy(kind="chat" | "embed")`，默认 `"chat"`。规则如下：
-  - embed role 永远不可路由：`kind="embed", routable=True` 在构造时就报错（规则 5：embedding 是索引身份的一部分）。
-  - 对 embed role 调 `text()` / `structured()` / `turn()`，或对 chat role 调 `embed()`，都是 `ConfigError`。
-- **后端**：`supports_embeddings` 是 profile 数据（0.7.0 起是 `serves` 集合，§3.3）。
-  - ollama、openai、litellm 支持：走 OpenAI SDK 的 `embeddings.create`，Ollama 用它的 `/v1/embeddings`。
-  - gateway 不支持（llm-gateway 的非目标）；anthropic 也不支持（Anthropic 没有 embedding API）。
-  - embed role 配到不支持的类型上，`build()` 时报错。
-- **请求体**：`{model, input: [...], encoding_format: "float"}`。显式写出 `"float"`：不写时 openai 3.46.0 会发
-  `base64`，再在本地解码成 float32（`openai/lib/_parsing/_embeddings.py`），而 Ollama 是否接受 base64 没有核实过。
-  不发 `dimensions`，宿主需要时再加。
-- **调用设置**：embed role 不用 chat 参数。
-  - 在 embed role 上显式设置 `temperature`、`max_output_tokens`、`reasoning_effort` 是 `ConfigError`。
-  - 从顶层继承来的这三项不发送、不报错：宿主的顶层是给 chat role 配的。
-  - `timeout_s`、`connect_timeout_s`、`max_retries` 照常生效。重试由 SDK 在同一 target 上做（§8），不 fallback。
-- **分批**：每批最多 64 条（lite-mem 原来的 `BATCH`），按顺序逐批发。
-  - 每批都检查两件事：向量条数等于输入条数；所有向量长度一致。不符合是 `BadStructuredReply`（回复和请求对不上），消息里不带向量内容。
-  - 各批的 `answered` 必须相同，否则是 `ProvenanceUnknown`。usage 按批相加，任何一批不知道就是 `None`。
-  - 空输入是 `ValueError`：不发请求，也就没有可以记录的来源。
-  - 400 / 413 时把一批拆小重试（lite-rag 的做法），等 lite-rag 迁移时再加。
-- **不经过 hook**：和 `turn()` 一样。hook 的回复类型是文本或结构化回复，lite-cache 也不缓存向量。
-- **测试工具**：`FakeModel.with_vectors({"embed": hash_vectors(8)}, **scripts)` / `AsyncFakeModel.with_vectors(...)`（0.5.1 起；0.5.0 的 `vectors=` 关键字会让宿主的 `FakeModel(**scripts)` 过不了 mypy）。
-  - embed 的脚本和其他脚本分开放：不放进 `FakeReply` 联合类型，否则宿主测试里已有的 `list` 脚本会推断失败。
-  - 每个 role 一个 callable：收到 `FakeEmbedCall(role, texts)`，返回向量；也可以给一个异常让它抛出。
-  - 调用记在 `embed_calls` 里。
-  - `hash_vectors(dim)` 按文本的 sha256 生成确定的向量。
-- **实测**（`-m ollama`，2026-11-21）：bge-m3:567m 经 `/v1/embeddings` 返回的向量，和原生 `/api/embed` 返回的
-  逐元素相等（中文和英文各一句，1024 维）。所以 lite-mem 迁移后，已经存下的向量仍然可用。
-- **以后（lite-rag 迁移时）**：query / document 前缀、Voyage / Cohere / Gemini、batch 减半。这些都是增量。
+- **Kinds of role**: `RolePolicy(kind="chat" | "embed")`, default `"chat"`. The rules:
+  - An embed role is never routable: `kind="embed", routable=True` raises an error at construction (rule 5: the embedding is part of the index identity).
+  - Calling `text()` / `structured()` / `turn()` on an embed role, or `embed()` on a chat role, is a `ConfigError`.
+- **Backends**: `supports_embeddings` is profile data (since 0.7.0 it is the `serves` set, §3.3).
+  - ollama, openai and litellm support it: it goes through the OpenAI SDK's `embeddings.create`, and Ollama uses its `/v1/embeddings`.
+  - gateway does not support it (a non-goal of llm-gateway); anthropic does not either (Anthropic has no embedding API).
+  - An embed role configured on an unsupported type raises an error at `build()`.
+- **Request body**: `{model, input: [...], encoding_format: "float"}`. `"float"` is written out explicitly: when it is not written, openai 3.46.0 sends
+  `base64` and then decodes it locally into float32 (`openai/lib/_parsing/_embeddings.py`), and whether Ollama accepts base64 has not been verified.
+  `dimensions` is not sent; it will be added when a host needs it.
+- **Call settings**: an embed role does not use chat parameters.
+  - Explicitly setting `temperature`, `max_output_tokens` or `reasoning_effort` on an embed role is a `ConfigError`.
+  - These three inherited from the top level are neither sent nor an error: the host's top level is configured for chat roles.
+  - `timeout_s`, `connect_timeout_s` and `max_retries` apply as usual. Retries are done by the SDK on the same target (§8), with no fallback.
+- **Batching**: at most 64 items per batch (lite-mem's original `BATCH`), sent batch by batch in order.
+  - Every batch is checked for two things: the number of vectors equals the number of inputs, and all vectors have the same length. A mismatch is `BadStructuredReply` (the reply does not match the request), and the message carries no vector content.
+  - The `answered` of all batches must be the same, otherwise it is `ProvenanceUnknown`. Usage is added up over the batches, and if any batch is unknown it is `None`.
+  - Empty input is a `ValueError`: no request is sent, so there is no provenance to record.
+  - On 400 / 413 a batch is split smaller and retried (lite-rag's approach), to be added when lite-rag is migrated.
+- **Does not go through hooks**: the same as `turn()`. The hook's reply types are text or structured replies, and lite-cache does not cache vectors either.
+- **Test tool**: `FakeModel.with_vectors({"embed": hash_vectors(8)}, **scripts)` / `AsyncFakeModel.with_vectors(...)` (since 0.5.1; the `vectors=` keyword of 0.5.0 made a host's `FakeModel(**scripts)` fail mypy).
+  - The embed scripts are kept apart from the other scripts: they are not put into the `FakeReply` union type, otherwise the `list` scripts already in hosts' tests would fail type inference.
+  - One callable per role: it receives `FakeEmbedCall(role, texts)` and returns vectors; an exception can also be given for it to raise.
+  - Calls are recorded in `embed_calls`.
+  - `hash_vectors(dim)` generates deterministic vectors from the sha256 of the text.
+- **Measured** (`-m ollama`, 2026-11-21): the vectors bge-m3:567m returns through `/v1/embeddings` are element-wise equal to those the native `/api/embed` returns
+  (one Chinese and one English sentence, 1024 dimensions). So after lite-mem is migrated, the vectors already stored remain usable.
+- **Later (when lite-rag is migrated)**: query / document prefixes, Voyage / Cohere / Gemini, batch halving. These are all increments.
 
-#### 3.2.1 embed role 的设置和关闭客户端（0.6.0）
+#### 3.2.1 Settings of the embed role and closing the client (0.6.0)
 
-- embed role 自己的三个设置，只能写在 `roles.<embed role>` 上，chat role 设了会在 `build()` 时被拒（和 `CHAT_ONLY` 对称）：
-  - `dimensions`：作为 `dimensions` 参数发出，用于截断。Ollama 的 `/v1/embeddings` 也支持，2026-11-22 实测 bge-m3 截成 256 维。
-  - `batch_size`：每个请求带多少条，默认 64。
-  - `max_concurrency`：同时在途的批数，默认 1，即逐批发送。并发时结果仍按输入顺序合并：sync 用线程池，async 用信号量。
-- 一个批被拒为太大（400 / 413）时就对半拆，一直拆到单条；单条还被拒，整次调用失败。做法取自 lite-rag 的 `_fitting`。
-  拆分只发生在失败的那个批上，其他批不受影响。
-- `LiteModel.close()` / `AsyncLiteModel.aclose()`，以及 `with` / `async with`：关闭 lite-model 自己建的 SDK 客户端。宿主传进来的
-  `http_client` 由宿主自己关。`limited()` 派生出的 model 共用同一组客户端，所以 `Bounded` / `AsyncBounded` 的 close 关的是被包住的那个
-  model。关闭后再调用会抛 `RuntimeError`；`FakeModel` 的 close 什么也不做。
+- The embed role's own three settings can be written only on `roles.<embed role>`, and a chat role that sets them is rejected at `build()` (symmetric with `CHAT_ONLY`):
+  - `dimensions`: sent as the `dimensions` parameter, used for truncation. Ollama's `/v1/embeddings` supports it too; measured on 2026-11-22, bge-m3 truncated to 256 dimensions.
+  - `batch_size`: how many items per request, default 64.
+  - `max_concurrency`: the number of batches in flight at the same time, default 1, i.e. batch by batch. When concurrent, results are still merged in input order: sync uses a thread pool and async uses a semaphore.
+- When a batch is rejected as too large (400 / 413) it is split in half, down to a single item; if a single item is still rejected, the whole call fails. The approach comes from lite-rag's `_fitting`.
+  Splitting happens only on the batch that failed, and the other batches are not affected.
+- `LiteModel.close()` / `AsyncLiteModel.aclose()`, and `with` / `async with`: close the SDK clients that lite-model built itself. The `http_client`
+  a host passes in is closed by the host. The model derived by `limited()` shares the same set of clients, so the close of `Bounded` / `AsyncBounded` closes the wrapped
+  model. A call after closing raises `RuntimeError`; the close of `FakeModel` does nothing.
 
-### 3.3 Voyage 与 `rerank()`（0.7.0）
+### 3.3 Voyage and `rerank()` (0.7.0)
 
-Voyage AI 是 Anthropic 文档推荐的 embedding 提供方（Anthropic 自己没有 embedding 模型）。它只有 embedding 和 rerank，没有 chat。
+Voyage AI is the embedding provider recommended by the Anthropic docs (Anthropic itself has no embedding model). It has only embedding and rerank, and no chat.
 
-- 内置 backend 类型 `voyage`：`https://api.voyageai.com/v1`，`VOYAGE_API_KEY`，channel `api`。走 OpenAI 协议模块，因为 `/v1/embeddings` 是
-  OpenAI 的格式。和 OpenAI 的差别写在 profile 里（规则 7），客户端里没有按名字的分支：
-  - `serves={embed, rerank}`：profile 的 `serves` 列出这个类型服务的 role 种类（0.7.0 起替代 `supports_embeddings`），chat role 配到 voyage 上，`build()` 时拒绝。
-  - `embed_dimensions_field="output_dimension"`：embed role 的 `dimensions` 以这个字段名发出（经 SDK 的 `extra_body`）。
-  - `embed_encoding_format=None`：Voyage 的 `encoding_format` 只接受 null 或 base64，不发 `"float"`，交给 SDK 用 base64 并解码。
-  - `embed_input_type=True`。
-- `embed(role, texts, *, input_type=None)`：`"query"` / `"document"`，告诉模型这批文本是查询还是文档。只有 `embed_input_type` 的类型接受，
-  其他类型传了就报 `ConfigError`，不悄悄丢掉。对半拆批时每个子批都带同样的 `input_type`。usage 读 `prompt_tokens`，没有就读
-  `total_tokens`（Voyage）。
-- `rerank(role, query, documents, *, top_k=None) -> RerankReply(scores, provenance, usage)`：
-  - 新的 role 种类 `RolePolicy(kind="rerank")`，和 embed 一样不可路由：reranker 决定宿主留下什么，要记录，不能被路由器换掉。
-  - 只在 `serves` 含 rerank 的类型上（目前只有 voyage）；rerank role 设了 chat 或 embed 的字段，`build()` 时拒绝。
-  - 请求 `POST /rerank`，`{query, documents, model, return_documents: false[, top_k]}`，经 SDK 的通用 `post`，所以重试、超时、鉴权和别的调用一样。
-  - 回复按相关度排序；lite-model 按 `index` 排回输入顺序，`scores[i]` 是第 i 个文档的分，`top_k` 之外的文档是 `None`。
-    index 越界、重复、分数不是有限数、条数多于 `top_k` 或少于 `min(top_k, 文档数)`，都是 `BadStructuredReply`。
-  - 一次请求，不拆批，不调用 hook。空文档列表报 `ValueError`，不发请求。
-  - `RerankModel` / `AsyncRerankModel` 协议；`Bounded` 透传；`FakeModel.with_scores({...})` 和 `rerank_calls`。
-- 请求和回复的格式取自 Voyage 的 API 参考（docs.voyageai.com，2025-12-10），契约测试按它手写；还没有和真实接口核对过，
-  `-m voyage`（要 `VOYAGE_API_KEY`，按 token 收费，两次很小的调用）是核对它的那一步。
+- Built-in backend type `voyage`: `https://api.voyageai.com/v1`, `VOYAGE_API_KEY`, channel `api`. It goes through the OpenAI protocol module, because `/v1/embeddings` is in
+  OpenAI's format. The differences from OpenAI are written in the profile (rule 7), and the client has no branch by name:
+  - `serves={embed, rerank}`: the profile's `serves` lists the role kinds this type serves (it replaces `supports_embeddings` since 0.7.0); a chat role configured on voyage is rejected at `build()`.
+  - `embed_dimensions_field="output_dimension"`: the embed role's `dimensions` is sent under this field name (through the SDK's `extra_body`).
+  - `embed_encoding_format=None`: Voyage's `encoding_format` accepts only null or base64, so `"float"` is not sent, and the SDK is left to use base64 and decode it.
+  - `embed_input_type=True`.
+- `embed(role, texts, *, input_type=None)`: `"query"` / `"document"`, telling the model whether this batch of texts is queries or documents. Only types with `embed_input_type` accept it;
+  passing it to other types raises `ConfigError` and it is not dropped silently. When a batch is split in half, every sub-batch carries the same `input_type`. Usage reads `prompt_tokens`, and if that is absent reads
+  `total_tokens` (Voyage).
+- `rerank(role, query, documents, *, top_k=None) -> RerankReply(scores, provenance, usage)`:
+  - A new role kind `RolePolicy(kind="rerank")`, not routable, like embed: the reranker decides what the host keeps, which must be recorded and cannot be swapped by a router.
+  - Only on types whose `serves` contains rerank (currently only voyage); a rerank role that sets chat or embed fields is rejected at `build()`.
+  - The request is `POST /rerank`, `{query, documents, model, return_documents: false[, top_k]}`, through the SDK's generic `post`, so retries, timeouts and authentication are the same as for other calls.
+  - The reply is sorted by relevance; lite-model sorts it back into input order by `index`, `scores[i]` is the score of the i-th document, and documents outside `top_k` are `None`.
+    An index out of range, a duplicate, a score that is not a finite number, more entries than `top_k`, or fewer than `min(top_k, number of documents)` are all `BadStructuredReply`.
+  - One request, no batch splitting, no hook calls. An empty document list raises `ValueError` and sends no request.
+  - `RerankModel` / `AsyncRerankModel` protocols; `Bounded` passes through; `FakeModel.with_scores({...})` and `rerank_calls`.
+- The request and reply formats are taken from Voyage's API reference (docs.voyageai.com, 2025-12-10), and the contract tests were written by hand against it; it has not yet been checked against the real API,
+  and `-m voyage` (needs `VOYAGE_API_KEY`, billed per token, two very small calls) is the step that checks it.
 
-### 3.4 Cohere 与 Gemini 的 embedding（0.8.0）
+### 3.4 Cohere and Gemini embedding (0.8.0)
 
-两家的 embedding API 都不是 OpenAI 的格式（路径、字段、回复结构、Gemini 的鉴权头都不同），所以各有一个只实现 embed 的协议模块
-（`backends/cohere_embed.py`、`backends/gemini_embed.py`），底下是一个小的 JSON-over-HTTP 客户端 `backends/rest.py`。
-它在客户端依赖 SDK 的地方和 SDK 行为一致：408 / 409 / 429 / 5xx 和网络错误在同一目标上重试 `max_retries` 次（尊重 `retry-after-ms` /
-`retry-after`，否则 0.5 秒起倍增到 8 秒）；HTTP 错误带 `status_code` 抛出（400 / 413 对半拆读它），信息只有状态码；只关闭自己建的客户端。
+The embedding APIs of both vendors are not in OpenAI's format (the paths, fields, reply structure and Gemini's authentication header all differ), so each has a protocol module that implements only embed
+(`backends/cohere_embed.py`, `backends/gemini_embed.py`), on top of a small JSON-over-HTTP client `backends/rest.py`.
+Where the client would depend on an SDK, it behaves like the SDK: 408 / 409 / 429 / 5xx and network errors are retried `max_retries` times on the same target (honoring `retry-after-ms` /
+`retry-after`, otherwise doubling from 0.5 seconds up to 8 seconds); an HTTP error is raised with `status_code` (the 400 / 413 halving reads it), and the message has only the status code; only the client it built itself is closed.
 
-- `cohere`：`https://api.cohere.com/v2`，`CO_API_KEY`（Bearer）。`POST /embed`，`{model, texts, input_type, embedding_types: ["float"],
-  output_dimension?}`；`input_type` 映射成 `search_query` / `search_document`。回复 `embeddings.float` 按输入顺序，`meta.billed_units.input_tokens` 是 usage。
-- `gemini`：`https://generativelanguage.googleapis.com/v1beta`，`GEMINI_API_KEY`，放在 `x-goog-api-key` 头里（不是 Bearer）。
-  `POST /models/{model}:batchEmbedContents`，每条文本一个 Content；`input_type` 映射成 `taskType`（`RETRIEVAL_QUERY` / `RETRIEVAL_DOCUMENT`），
-  不传就不发（gemini-embedding-2 这类用文本前缀的模型，由宿主决定不传）；维度是 `outputDimensionality`。回复 `embeddings[].values`，没有 usage。
-- 两家的回复都不说是哪个模型回答的：`Provenance.answered` 为 None，不猜（规则 4）。两个类型都只服务 embed（`serves`），chat role 配上去 `build()` 时拒绝。
-- 请求和回复的格式取自 lite-rag 按 API 参考记录的格式（2026-11-08），契约测试按它写；`-m cohere` / `-m gemini` 要 key，按 token 收费，等有 key 再跑。
-- 不迁进来的：进程内的 embedder（fastembed 的 ONNX、sentence-transformers 的 torch）。lite-model 是 HTTP 调用层；把它们放进来会让每个宿主都背上
-  这些重依赖，而它们没有 provenance、重试、usage 可言。它们留在宿主里（lite-rag）。
+- `cohere`: `https://api.cohere.com/v2`, `CO_API_KEY` (Bearer). `POST /embed`, `{model, texts, input_type, embedding_types: ["float"],
+  output_dimension?}`; `input_type` is mapped to `search_query` / `search_document`. The reply `embeddings.float` is in input order, and `meta.billed_units.input_tokens` is the usage.
+- `gemini`: `https://generativelanguage.googleapis.com/v1beta`, `GEMINI_API_KEY`, put in the `x-goog-api-key` header (not Bearer).
+  `POST /models/{model}:batchEmbedContents`, one Content per text; `input_type` is mapped to `taskType` (`RETRIEVAL_QUERY` / `RETRIEVAL_DOCUMENT`),
+  and it is not sent when not passed (for models like gemini-embedding-2 that use text prefixes, the host decides not to pass it); the dimension is `outputDimensionality`. The reply `embeddings[].values` has no usage.
+- Neither vendor's reply says which model answered: `Provenance.answered` is None, and it is not guessed (rule 4). Both types serve only embed (`serves`), and a chat role configured on them is rejected at `build()`.
+- The request and reply formats are taken from the formats lite-rag recorded from the API reference (2026-11-08), and the contract tests were written against them; `-m cohere` / `-m gemini` need a key and are billed per token, to be run once a key is available.
+- Not migrated in: in-process embedders (fastembed's ONNX, sentence-transformers' torch). lite-model is an HTTP call layer; bringing them in would make every host carry
+  these heavy dependencies, and they have no provenance, retries or usage to speak of. They stay in the host (lite-rag).
 
-## 4. 配置
+## 4. Configuration
 
-lite-model 提供 pydantic 配置模型，宿主模块把它嵌进自己的设置，环境变量用宿主的前缀
-（`LITERAG_LLM__...`、`LITEMEM_LLM__...`）。lite-model 自己的 `LITEMODEL_` 前缀只给 CLI 和测试用。
+lite-model provides pydantic config models, which the host module embeds in its own settings, with environment variables using the host's prefix
+(`LITERAG_LLM__...`, `LITEMEM_LLM__...`). lite-model's own `LITEMODEL_` prefix is only for the CLI and tests.
 
 ```yaml
 # defaults, then per-role overrides; a field left out keeps the default
@@ -375,138 +377,138 @@ forbid_channels: []         # tests / CI set [subscription, api]
 prices: {}                  # S4: "backend:model" -> {input_per_mtok, output_per_mtok}
 ```
 
-**命名 backend**（S1 定，主人 2026-11-18）：`backends` 下每一项有名字和 `type`（`ollama`、`openai`、
-`anthropic`、`gateway`、`litellm`），`type` 决定协议和 §5 的参数表；`base_url`、`api_key_env`、`channel`、
-`router_aliases` 不写就取 `type` 的默认。role 用名字引用 backend，于是一个宿主可以同时用两个
-OpenAI-compatible 厂商（DeepSeek 和 DashScope 都是 `type: openai`），endpoint 和 key 只写在一处。五个内置名字一直存在。
+**Named backends** (decided in S1, by the owner on 2026-11-18): each entry under `backends` has a name and a `type` (`ollama`, `openai`,
+`anthropic`, `gateway`, `litellm`). The `type` determines the protocol and the parameter table of §5; `base_url`, `api_key_env`, `channel` and
+`router_aliases` take the `type`'s defaults when not written. A role refers to a backend by name, so one host can use two
+OpenAI-compatible vendors at the same time (DeepSeek and DashScope are both `type: openai`), and the endpoint and key are written in only one place. The five built-in names are always there.
 
-`keyless: true`（0.1.1）：这个 endpoint 不要 key（例如把 Ollama 的 `/v1` 当 `type: openai` 用，什么 Ollama 专有的参数
-都不加），SDK 拿到占位 key；和 `api_key_env` 同时写会被拒绝。
+`keyless: true` (0.1.1): this endpoint needs no key (for example Ollama's `/v1` used as `type: openai`, with no Ollama-specific parameters
+added); the SDK gets a placeholder key; writing it together with `api_key_env` is rejected.
 
-**宿主自己的默认值**（0.2.0，lite-mem S12 发现）：宿主在 `ModelsConfig` 的子类上设 `host_backends`（盖在内置 backend
-上面）和 `host_roles`（每个 role 的调用参数）。配置给的值叠在上面：同名的 backend 或 role 逐字段改它（例如只改内置
-`ollama` 的 `base_url`；role 里写 null 去掉宿主给这个 role 的值，这个 role 回到顶层的值），只有写了**另一个** `type` 的 backend 才从头开始——同样的 `type` 照写一遍
-（`..._OPENAI__TYPE=openai`）不会丢掉宿主的 `base_url`、`keyless`。于是配置**加**一个 backend 或改一个 role，不会把它
-没提到的默认值弄丢。key 从哪里来（`api_key_env` 或 `keyless`）算一个选择（0.2.1）：配置写了其中一个，就替换宿主的那一个——
-在宿主的 keyless backend 上只写 `api_key_env` 就是改成要 key，不用再写 `keyless: false`。0.1.x 里配置了任何 backend 都会让同名的内置值顶掉宿主的，lite-mem 的默认 role 因此会被送到
-api.openai.com。
+**The host's own defaults** (0.2.0, found in lite-mem S12): the host sets `host_backends` (laid over the built-in backends)
+and `host_roles` (the call parameters of each role) on its subclass of `ModelsConfig`. Values given by the config are laid on top of them: a backend or role of the same name is changed field by field (for example changing only the built-in
+`ollama`'s `base_url`; writing null in a role removes the value the host gave that role, and that role goes back to the top-level value). Only a backend written with a **different** `type` starts from scratch; writing the same `type` again
+(`..._OPENAI__TYPE=openai`) does not lose the host's `base_url` or `keyless`. So the config **adding** a backend or changing a role does not lose the defaults it
+did not mention. Where the key comes from (`api_key_env` or `keyless`) counts as one choice (0.2.1): if the config writes one of them, it replaces the host's one;
+writing only `api_key_env` on a host's keyless backend means changing it to need a key, with no need to also write `keyless: false`. In 0.1.x, configuring any backend made the built-in value of the same name override the host's, so lite-mem's default role
+was sent to api.openai.com.
 
-每个 role 解析成一个 `Target`（frozen）：backend（名字）、type、model、base_url、api_key_env、channel、
-routed、reasoning_effort、max_output_tokens、temperature、timeout_s、connect_timeout_s、max_retries。endpoint
-和 key 属于 backend，所以 role 换了 backend 就换了 endpoint 和 key，不会沿用默认 backend 的。
-`max_output_tokens`、`reasoning_effort`、`temperature` 不配就不发（`temperature` 取 profile 默认，Ollama 0），
-这样宿主迁移时请求体不变（lite-mem 不发 `max_tokens`，lite-rag 发 1024）。
-字符串字段（backend、model、base_url、api_key_env、router alias）不接受空字符串：空值不会被悄悄读成
-"用默认值"。`temperature` 限 0–2。
+Each role is resolved into a `Target` (frozen): backend (name), type, model, base_url, api_key_env, channel,
+routed, reasoning_effort, max_output_tokens, temperature, timeout_s, connect_timeout_s, max_retries. The endpoint
+and key belong to the backend, so when a role changes backend it changes endpoint and key, and does not keep the default backend's.
+`max_output_tokens`, `reasoning_effort` and `temperature` are not sent when not configured (`temperature` takes the profile default, 0 for Ollama),
+so the request body does not change when a host migrates (lite-mem does not send `max_tokens`, lite-rag sends 1024).
+String fields (backend, model, base_url, api_key_env, router alias) do not accept an empty string: an empty value is not silently read as
+"use the default". `temperature` is limited to 0–2.
 
-**启动时校验（`build()` 里，失败抛 `ConfigError`）**，依据 `KB/global/llm-app-architecture.md` §1.5：
-- 配置里出现宿主没声明的 role；宿主声明的 role 解析不出 target（例如引用了不存在的 backend 名字）。
-- 缺 key（key 环境变量没设或为空）。
-- `anthropic` 后端但没装 extra `anthropic`。
-- 路由别名用在不可路由的 role 上（§7.3）。
-- target 的 channel 在 `forbid_channels` 里。
-- 后端不支持的参数（例如 `anthropic` 配了 `temperature`，见 §5 的参数表）。
-- 所有问题一次列出（一个 `ConfigError`，每条一行），不是遇到第一条就停。错误里只有 role、backend、model 和
-  key 的变量名，没有 key 的值。
-- `anthropic` 没配 `max_output_tokens`（Messages API 必须带 `max_tokens`；不猜默认值，宿主自己写，lite-mem 2048、
-  lite-rag 1024，迁移时请求体不变；主人 2026-11-18）。
-- `anthropic` 的 `base_url` 以 `/v1` 结尾：Anthropic SDK 自己拼 `/v1/messages`（OpenAI SDK 要 `/v1` 在
-  `base_url` 里），照抄 OpenAI 风格的 URL 会请求 `/v1/v1/messages`，到第一次调用才失败。
-- 路由别名用在没有 `answered_header` 的 backend type 上（gateway：拿不到实际模型，§6.2）。
+**Validation at startup (in `build()`; a failure raises `ConfigError`)**, based on `KB/global/llm-app-architecture.md` §1.5:
+- The config contains a role the host did not declare; a role the host declared cannot be resolved to a target (for example it refers to a backend name that does not exist).
+- A missing key (the key environment variable is not set or is empty).
+- An `anthropic` backend without the `anthropic` extra installed.
+- A routing alias used on a role that is not routable (§7.3).
+- The target's channel is in `forbid_channels`.
+- A parameter the backend does not support (for example `anthropic` configured with `temperature`, see the parameter table in §5).
+- All problems are listed at once (one `ConfigError`, one line each), and it does not stop at the first one. The error contains only the role, backend, model and
+  the key's variable name, and never the key's value.
+- `anthropic` without `max_output_tokens` configured (the Messages API requires `max_tokens`; no default is guessed, the host writes its own, lite-mem 2048,
+  lite-rag 1024, so the request body does not change when migrating; the owner, 2026-11-18).
+- An `anthropic` `base_url` ending in `/v1`: the Anthropic SDK builds `/v1/messages` itself (the OpenAI SDK wants `/v1` in
+  `base_url`), and copying an OpenAI-style URL would request `/v1/v1/messages`, failing only at the first call.
+- A routing alias used on a backend type with no `answered_header` (gateway: the actual model cannot be obtained, §6.2).
 
-`litemodel dump-config`：读 `LITEMODEL_*` 环境变量和 `.env`，打印合并后的配置和每个已配置 role 的 target
-（key 只显示变量名），不发任何请求，也**不跑**启动校验（缺 key 时照样能看配置；KB §10.3）。
+`litemodel dump-config`: reads the `LITEMODEL_*` environment variables and `.env`, prints the merged config and the target of every configured role
+(the key shows only the variable name), sends no request, and also does **not run** the startup validation (the config can still be viewed when a key is missing; KB §10.3).
 
-## 5. 后端
+## 5. Backends
 
-| backend | 协议 | channel 默认 | 结构化输出 | 来源（answered） |
+| backend | Protocol | Default channel | Structured output | Provenance (answered) |
 | --- | --- | --- | --- | --- |
-| `ollama` | OpenAI SDK → Ollama `/v1` | local | strict `json_schema` | 响应 `model` |
-| `openai` | OpenAI SDK，任意 OpenAI-compatible 端点 | api | strict `json_schema` | 响应 `model` |
-| `anthropic` | Anthropic SDK Messages（system 消息用 `\n\n` 拼进 `system` 字段；`max_tokens` / `model_context_window_exceeded` → `Truncated`；`end_turn` / `stop_sequence` / `tool_use` 是完整回复；其他 stop_reason（`refusal`、`pause_turn`……）→ `EmptyReply`；结构化回复是 text block 拼接后的 JSON） | api | `output_config.format = {type: json_schema, schema: <strict schema>}`，不发 tools / `tool_choice`（0.5.0；之前是一个强制工具） | 响应 `model` |
-| `gateway` | OpenAI SDK → llm-gateway | subscription（可按 profile 覆盖） | strict `json_schema`；gateway 对 DeepSeek / Qwen 降级为 prompted，响应头 `X-LLMGW-Structured-Output: prompted` 记进来源 | 见 §6.2 |
-| `litellm` | OpenAI SDK → LiteLLM Proxy | api | strict `json_schema`（S0 经 `ollama_chat/` 核实；其他上游接入时再核实） | 见 §6.3 |
+| `ollama` | OpenAI SDK → Ollama `/v1` | local | strict `json_schema` | response `model` |
+| `openai` | OpenAI SDK, any OpenAI-compatible endpoint | api | strict `json_schema` | response `model` |
+| `anthropic` | Anthropic SDK Messages (system messages are joined into the `system` field with `\n\n`; `max_tokens` / `model_context_window_exceeded` → `Truncated`; `end_turn` / `stop_sequence` / `tool_use` are complete replies; other stop_reasons (`refusal`, `pause_turn`, ...) → `EmptyReply`; a structured reply is the JSON of the text blocks joined together) | api | `output_config.format = {type: json_schema, schema: <strict schema>}`, no tools / `tool_choice` sent (0.5.0; before that it was a forced tool) | response `model` |
+| `gateway` | OpenAI SDK → llm-gateway | subscription (can be overridden per profile) | strict `json_schema`; for DeepSeek / Qwen the gateway degrades to prompted, and the response header `X-LLMGW-Structured-Output: prompted` is recorded in the provenance | see §6.2 |
+| `litellm` | OpenAI SDK → LiteLLM Proxy | api | strict `json_schema` (verified in S0 through `ollama_chat/`; to be verified when other upstreams are connected) | see §6.3 |
 
-**参数差异是数据**（沿用 lite-rag `PROVIDERS` 的做法），一张 `BackendProfile` 表：
+**Parameter differences are data** (following lite-rag's `PROVIDERS` approach), one `BackendProfile` table:
 
-| 字段 | 说明 | 已知值（S0 2026-11-18 核实） |
+| Field | Description | Known values (verified in S0, 2026-11-18) |
 | --- | --- | --- |
-| `max_tokens_param` | `max_tokens` 或 `max_completion_tokens` | ollama：`max_tokens`（Ollama 不认 `max_completion_tokens`，lite-rag 2026-11-08）；openai：`max_completion_tokens`；litellm：`max_completion_tokens`（1.108.9 两个都认，经 `ollama_chat/` 实测都生效；用 OpenAI 的新名字，由 LiteLLM 按上游转换）；gateway：`max_completion_tokens`（两个都映射到 `max_tokens`，新名字优先，llm-gateway `translate.py:58-59`） |
-| `default_temperature` | 未配置时发送的值；None = 不发 | ollama：0.0；openai：None（推理模型拒绝非默认值）；litellm：None（上游可能是推理模型；`temperature: 0` 经 `ollama_chat/` 被接受） |
-| `supports_temperature` | | anthropic 2.6.0：否（lite-rag 2026-11-08 核实） |
-| `reasoning_effort` | 怎么发：顶层参数、`extra_body`、不支持 | litellm：顶层参数；`"none"` 经 `ollama_chat/` 关掉 qwen3 的思考（实测），`"low"` 对 qwen3 **不减少**思考，未设 = 开着思考。gateway：**现在被丢弃**（`schemas.py` 没有该字段，进 `X-LLMGW-Ignored-Params`），llm-gateway 修好前配置了就报错而不是悄悄失效 |
-| `key_env` | 默认 key 变量 | |
-| `answered_header` | 实际回答的模型在哪个响应头（响应体 `model` 不是它时） | litellm：`x-litellm-model-name`；其他：无（读响应体） |
-| `via_headers` | 记进 `Provenance.via` 的来源头（允许列表） | litellm：`x-litellm-model-id`、`-model-group`；gateway：`X-LLMGW-Backend`、`X-LLMGW-Structured-Output` |
-| `ignored_params_header` | 列出被丢弃字段的响应头 | gateway：`X-LLMGW-Ignored-Params` |
-| `request_headers` | 每个请求带的头 | litellm：`x-litellm-num-retries: 0` |
-| `role_tag` | 把 role 作为 `metadata.tags` 发出（§7.3） | litellm：是 |
-| `supports_tools` | 端点接不接受 `tools`（`turn()`，§3.1）；否则 `ConfigError` | 五种类型都是（0.4.0）。实测：ollama `qwen3:1.7b`（2026-11-21，`-m ollama`）；llm-gateway 按它的 `docs/DESIGN.md` §9 支持，未经 lite-model 实测；litellm、openai、anthropic 只有契约测试 |
+| `max_tokens_param` | `max_tokens` or `max_completion_tokens` | ollama: `max_tokens` (Ollama does not recognize `max_completion_tokens`, lite-rag 2026-11-08); openai: `max_completion_tokens`; litellm: `max_completion_tokens` (1.108.9 accepts both, and both took effect when measured through `ollama_chat/`; it uses OpenAI's new name, and LiteLLM converts it per upstream); gateway: `max_completion_tokens` (both map to `max_tokens`, the new name takes precedence, llm-gateway `translate.py:58-59`) |
+| `default_temperature` | The value sent when not configured; None = not sent | ollama: 0.0; openai: None (reasoning models reject a non-default value); litellm: None (the upstream may be a reasoning model; `temperature: 0` is accepted through `ollama_chat/`) |
+| `supports_temperature` | | anthropic 2.6.0: no (verified by lite-rag 2026-11-08) |
+| `reasoning_effort` | How it is sent: top-level parameter, `extra_body`, or unsupported | litellm: top-level parameter; `"none"` turns off qwen3's thinking through `ollama_chat/` (measured), `"low"` does **not reduce** thinking for qwen3, and unset = thinking on. gateway: **currently dropped** (`schemas.py` has no such field, and it goes into `X-LLMGW-Ignored-Params`); until llm-gateway is fixed, configuring it raises an error rather than silently having no effect |
+| `key_env` | The default key variable | |
+| `answered_header` | Which response header holds the model that actually answered (when the response body `model` is not it) | litellm: `x-litellm-model-name`; others: none (read the response body) |
+| `via_headers` | The provenance headers recorded into `Provenance.via` (allow list) | litellm: `x-litellm-model-id`, `-model-group`; gateway: `X-LLMGW-Backend`, `X-LLMGW-Structured-Output` |
+| `ignored_params_header` | The response header that lists dropped fields | gateway: `X-LLMGW-Ignored-Params` |
+| `request_headers` | Headers carried on every request | litellm: `x-litellm-num-retries: 0` |
+| `role_tag` | Sends the role as `metadata.tags` (§7.3) | litellm: yes |
+| `supports_tools` | Whether the endpoint accepts `tools` (`turn()`, §3.1); otherwise `ConfigError` | Yes for all five types (0.4.0). Measured: ollama `qwen3:1.7b` (2026-11-21, `-m ollama`); llm-gateway supports it according to its `docs/DESIGN.md` §9, not measured through lite-model; litellm, openai and anthropic have only contract tests |
 
-思考 token 计入输出上限：经 LiteLLM 的 qwen3 开着思考时，`max_tokens` 小会得到空 `content` 和
-`finish_reason: "length"`（应报 `Truncated`，不是 `EmptyReply`）。
+Thinking tokens count toward the output limit: with qwen3 through LiteLLM and thinking on, a small `max_tokens` gives an empty `content` and
+`finish_reason: "length"` (which should raise `Truncated`, not `EmptyReply`).
 
-gateway 后端在响应头里看到 `X-LLMGW-Ignored-Params` 列出 lite-model **实际发出**的字段（`max_*_tokens`、
-`temperature`、`reasoning_effort`、`response_format`）时，抛 `IgnoredParameter`，不把被丢掉的设置当成生效；
-列出的其他字段（不是 lite-model 发的）不算错。错误里只有 lite-model 自己的字段名，不回显 gateway 的列表。
+When the gateway backend sees, in the response header `X-LLMGW-Ignored-Params`, a field that lite-model **actually sent** (`max_*_tokens`,
+`temperature`, `reasoning_effort`, `response_format`), it raises `IgnoredParameter` and does not treat the dropped setting as in effect;
+other fields in the list (not sent by lite-model) are not an error. The error contains only lite-model's own field names and does not echo the gateway's list.
 
-## 6. 来源（provenance）
+## 6. Provenance
 
-### 6.1 规则
+### 6.1 Rules
 
-- 每次回答都带 `Provenance`。`answered` 取**响应里实际回答的模型**，不取配置；端点没说时为 `None`，
-  `tag` 里用 `requested?` 表示"未确认"，不冒充。
-- 宿主存 `tag`（`backend:answered`），需要时另存 `requested` 和 `channel`。lite-mem 现在存的 `provider:model`
-  格式在迁移时保持兼容：`tag` 的前缀是 **backend 的名字**，所以宿主把 backend 命名成它现在存的 provider
-  （lite-mem 对本机 Ollama 存 `openai:qwen3:8b`：`backends: {openai: {type: ollama}}`），存下来的格式不变；
-  也可以在 adapter 里映射。
-- 一次操作固定一个 target（KB §1.4）：调用期间配置变了也不中途换。
+- Every answer carries `Provenance`. `answered` takes **the model that actually answered in the response**, not the config; when the endpoint does not say it is `None`,
+  and `tag` uses `requested?` to mean "unconfirmed", and does not pass it off as confirmed.
+- The host stores `tag` (`backend:answered`), and stores `requested` and `channel` separately when needed. The `provider:model` format that lite-mem stores today
+  stays compatible when migrating: the prefix of `tag` is the **backend's name**, so the host names the backend after the provider it stores now
+  (lite-mem stores `openai:qwen3:8b` for the local Ollama: `backends: {openai: {type: ollama}}`), and the stored format does not change;
+  it can also be mapped in the adapter.
+- One operation fixes one target (KB §1.4): if the config changes during the call, it does not switch midway.
 
-### 6.2 经过 llm-gateway
+### 6.2 Through llm-gateway
 
-gateway 的响应 `model` 字段写的是 **profile 名**（`translate.py:194,256`），不转发上游的响应头。所以：
-- 固定 profile（一个 profile 对应一个模型）：`answered` = profile 名（响应体 `model`），`via` 记
-  `x-llmgw-backend`（如 `claude-code`）和有时的 `x-llmgw-structured-output: prompted`，`routed=False`。
-- 路由别名配在 gateway 上（`backends.<gateway>.router_aliases`）：在 llm-gateway 透传上游模型之前（§15），
-  `build()` **拒绝**（gateway profile 没有 `answered_header`，拿不到实际模型就不允许路由）。
+The gateway's response `model` field holds the **profile name** (`translate.py:194,256`), and it does not forward the upstream's response headers. So:
+- A fixed profile (one profile per model): `answered` = the profile name (the response body `model`), `via` records
+  `x-llmgw-backend` (such as `claude-code`) and sometimes `x-llmgw-structured-output: prompted`, `routed=False`.
+- A routing alias configured on the gateway (`backends.<gateway>.router_aliases`): until llm-gateway passes through the upstream model (§15),
+  `build()` **rejects** it (the gateway profile has no `answered_header`, and routing is not allowed when the actual model cannot be obtained).
 
-### 6.3 经过 LiteLLM
+### 6.3 Through LiteLLM
 
-S0 实测（1.108.9，2026-11-18，`KB/global/litellm/README.md` §2–§3）：
-- **普通别名**（`workhorse`）的响应体 `model` 永远是别名本身；实际模型只在响应头
-  `x-litellm-model-name`（deployment 的 LiteLLM 模型串，如 `ollama_chat/qwen3:8b`）。
-- **路由别名**打开 `return_raw_model_name: true` 后，响应体 `model` 是被选中 deployment 的 LiteLLM 模型串
-  （`ollama_chat/qwen3:1.7b`）；不打开时被改回别名，但 `x-litellm-model-name` 头仍是实际模型。
-- 每个成功响应都有 `x-litellm-model-name`、`x-litellm-model-id`（选中的 deployment）、`x-litellm-model-group`
-  （调用的别名）；错误响应没有。
+Measured in S0 (1.108.9, 2026-11-18, `KB/global/litellm/README.md` §2–§3):
+- For a **plain alias** (`workhorse`), the response body `model` is always the alias itself; the actual model is only in the response header
+  `x-litellm-model-name` (the deployment's LiteLLM model string, such as `ollama_chat/qwen3:8b`).
+- For a **routing alias** with `return_raw_model_name: true` turned on, the response body `model` is the LiteLLM model string of the chosen deployment
+  (`ollama_chat/qwen3:1.7b`); when it is not turned on it is changed back to the alias, but the `x-litellm-model-name` header is still the actual model.
+- Every successful response has `x-litellm-model-name`, `x-litellm-model-id` (the chosen deployment) and `x-litellm-model-group`
+  (the alias called); error responses do not.
 
-规则（S3 实现，`openai_compat._answered`）：
-- `answered` = 响应头 `x-litellm-model-name`（profile 的 `answered_header`）。路由别名的响应体 `model` 必须与
-  头一致（`return_raw_model_name` 打开时一致），不一致抛 `ProvenanceUnknown`。头缺失时，普通别名和路由别名都
-  抛 `ProvenanceUnknown`（拿不到实际模型就不冒充）。头的值只是请求的别名本身时同样抛（区分不了别名和模型；
-  因此 proxy 配置里别名不能与它的模型串同名，`tests/unit/test_deploy_litellm.py` 守着）。
-- `via` 记 `x-litellm-model-id` 和 `x-litellm-model-group`（只记允许列表里的头，名字小写）。
-- `-m litellm` 实测（2026-11-18）：`workhorse` → `ollama_chat/qwen3:8b`；`smart-router` 对 "hi" →
-  `ollama_chat/qwen3:1.7b`，对一个长的多步编程问题 → `ollama_chat/qwen3:8b`；`routed=True`。
-- proxy 配置仍要求路由别名打开 `return_raw_model_name`（`tests/unit/test_deploy_litellm.py` 守着），让日志和
-  响应体也指向实际模型。
-- 成本：`x-litellm-response-cost` 在 Ollama 模型的成功响应里**不存在**（没有价格），错误响应里是 `0`。有这个头
-  且是成功响应时才写进 `Usage.cost_usd`；接入有价格的上游时再核实。
+Rules (implemented in S3, `openai_compat._answered`):
+- `answered` = the response header `x-litellm-model-name` (the profile's `answered_header`). For a routing alias the response body `model` must agree with the
+  header (it does when `return_raw_model_name` is on); if not, `ProvenanceUnknown` is raised. When the header is missing, both plain aliases and routing aliases
+  raise `ProvenanceUnknown` (when the actual model cannot be obtained, it is not passed off as known). It also raises when the header value is just the requested alias itself (an alias cannot be told from a model;
+  so in the proxy config an alias must not have the same name as its model string, which `tests/unit/test_deploy_litellm.py` guards).
+- `via` records `x-litellm-model-id` and `x-litellm-model-group` (only headers in the allow list, with lower-case names).
+- `-m litellm` measured (2026-11-18): `workhorse` → `ollama_chat/qwen3:8b`; `smart-router` for "hi" →
+  `ollama_chat/qwen3:1.7b`, and for a long multi-step programming question → `ollama_chat/qwen3:8b`; `routed=True`.
+- The proxy config still requires routing aliases to turn on `return_raw_model_name` (guarded by `tests/unit/test_deploy_litellm.py`), so that the logs and
+  the response body also point to the actual model.
+- Cost: `x-litellm-response-cost` is **absent** from the successful responses of Ollama models (they have no price), and is `0` in error responses. It is written into `Usage.cost_usd` only when this header is present
+  and the response is successful; to be verified when an upstream with prices is connected.
 
-## 7. 路由
+## 7. Routing
 
-### 7.1 为什么只用 Proxy
+### 7.1 Why only the Proxy
 
-- litellm 包 2026 年两次被投毒：3 月 1.82.7 / 1.82.8；10 月 21 日 1.107.0（PyPI 全部 7 个 wheel，以及
-  Docker `latest`、`main-stable` 等 tag），载荷在 Python 启动时运行、窃取凭证。装进进程，宿主能碰到的数据库
-  连接和所有 key 都暴露；放在容器里，它只拿到挂进去的那几个 key。
-- llm-steward 直接 import lite-rag，库依赖会传过去；steward 2026-11-08 已因依赖过重去掉过 LiteLLM。
-- 路由配置（model_list、分档、分类器）放在 proxy，所有模块共用一份。
+- The litellm package was poisoned twice in 2026: 1.82.7 / 1.82.8 in March; 1.107.0 on 21 October (all 7 wheels on PyPI, and the
+  Docker tags `latest`, `main-stable` and others). The payload ran at Python startup and stole credentials. Installed in the process, it exposes the database
+  connections and all keys the host can reach; in a container, it gets only the few keys mounted into it.
+- llm-steward imports lite-rag directly, so library dependencies would be passed on; steward already removed LiteLLM on 2026-11-08 because the dependencies were too heavy.
+- The routing config (model_list, tiers, classifier) lives in the proxy, one copy shared by all modules.
 
-### 7.2 Proxy 配置（`deploy/litellm/`，S0 起）
+### 7.2 Proxy config (`deploy/litellm/`, since S0)
 
-`deploy/litellm/config.yaml` 是实际配置；S0 的分档全是本机 Ollama（`small` = `qwen3:1.7b`，`workhorse` =
-`qwen3:8b`），测试和核实不花钱。接入付费上游时按下面的形状加 deployment：
+`deploy/litellm/config.yaml` is the actual config; the S0 tiers are all local Ollama (`small` = `qwen3:1.7b`, `workhorse` =
+`qwen3:8b`), so tests and verification cost nothing. When a paid upstream is connected, add a deployment in the shape below:
 
 ```yaml
 model_list:
@@ -531,41 +533,41 @@ general_settings:
 # no `fallbacks`: a failure raises (KB llm-app-architecture §3.2)
 ```
 
-`context_compaction`（1.108.9 默认开）：请求接近选中 deployment 的输入上限时，路由器另调一次模型把历史压成
-摘要再发出去。这既是一次看不见的模型调用，又改写了宿主构造的请求，所以关掉。它还要读 deployment 的
-`max_input_tokens`，Ollama 模型不在 LiteLLM 价格表里，开着时**每次**路由调用都 500（S0 实测）。
+`context_compaction` (on by default in 1.108.9): when a request approaches the input limit of the chosen deployment, the router makes one more model call to compact the history into a
+summary before sending it. This is both an invisible model call and a rewrite of the request the host built, so it is turned off. It also has to read the deployment's
+`max_input_tokens`; Ollama models are not in LiteLLM's price table, so with it on **every** routed call returns 500 (measured in S0).
 
-运行：版本、digest、公钥、升级步骤在 `deploy/litellm/README.md`。设计上的要求：
-- 镜像按 digest 锁定；**永远不用 1.107.0、1.82.7、1.82.8**，不用浮动 tag。LiteLLM 用 cosign **密钥**签名
-  （不是 keyless），公钥锁定在仓库里。
-- 验签在 compose 里：`verify` 服务先跑 `cosign verify`，`litellm` 依赖它成功退出，验签失败就不启动；本机不装
-  cosign，CI 跑同一个 `verify`。
-- 不接数据库（没有数据库时 `max_budget` 不生效）；只绑 127.0.0.1:**4400**（4000 已登记给 tenderted）；只挂
-  需要的 key。
-- **不开 Proxy 的 cache**（`litellm_settings.cache`，2026-11-19）：缓存是 lite-cache 的事，它作为 hook 接在
-  lite-model 上（§10）。Proxy 命中时 lite-model 现在认不出来：回复不会标 `cached`，省下的 token 会被记成这次花的
-  （§9）。0.3.0：读到非空的 `x-litellm-cache-key` 时标 `cached=True`（profile 的 `cached_header`），这样即使
-  有人开了，用量也不会算错。依据 1.108.9 源码：`cache_key` 只在命中分支写进 hidden params（`caching/caching_handler.py`），
-  空值的头不发（`proxy/common_request_processing.py`）。2026-11-20 Proxy 实测（owner 同意，临时开 in-memory cache）：
-  未命中没有这个头，命中有，且 `x-litellm-model-name` 仍是当初回答的模型；命中回复的 `usage` 是原来的 token 数
-  （KB `global/litellm` §3.1）。
+Running it: the version, digest, public key and upgrade steps are in `deploy/litellm/README.md`. The design requirements:
+- The image is locked by digest; **never use 1.107.0, 1.82.7 or 1.82.8**, and never a floating tag. LiteLLM signs with a cosign **key**
+  (not keyless), and the public key is pinned in the repo.
+- Signature verification is in compose: the `verify` service runs `cosign verify` first, `litellm` depends on it exiting successfully, and if verification fails it does not start; cosign is not installed on this
+  machine, and CI runs the same `verify`.
+- No database is connected (`max_budget` has no effect without a database); it binds only 127.0.0.1:**4400** (4000 is registered to tenderted); only the
+  needed keys are mounted.
+- **The Proxy's cache is not turned on** (`litellm_settings.cache`, 2026-11-19): caching is lite-cache's job, and it plugs into
+  lite-model as a hook (§10). lite-model currently cannot recognize a Proxy hit: the reply is not marked `cached`, and the tokens saved would be recorded as spent this time
+  (§9). 0.3.0: when a non-empty `x-litellm-cache-key` is read, `cached=True` is set (the profile's `cached_header`), so even
+  if someone turns it on, the usage is not counted wrongly. Based on the 1.108.9 source: `cache_key` is written into the hidden params only on the hit branch (`caching/caching_handler.py`),
+  and an empty header is not sent (`proxy/common_request_processing.py`). Measured against the Proxy on 2026-11-20 (the owner agreed, with an in-memory cache turned on temporarily):
+  a miss has no such header, a hit has it, and `x-litellm-model-name` is still the model that originally answered; the `usage` of a hit reply is the original token count
+  (KB `global/litellm` §3.1).
 
-**订阅额度不进自动路由**：分档里不放指向 llm-gateway 订阅 profile 的 deployment。要用订阅，在 role 上
-显式配 `backend: gateway`。确实要按难度在订阅模型间路由时，另起一个别名（如 `sub-router`），只有显式选它
-才生效，并且受 `forbid_channels` 约束。
+**Subscription quota does not enter automatic routing**: the tiers contain no deployment that points at an llm-gateway subscription profile. To use a subscription, configure
+`backend: gateway` explicitly on the role. When routing between subscription models by difficulty is really needed, start a separate alias (such as `sub-router`), which
+takes effect only when explicitly chosen and is subject to `forbid_channels`.
 
-### 7.3 客户端护栏
+### 7.3 Client guards
 
-- `RolePolicy.routable`：宿主声明。lite-rag 的 `contextual`、`graph` 的模型 id 是索引身份的一部分
-  （lite-rag `config.py:155,217`），必须 `routable=False`；judge 一类测量用途也必须 `False`。
-- `backends.litellm.router_aliases` 列出哪些名字是路由别名；不可路由的 role 配了其中一个，`build()` 拒绝。
-- 每次请求带上 role：`metadata: {tags: ["role:<role>"]}`（S0：`user` 和 `metadata.tags` 都被接受；没有数据库或
-  日志 callback 时 proxy 不在任何地方记录它们，接日志时再核实能看到哪个）。用 `tags` 而不用 `user`，`user`
-  留给宿主表示终端用户。
-- 每次请求带 `x-litellm-num-retries: 0`。S0 实测：配置 `num_retries: 2` 时，对不可达的 deployment 不带头重试
-  2 次（4.8 s），带头 0 次（0.06 s）。重试只在 lite-model 一处。
+- `RolePolicy.routable`: declared by the host. For lite-rag's `contextual` and `graph`, the model id is part of the index identity
+  (lite-rag `config.py:155,217`), so they must be `routable=False`; measuring uses such as a judge must also be `False`.
+- `backends.litellm.router_aliases` lists which names are routing aliases; a role that is not routable and is configured with one of them is rejected at `build()`.
+- Every request carries the role: `metadata: {tags: ["role:<role>"]}` (S0: both `user` and `metadata.tags` are accepted; without a database or
+  log callback the proxy records them nowhere, and which one is visible will be verified when logging is connected). `tags` is used and not `user`; `user`
+  is left for the host to denote the end user.
+- Every request carries `x-litellm-num-retries: 0`. Measured in S0: with `num_retries: 2` configured, an unreachable deployment is retried
+  2 times without the header (4.8 s) and 0 times with it (0.06 s). Retries happen in one place only, lite-model.
 
-## 8. 错误与重试
+## 8. Errors and retries
 
 ```
 ModelError (base)
@@ -580,35 +582,35 @@ ModelError (base)
                           missing or only repeats the alias (§6.3)
 ```
 
-- **不做 fallback**：失败就抛，不换模型、不换后端。
-- 重试：只重试同一个 target，只用 SDK 的 `max_retries`（默认 1）。LiteLLM 的重试关掉（§7.3），避免
-  SDK × proxy × 宿主任务队列叠成几十次。
-- 错误信息只含 role、`backend:model` 和异常类型，**不含上游原文**（SDK 和代理可能回显 key、auth 头、带凭证
-  的 URL；沿用 lite-mem `_failed`），原始异常留在 `__cause__`。
+- **No fallback**: on failure it raises, and does not switch model or backend.
+- Retries: only the same target is retried, using only the SDK's `max_retries` (default 1). LiteLLM's retries are turned off (§7.3), to avoid
+  SDK × proxy × the host's task queue stacking up to dozens of attempts.
+- Error messages contain only the role, `backend:model` and the exception type, and **no upstream text** (the SDK and proxy may echo keys, auth headers and URLs with credentials;
+  following lite-mem's `_failed`); the original exception stays in `__cause__`.
 
-`turn()` 的差别（§3.1）：被截断的一轮是回复（`stop="length"`），不是 `Truncated`，除非它什么都没带；没有
-`BadStructuredReply`（参数不合法是 `ToolCall.arguments=None`）。其余错误、用量和"不含上游原文"的规则相同。
+Differences for `turn()` (§3.1): a truncated round is a reply (`stop="length"`), not `Truncated`, unless it carries nothing; there is no
+`BadStructuredReply` (invalid arguments are `ToolCall.arguments=None`). The other errors, usage and the "no upstream text" rule are the same.
 
-## 9. 用量与成本
+## 9. Usage and cost
 
-- `Usage`：input、output、reasoning（`completion_tokens_details.reasoning_tokens`，有就记；经 LiteLLM →
-  Ollama 时是 null，思考 token 已含在 `completion_tokens` 里，S0 实测）、cost_usd。
-- 失败和截断的调用也报告用量：端点回答了但答案不能用时（`Truncated`、`EmptyReply`、`BadStructuredReply`、
-  `IgnoredParameter`、`ProvenanceUnknown`），异常的 `usage` 是这次花掉的 token 和成本；`CallFailed`、
-  `ConfigError` 的 `usage` 是 `None`（没有回答，SDK 拿不到用量）。
-- 成本：优先用端点自己报的成本（profile 的 `cost_header`，litellm：`x-litellm-response-cost`，能读成非负有限
-  数才用）；否则用配置里的 `prices`（键 `"backend:model"`，model 是**实际回答**的模型，与 `Provenance.tag`
-  一致；USD / 百万 token）；都没有就是 `None`，不估算。订阅通道的成本永远是 `None`。`prices` 的键里 backend
-  不存在时，`build()` 拒绝。
-- hook 命中（`cached=True`）的回复带的是**当初那次**调用的 `usage`：这次省下的，不是这次花的。汇总花费的宿主
-  先看 `cached`。
+- `Usage`: input, output, reasoning (`completion_tokens_details.reasoning_tokens`, recorded when present; through LiteLLM →
+  Ollama it is null, and the thinking tokens are already included in `completion_tokens`, measured in S0), cost_usd.
+- Failed and truncated calls also report usage: when the endpoint answered but the answer cannot be used (`Truncated`, `EmptyReply`, `BadStructuredReply`,
+  `IgnoredParameter`, `ProvenanceUnknown`), the exception's `usage` is the tokens and cost spent on this call; for `CallFailed` and
+  `ConfigError` the `usage` is `None` (there was no answer, and the SDK cannot get usage).
+- Cost: the cost the endpoint itself reports is preferred (the profile's `cost_header`, litellm: `x-litellm-response-cost`, used only if it can be read as a non-negative finite
+  number); otherwise the `prices` in the config are used (key `"backend:model"`, where model is the model that **actually answered**, consistent with `Provenance.tag`;
+  USD per million tokens); if neither exists it is `None`, and it is not estimated. The cost of a subscription channel is always `None`. When the backend in a `prices` key
+  does not exist, `build()` rejects it.
+- A reply from a hook hit (`cached=True`) carries the `usage` of **the original** call: what was saved this time, not what was spent this time. A host that totals spend
+  checks `cached` first.
 
-## 10. 并发与 hook
+## 10. Concurrency and hooks
 
-- `Bounded(model, concurrency)` / `AsyncBounded`：沿用 lite-rag `BoundedCalls`，包一个 `Model` / `AsyncModel`，
-  所有经过它的调用（包括别的线程 / task 发起的）同时最多 `concurrency` 个；`map()` 并发跑独立调用、按输入
-  顺序返回，第一个错误抛出。
-- Hook（KB §10：注册、可撤销、可寻址）：
+- `Bounded(model, concurrency)` / `AsyncBounded`: follows lite-rag's `BoundedCalls`, wraps a `Model` / `AsyncModel`, and
+  at most `concurrency` calls going through it (including those started by other threads / tasks) run at the same time; `map()` runs independent calls concurrently, returns them in input
+  order, and raises the first error.
+- Hook (KB §10: registered, revocable, addressable):
 
   ```python
   class Hook(Protocol):
@@ -619,102 +621,102 @@ ModelError (base)
   model.hooks.register(hook) -> Registration   # Registration.remove() unregisters
   ```
 
-  `Call` 含 role、解析后的 `Target`、messages、`request`（实际发出的 SDK 参数）、`params`（去掉 model、
-  messages 和传输层的 `extra_headers`）、schema、`schema_name`、`schema_hash`（strict schema 规范化 JSON 的
-  sha256）：正好是 lite-cache L1 的缓存键需要的字段（lite-cache 设计 §3.1）。
-- 顺序：每次调用取一份 hook 快照；`before` 按注册顺序，**第一个**返回回复的 hook 结束这次调用，不发请求，
-  返回的回复 `cached=True`（放在回复上，不在 `Provenance` 上：来源保持原来那次真正回答的模型；主人 2026-11-18）。
-  `after` 只对刚从端点拿到的回复运行（命中、失败的调用都不运行，缓存不会重复写）。
-- 没有 hook 时不构造 `Call`。hook 是同步的，同步和异步模型共用（lite-cache 的 store 是同步的）。
-- 名字唯一（重复注册报 `ConfigError`），`model.hooks[name]` 取回，`Registration.remove()` 撤销（重复撤销无害）。
-- 调用上下文：`with call_context(scope="acme/u42", cache=True): model.text(...)`，hook 从 `Call.context`（只读）
-  读到；嵌套的块叠加并覆盖外层。是一个 contextvar：`Model` 协议不加参数，宿主 adapter、`FakeModel`、`Bounded`
-  都不变；同步调用和块内创建的 asyncio task 都看得到。lite-model 自己从不读这些值（主人 2026-11-18）。
-- `LiteModel.target(role)` / `AsyncLiteModel.target(role)`：调用前取得某个 role 解析后的 target（宿主把它记进
-  索引身份，§12.1）。
-- hook 抛错 = 调用失败，原样抛出（不吞掉，不包装）；`before` 抛错时不发请求。`after` 抛错时这次已经计费的回复
-  和它的 `usage` 一起丢掉：`after` 不应抛错（lite-cache 写失败时照样返回回复；回复上没有 `store_error` 字段，失败记在日志和 `CacheHook.store_errors` 里，lite-cache 设计 §3.5）。
-- hook 看到的 `Call.request` 是实际请求的只读深拷贝：hook 改不了发出去的请求，缓存键描述的就是发出去的那个。
-- hook 返回的回复类型不对（`text()` 拿到 `StructuredReply`，`structured()` 拿到 `TextReply` 或别的 schema 的
-  值）时抛 `TypeError`，写明是哪个 hook——在出错的地方失败，而不是调用方读值时。
-- `build()` / `build_async()` 返回 `LiteModel` / `AsyncLiteModel`（满足 `Model` / `AsyncModel`，多一个
-  `.hooks`）；`Model` 协议本身不含 hooks，`FakeModel` 和宿主的 adapter 不必实现。
-- **0.3.0（2026-11-19 定，2026-11-20 实现）**：
-  - `AsyncHook`（`async def before / after`，`lite_model.hooks`），`AsyncLiteModel` 会 await 它；同步 `Hook` 在异步
-    模型上照旧可用。同步模型注册 `AsyncHook` 时 `TypeError`（它永远不会被 await）。原因：llm-steward 是 async 的，
-    lite-cache 的同步 psycopg 查询放在同步 hook 里会阻塞 event loop。
-  - `Bounded` / `AsyncBounded` 包住 `LiteModel` / `AsyncLiteModel` 时，槽位在执行器里只包住真正发出的请求
-    （结构化地认 `Limitable`：有 `limited(slot)` 的模型，共享 routes 和 hooks；宿主 adapter 转发它即可）：hook 命中不再排队，hook 也可以经同一个 `Bounded` 调模型
-    （concurrency 1 时以前会死锁；L2 verifier 就是这个形状）。包住别的 `Model`（`FakeModel`、宿主 adapter）时照旧
-    整个调用占一个槽位。
-  - `Bounded.map` 的工作线程用调用方 context 的一份拷贝（每项一份）运行每一项，`call_context()` 的值能到 hook
-    （lite-rag S18 发现，lite-rag 在自己的 `BoundedLLM.map` 里先绕过；2026-11-19）。
-  - `cached=True` 的意思是"这次没有再花钱"，来源有两个：hook 命中（不经过 `after`），或 Proxy 自己的缓存命中
-    （`x-litellm-cache-key`，§7.2；会经过 `after`）。hook 在 `after` 里看到 `reply.cached` 为真时，不该把它的
-    `usage` 算成这次花掉的（lite-cache 的 `after` 待跟进）。
-  - 不加 `failed(call, error)` hook：lite-cache 不统计失败的调用（它的设计 §0），失败调用的用量在异常上（§9）。
+  `Call` holds the role, the resolved `Target`, messages, `request` (the SDK parameters actually sent), `params` (with model,
+  messages and the transport-level `extra_headers` removed), schema, `schema_name` and `schema_hash` (the sha256 of the strict schema's normalized JSON):
+  exactly the fields lite-cache's L1 cache key needs (lite-cache design §3.1).
+- Order: each call takes a snapshot of the hooks; `before` runs in registration order, and the **first** hook that returns a reply ends the call, no request is sent,
+  and the returned reply has `cached=True` (set on the reply, not on `Provenance`: the provenance stays the model that really answered originally; the owner, 2026-11-18).
+  `after` runs only for a reply that was just obtained from the endpoint (it does not run for hits or failed calls, so the cache is not written twice).
+- When there is no hook no `Call` is built. Hooks are synchronous, shared by sync and async models (lite-cache's store is synchronous).
+- Names are unique (registering a duplicate raises `ConfigError`), `model.hooks[name]` retrieves one, and `Registration.remove()` revokes it (revoking twice is harmless).
+- Call context: `with call_context(scope="acme/u42", cache=True): model.text(...)`, and the hook reads it from `Call.context` (read-only);
+  nested blocks stack and override the outer one. It is a contextvar: the `Model` protocol gets no new parameter, and the host adapter, `FakeModel` and `Bounded`
+  are all unchanged; both synchronous calls and asyncio tasks created inside the block can see it. lite-model itself never reads these values (the owner, 2026-11-18).
+- `LiteModel.target(role)` / `AsyncLiteModel.target(role)`: gets the resolved target of a role before the call (the host records it into the
+  index identity, §12.1).
+- A hook that raises = the call fails, and the error is raised as it is (not swallowed, not wrapped); when `before` raises no request is sent. When `after` raises, the reply that was already billed
+  is dropped together with its `usage`: `after` should not raise (when lite-cache fails to write, it still returns the reply; there is no `store_error` field on the reply, and the failure is recorded in the log and in `CacheHook.store_errors`, lite-cache design §3.5).
+- The `Call.request` a hook sees is a read-only deep copy of the actual request: a hook cannot change the request that is sent, and the cache key describes the one that was sent.
+- When a hook returns a reply of the wrong type (`text()` gets a `StructuredReply`, `structured()` gets a `TextReply` or a value of another schema)
+  it raises `TypeError` naming the hook: it fails where the error is, not when the caller reads the value.
+- `build()` / `build_async()` return `LiteModel` / `AsyncLiteModel` (they satisfy `Model` / `AsyncModel`, with one extra
+  `.hooks`); the `Model` protocol itself has no hooks, and `FakeModel` and hosts' adapters need not implement them.
+- **0.3.0 (decided 2026-11-19, implemented 2026-11-20)**:
+  - `AsyncHook` (`async def before / after`, `lite_model.hooks`), which `AsyncLiteModel` awaits; a synchronous `Hook` still works on an async
+    model as before. Registering an `AsyncHook` on a sync model raises `TypeError` (it would never be awaited). Reason: llm-steward is async, and
+    lite-cache's synchronous psycopg queries inside a synchronous hook would block the event loop.
+  - When `Bounded` / `AsyncBounded` wraps `LiteModel` / `AsyncLiteModel`, the slot wraps only the request actually sent, inside the executor
+    (it recognizes `Limitable` structurally: a model with `limited(slot)`, sharing routes and hooks; a host adapter only has to forward it): a hook hit no longer queues, and a hook can also call a model through the same `Bounded`
+    (this used to deadlock at concurrency 1; the L2 verifier has exactly this shape). When it wraps another `Model` (`FakeModel`, a host adapter), the whole call
+    still takes one slot as before.
+  - The worker threads of `Bounded.map` run each item with a copy of the caller's context (one copy per item), so the values of `call_context()` reach the hook
+    (found in lite-rag S18; lite-rag worked around it first in its own `BoundedLLM.map`; 2026-11-19).
+  - `cached=True` means "no money was spent again this time", and it has two sources: a hook hit (it does not go through `after`), or a hit in the Proxy's own cache
+    (`x-litellm-cache-key`, §7.2; it does go through `after`). When a hook sees `reply.cached` true in `after`, it should not count its
+    `usage` as spent this time (lite-cache's `after` is still to follow up).
+  - No `failed(call, error)` hook is added: lite-cache does not count failed calls (its design §0), and the usage of a failed call is on the exception (§9).
 
-- **`turn()` 不经过 hook**（0.4.0）：hook 的回复类型是 `TextReply | StructuredReply`，唯一的 hook 是 lite-cache，
-  而 agent 的轮次不缓存（每一轮上下文都不同）。让 hook 看到 `TurnReply` 需要先扩 `Hook` 协议和 lite-cache 的序列化
-  （§15）。`Bounded` / `AsyncBounded` 的槽位对 `turn()` 照常生效。
+- **`turn()` does not go through hooks** (0.4.0): the hook's reply types are `TextReply | StructuredReply`, the only hook is lite-cache,
+  and an agent's rounds are not cached (the context is different every round). Letting a hook see `TurnReply` would first require extending the `Hook` protocol and lite-cache's serialization
+  (§15). The `Bounded` / `AsyncBounded` slot still applies to `turn()` as usual.
 
-## 11. 测试工具
+## 11. Test tools
 
-- `lite_model.testing.FakeModel`：按 role 脚本化回复（文本或结构化对象，也可以是要抛的异常；列表按次消费，
-  函数按调用计算），记录每次请求（role、messages、schema），实现 `Model`。`AsyncFakeModel` 同样的脚本、同一份
-  `calls`，实现 `AsyncModel`（一个类不能让同名方法既同步又异步）。来源为 `backend="fake"`。
-- `FakeModel.turn` / `AsyncFakeModel.turn`（0.4.0）：脚本是 `AssistantTurn`（有 call 时 `stop="tool_calls"`，否则
-  `"end"`）、`(AssistantTurn, stop)`（脚本化 `"length"`）或异常；调用记在 `turn_calls`（`FakeTurnCall`：role、
-  messages、tools），不进 `calls`——`FakeCall.messages` 的类型不变，宿主现有测试不受影响。
-- 契约测试同步、异步各跑一遍（`tests/contract/conftest.py` 的 `connect` fixture）。
-- 契约测试：**真的 SDK**，只把 transport 换成记录请求的假 endpoint（`build(..., http_client=...)`，
-  `tests/upstream.py`），检查每个后端实际发出的请求体（参数名、strict schema、强制工具、header）。
-- `tests/conftest.py` 在 `-m ollama` / `-m litellm` 以外拒绝一切 socket 连接：忘了注入 transport 的测试会失败，
-  而不是悄悄调用真的服务。
-- 标记：`-m ollama`（真实本地 Ollama，免费）；`-m litellm`（需要本机 proxy，**只用指向 Ollama 的别名**）；
-  永远没有调用订阅或付费 API 的测试。测试配置设 `forbid_channels: [subscription, api]`。
+- `lite_model.testing.FakeModel`: scripted replies per role (text or a structured object, or an exception to raise; a list is consumed per call,
+  a function is computed per call), records every request (role, messages, schema), and implements `Model`. `AsyncFakeModel` has the same scripts and the same
+  `calls`, and implements `AsyncModel` (one class cannot make a method of the same name both sync and async). The provenance has `backend="fake"`.
+- `FakeModel.turn` / `AsyncFakeModel.turn` (0.4.0): a script is an `AssistantTurn` (`stop="tool_calls"` when there is a call, otherwise
+  `"end"`), `(AssistantTurn, stop)` (to script `"length"`), or an exception; calls are recorded in `turn_calls` (`FakeTurnCall`: role,
+  messages, tools) and do not go into `calls`, so the type of `FakeCall.messages` is unchanged and hosts' existing tests are not affected.
+- The contract tests run once sync and once async (the `connect` fixture in `tests/contract/conftest.py`).
+- Contract tests: **the real SDK**, with only the transport replaced by a fake endpoint that records requests (`build(..., http_client=...)`,
+  `tests/upstream.py`), checking the request body each backend actually sends (parameter names, strict schema, forced tool, header).
+- `tests/conftest.py` rejects every socket connection outside `-m ollama` / `-m litellm`: a test that forgot to inject a transport fails,
+  rather than quietly calling a real service.
+- Markers: `-m ollama` (real local Ollama, free); `-m litellm` (needs a local proxy, **only aliases that point at Ollama**);
+  there is never a test that calls a subscription or paid API. The test config sets `forbid_channels: [subscription, api]`.
 
-## 12. 迁移
+## 12. Migration
 
-每个模块在**自己的 repo 里**作为一个 stage 迁移，验收都包含：迁移前后发出去的请求体一致（契约测试）、
-eval 数字一致、来源格式兼容。
+Each module migrates as one stage **in its own repo**, and the acceptance for each includes: the request bodies sent before and after migration are the same (contract test),
+the eval numbers are the same, and the provenance format is compatible.
 
-| 顺序 | 模块 | 要点 |
+| Order | Module | Key points |
 | --- | --- | --- |
-| 1 | lite-mem | 功能最全（strict schema、Anthropic 强制工具、按 role 覆盖），最能检验接口。`produced_by` 继续存 `provider:model`。**已迁移**（2026-11-18，lite-mem S12，用 0.1.1 的 `keyless`；12 个请求体前后相同） |
-| 2 | lite-rag | 三处 LLM 配置变成三个 role；`contextual`、`graph` 不可路由；`Completion.model_id` 改成实际回答的模型；`literag eval` 前后一致。**已迁移**（2026-11-18，lite-rag S15，用 0.2.0 的 `host_roles`；5 个请求体前后相同，索引身份不变） |
-| 3 | llm-steward | 异步；顺带修它没整理过的 strict schema（raw `model_json_schema()`）。**已迁移**（2026-11-19，llm-steward P9；5 个请求体前后相同——它的 schema 本来就是 strict 形状，`strict_schema` 结果不变；锁定的 lite-rag、lite-mem 一起升到迁移后的版本） |
-| — | lite-eval judge | 暂不迁移（§1 非目标） |
+| 1 | lite-mem | The most complete feature set (strict schema, Anthropic forced tool, per-role overrides), so it tests the interface best. `produced_by` keeps storing `provider:model`. **Migrated** (2026-11-18, lite-mem S12, using 0.1.1's `keyless`; 12 request bodies the same before and after) |
+| 2 | lite-rag | The three LLM configs become three roles; `contextual` and `graph` are not routable; `Completion.model_id` becomes the model that actually answered; `literag eval` is the same before and after. **Migrated** (2026-11-18, lite-rag S15, using 0.2.0's `host_roles`; 5 request bodies the same before and after, index identity unchanged) |
+| 3 | llm-steward | Async; also fixes its strict schema, which was never cleaned up (raw `model_json_schema()`). **Migrated** (2026-11-19, llm-steward P9; 5 request bodies the same before and after — its schema already had the strict shape, so the `strict_schema` result is unchanged; the pinned lite-rag and lite-mem were upgraded together to the post-migration versions) |
+| — | lite-eval judge | Not migrated for now (§1 non-goals) |
 
-lite-model 以 GitHub release wheel 发布，宿主在 `[tool.uv.sources]` 里锁定版本（与 lite-eval 相同的做法）。
+lite-model is released as a GitHub release wheel, and hosts pin the version in `[tool.uv.sources]` (the same approach as lite-eval).
 
-### 12.1 迁移后删什么、留什么
+### 12.1 What is deleted and what stays after migration
 
-迁移的目的是消除重复：一个模块迁移完，它自己那份 LLM 客户端代码**删掉**。模块之间可以一个一个迁，
-没迁的照常工作；但已迁的模块里不能同时留着旧客户端。
+The purpose of migration is to remove duplication: once a module is migrated, its own copy of the LLM client code is **deleted**. Modules can migrate one at a time,
+and those not yet migrated work as usual; but a migrated module cannot keep the old client at the same time.
 
-| 模块 | 删掉（改由 lite-model 提供） | 留在模块里 |
+| Module | Deleted (now provided by lite-model) | Stays in the module |
 | --- | --- | --- |
-| lite-mem | `llm.py` 的 `strict_schema`、`_failed`、`_parsed`、`_VendorLLM`、`OpenAICompatibleLLM`、`AnthropicLLM`、`RoutedLLM`；`config.py` 的 `RoleOverride`、`ModelTarget`、`LLMConfig`（改为嵌入 lite-model 的配置）；`testing.py` 的 FakeLLM；对应的单元测试 | role 名（`extract`、`resolve`、`consolidate`）及其 `RoleSpec`；把 payload 序列化成 user 消息；`prompts/*.j2`；`Provenance` → `produced_by` 的存储格式；embedding 客户端（v2 前） |
-| lite-rag | `llm.py` 的 `PROVIDERS`、`ProviderProfile`、`_Client`、`OpenAICompatLLM`、`AnthropicLLM`、`BoundedCalls`、`build_llm`；`config.py` 的 `LLMConfig` 及其 provider 校验；`testing.py` 的 FakeLLM；对应的单元测试 | `answer`、`contextual`、`graph` 三个 role 的声明（后两个 `routable=False`）；graph 从文本里解析 JSON（业务逻辑）；索引身份里的 LLM id（改为取自 lite-model 的 target）；`prompts/*.j2`；embedding、rerank |
-| llm-steward | `llm/client.py`；`llm/roles.py` 里解析 role 和调模型的部分；各处自己生成 schema 的代码（改用 lite-model 的 `strict_schema`）；`tests/fakes/llm.py` | role 名（`memory.extract`、`memory.resolve`、`kb.risk`、`kb.worthiness`、`kb.draft`）；mem0 的 LLM 配置（mem0 内部调模型，不经过 lite-model） |
-| lite-eval | 不迁移（§1 非目标） | judge 客户端整份 |
+| lite-mem | In `llm.py`: `strict_schema`, `_failed`, `_parsed`, `_VendorLLM`, `OpenAICompatibleLLM`, `AnthropicLLM`, `RoutedLLM`; in `config.py`: `RoleOverride`, `ModelTarget`, `LLMConfig` (changed to embed lite-model's config); FakeLLM in `testing.py`; the corresponding unit tests | The role names (`extract`, `resolve`, `consolidate`) and their `RoleSpec`; serializing the payload into the user message; `prompts/*.j2`; the storage format from `Provenance` → `produced_by`; the embedding client (until v2) |
+| lite-rag | In `llm.py`: `PROVIDERS`, `ProviderProfile`, `_Client`, `OpenAICompatLLM`, `AnthropicLLM`, `BoundedCalls`, `build_llm`; in `config.py`: `LLMConfig` and its provider validation; FakeLLM in `testing.py`; the corresponding unit tests | The declarations of the three roles `answer`, `contextual`, `graph` (the latter two `routable=False`); graph parsing JSON out of text (business logic); the LLM id in the index identity (changed to come from lite-model's target); `prompts/*.j2`; embedding, rerank |
+| llm-steward | `llm/client.py`; the parts of `llm/roles.py` that resolve roles and call models; the code that generates schemas by itself in various places (changed to use lite-model's `strict_schema`); `tests/fakes/llm.py` | The role names (`memory.extract`, `memory.resolve`, `kb.risk`, `kb.worthiness`, `kb.draft`); mem0's LLM config (mem0 calls the model internally, not through lite-model) |
+| lite-eval | Not migrated (§1 non-goals) | The whole judge client |
 
-每个模块保留一个**薄 adapter**（十几行）：把模块自己的 `LLM` Protocol 接到 `lite_model.Model` 上，模块内部
-的调用点不用改，也满足"每个组件都是 Protocol"的规则。是否改为直接依赖 `lite_model.Model`、去掉 adapter，
-在各模块迁移时决定。
+Each module keeps one **thin adapter** (a dozen lines): it connects the module's own `LLM` Protocol to `lite_model.Model`, so the call sites inside the module
+need no change, and it also satisfies the rule "every component is a Protocol". Whether to change to depend directly on `lite_model.Model` and drop the adapter
+is decided when each module migrates.
 
-### 12.2 每个模块的迁移步骤
+### 12.2 Migration steps for each module
 
-1. 先写契约测试，固定**现在**实际发出去的请求体（参数名、schema、强制工具、header）。
-2. 改为调用 lite-model，跑同一组契约测试：请求体一致。
-3. 跑模块自己的 eval（lite-rag `literag eval`，lite-mem 的 eval）：数字一致；前后数字记进 KB。
-4. 一致之后**删除**旧客户端、旧 fake 和只测旧客户端的单元测试；FakeLLM 换成 `lite_model.testing.FakeModel`。
-5. 更新该模块的设计文档和 `AGENTS.md`：LLM 相关规则（Protocol、no fallback、来源记录、Tests never call a real
-   model）改为指向 lite-model；依赖列表里去掉不再直接使用的 `openai` / `anthropic`（如果别处也不用）。
-6. 按该模块的阶段收尾流程（/simplify → Codex review → 修复 → 重跑全部检查）结束。
+1. First write contract tests that fix the request bodies actually sent **now** (parameter names, schema, forced tool, header).
+2. Switch to calling lite-model and run the same contract tests: the request bodies are the same.
+3. Run the module's own eval (lite-rag `literag eval`, lite-mem's eval): the numbers are the same; the numbers before and after are recorded in the KB.
+4. Once they match, **delete** the old client, the old fake and the unit tests that tested only the old client; FakeLLM is replaced by `lite_model.testing.FakeModel`.
+5. Update the module's design doc and `AGENTS.md`: the LLM-related rules (Protocol, no fallback, provenance record, Tests never call a real
+   model) now point to lite-model; remove `openai` / `anthropic` from the dependency list if they are no longer used directly (and not used elsewhere).
+6. Finish with the module's stage close-out process (/simplify → Codex review → fix → re-run all checks).
 
-## 13. 项目结构
+## 13. Project structure
 
 ```
 lite-model/
@@ -741,356 +743,354 @@ lite-model/
 └─ docs/lite-model-design.md
 ```
 
-## 14. 阶段与验收
+## 14. Stages and acceptance
 
-每个阶段结束：ruff、ruff format、mypy、pytest 全绿；新测试都见过一次红；然后按 `AGENTS.md` Workflow 第 4 步
-收尾（/simplify → Codex 只读 review → 修复 → 重跑全部检查）。
+At the end of each stage: ruff, ruff format, mypy and pytest are all green; every new test has been seen red once; then the close-out follows step 4 of the `AGENTS.md` Workflow
+(/simplify → Codex read-only review → fix → re-run all checks).
 
-| 阶段 | 内容 | 验收 |
+| Stage | Content | Acceptance |
 | --- | --- | --- |
-| **S0** 环境与核实 | repo 骨架（uv、ruff、mypy、pytest、CI）；版本锁定（openai、anthropic、pydantic 与 lite-mem 相同）；起 LiteLLM Proxy（digest 锁定、cosign 验签、无数据库、127.0.0.1:4400（原定 4000，与 tenderted 冲突）、§7.2 配置，分档先全用 Ollama 模型以免花钱）；用 curl 核实：`max_tokens` / `max_completion_tokens`、`temperature`、`reasoning_effort` 到 `ollama_chat` 的转换、strict `json_schema`、`return_raw_model_name`、响应头（`x-litellm-model-id`、`-model-group`、`-response-cost`）、`x-litellm-num-retries`、role 透传字段 | 核实结果写进 KB（`KB/global/litellm/README.md`，并修正 `tech-selection/01b` 过时的两处：`enable_context_window_escalation` 默认 false、`classifier_fallback`）；§5 参数表和 §6.3、§7.3 按结果更新；端口登记到 `KB/global/machine/` |
-| **S1** 核心 | types、config（含启动校验）、errors、`strict_schema`、openai-compatible 后端（ollama / openai），同步 `text` / `structured`，来源取自响应，`FakeModel`，`dump-config` | 单元 + 契约测试覆盖 §4 每条校验、§5 ollama/openai 参数、§8 每种错误；`-m ollama` 跑通 text 与 structured |
-| **S2** Anthropic 与异步 | anthropic 后端（强制工具、system 字段、`stop_reason`）；`build_async` 与两个异步后端 | 契约测试检查 Anthropic 请求体；同步与异步共用一套契约测试 |
-| **S3** gateway 与 litellm | 两个后端；channel 与 `forbid_channels`；`router_aliases` 与 `RolePolicy` 护栏；§6.2 / §6.3 来源；`IgnoredParameter`；`x-litellm-num-retries: 0` | 契约测试覆盖：路由别名在不可路由 role 上被拒、`return_raw_model_name` 未开时 `ProvenanceUnknown`、gateway 忽略参数时报错；`-m litellm` 用 Ollama 别名跑通，来源是实际模型 |
-| **S4** 用量、并发、hook | `Usage`（含 reasoning、失败时的用量）、价格表与成本头、`Bounded`、hook 注册 / 撤销 / 短路 | 测试覆盖：失败调用也有用量、hook 命中保留原来源并 `cached=True`、撤销后不再生效 |
-| **S5** 发布与收尾 | README、`deploy/litellm/`、v0.1.0 release wheel；整个库的最终收尾 review | 宿主可以从 wheel 安装；全量检查绿 |
-| **S6+** 迁移 | 在 lite-mem、lite-rag、llm-steward 各自 repo 里按 §12 迁移 | 见 §12 |
-| **0.3.0** lite-cache 的前置（2026-11-20 实现） | `AsyncHook`；`Bounded` 槽位只包住真正的请求；`Bounded.map` 带调用方 context；litellm 回复带 `x-litellm-cache-key` 时 `cached=True` | `tests/contract/test_bounded_hooks.py`：concurrency 1 时命中不等正在跑的调用（sync、async）；hook 经同一个 `Bounded` 调模型不死锁；`map` 里 hook 看得到 `call_context`；async hook 命中短路且不阻塞其它 task；同步模型拒绝 `AsyncHook`。`test_usage_and_hooks.py`：带缓存头的 litellm 回复 `cached=True`、来源不变，空值或别的后端不算 |
-| **0.5.0** 向量与 Anthropic 结构化输出（2026-11-21 实现） | `embed()`（§3.2）：`RolePolicy(kind=)`、`EmbedReply`、`EmbedModel` / `AsyncEmbedModel`、`supports_embeddings`、分批与校验、`FakeModel(vectors=)`、`hash_vectors`；Anthropic `structured()` 改用 `output_config.format`（§15） | `tests/contract/test_embed.py`（同步、异步）：请求体（`encoding_format: "float"`，不带 chat 参数）；按 index 排回输入顺序；来源与 usage；64 条一批、顺序和 usage 合计；条数、维度不对，以及批与批之间不一致；不同批由不同模型回答；空输入不发请求；同一 target 重试、错误不带上游文本；不调用 hook；role 种类不对、不支持的后端、embed role 上的 chat 参数被拒。`test_anthropic.py`：结构化请求只有 `output_config`，没有 tools / `tool_choice`；回复从 text JSON 读。`-m ollama`：`/v1/embeddings` 与 `/api/embed` 的向量相等 |
-| **0.4.0** lite-agent 的前置（2026-11-21 实现） | `turn()`（§3.1）：`ToolSpec`、`AssistantTurn`（有序 blocks）、`ToolResults`、`TurnReply`、`ToolModel` / `AsyncToolModel`；两种协议的请求和回复映射；`Opaque` 重放规则；`supports_tools`；`FakeModel.turn` | `tests/contract/test_turns.py`（同步、异步）：带 tools 的请求体；历史里的 call 和结果（OpenAI 每个结果一条 `tool` 消息，Anthropic 一条 user 消息）；多个 call 的顺序和 id；截断返回 `stop="length"` 和它的 call；不合法的参数；thinking block 的字段和值原样往返、位置不变、交错顺序保留；未知的 `finish_reason`；空的 `ToolResults`；历史中间的 system 消息；另一种协议的 `Opaque` 不发；`EmptyReply` / `Truncated` / `CallFailed` / `ProvenanceUnknown` 带对的 usage；不调用 hook；`text()` 请求体不变。`-m ollama`：一个真实的 tool 轮次加结果 |
+| **S0** Environment and verification | Repo skeleton (uv, ruff, mypy, pytest, CI); version pinning (openai, anthropic and pydantic the same as lite-mem); start the LiteLLM Proxy (locked by digest, cosign signature check, no database, 127.0.0.1:4400 (originally 4000, which conflicts with tenderted), the §7.2 config, with the tiers using only Ollama models at first so nothing is spent); verify with curl: `max_tokens` / `max_completion_tokens`, `temperature`, the conversion of `reasoning_effort` to `ollama_chat`, strict `json_schema`, `return_raw_model_name`, the response headers (`x-litellm-model-id`, `-model-group`, `-response-cost`), `x-litellm-num-retries`, the field that passes the role through | The verification results are written into the KB (`KB/global/litellm/README.md`, and two outdated points in `tech-selection/01b` are corrected: `enable_context_window_escalation` defaults to false, and `classifier_fallback`); the §5 parameter table and §6.3, §7.3 are updated per the results; the port is registered in `KB/global/machine/` |
+| **S1** Core | types, config (with startup validation), errors, `strict_schema`, the openai-compatible backend (ollama / openai), sync `text` / `structured`, provenance taken from the response, `FakeModel`, `dump-config` | Unit + contract tests cover every validation in §4, the ollama/openai parameters in §5, and every kind of error in §8; `-m ollama` runs text and structured through |
+| **S2** Anthropic and async | The anthropic backend (forced tool, system field, `stop_reason`); `build_async` and the two async backends | Contract tests check the Anthropic request body; sync and async share one set of contract tests |
+| **S3** gateway and litellm | The two backends; channel and `forbid_channels`; the `router_aliases` and `RolePolicy` guards; the §6.2 / §6.3 provenance; `IgnoredParameter`; `x-litellm-num-retries: 0` | Contract tests cover: a routing alias rejected on a role that is not routable, `ProvenanceUnknown` when `return_raw_model_name` is not on, an error when the gateway ignores a parameter; `-m litellm` runs through with an Ollama alias, and the provenance is the actual model |
+| **S4** Usage, concurrency, hook | `Usage` (including reasoning, and usage on failure), the price table and cost header, `Bounded`, hook register / revoke / short-circuit | Tests cover: a failed call also has usage, a hook hit keeps the original provenance and `cached=True`, and a revoked hook no longer takes effect |
+| **S5** Release and close-out | README, `deploy/litellm/`, the v0.1.0 release wheel; the final close-out review of the whole library | A host can install from the wheel; the full set of checks is green |
+| **S6+** Migration | Migrate in each of the lite-mem, lite-rag and llm-steward repos per §12 | See §12 |
+| **0.3.0** Prerequisites for lite-cache (implemented 2026-11-20) | `AsyncHook`; the `Bounded` slot wraps only the real request; `Bounded.map` carries the caller's context; `cached=True` when a litellm reply carries `x-litellm-cache-key` | `tests/contract/test_bounded_hooks.py`: at concurrency 1 a hit does not wait for a running call (sync, async); a hook calling a model through the same `Bounded` does not deadlock; in `map` the hook can see `call_context`; an async hook hit short-circuits and does not block other tasks; a sync model rejects `AsyncHook`. `test_usage_and_hooks.py`: a litellm reply with the cache header gets `cached=True` with the provenance unchanged, and an empty value or another backend does not count |
+| **0.5.0** Vectors and Anthropic structured output (implemented 2026-11-21) | `embed()` (§3.2): `RolePolicy(kind=)`, `EmbedReply`, `EmbedModel` / `AsyncEmbedModel`, `supports_embeddings`, batching and validation, `FakeModel(vectors=)`, `hash_vectors`; Anthropic `structured()` switched to `output_config.format` (§15) | `tests/contract/test_embed.py` (sync, async): the request body (`encoding_format: "float"`, no chat parameters); sorted back into input order by index; provenance and usage; 64 items per batch, order and usage total; a wrong count or dimension, and inconsistency between batches; different batches answered by different models; empty input sends no request; retry on the same target, and errors carry no upstream text; no hook call; a wrong role kind, an unsupported backend, and chat parameters on an embed role are rejected. `test_anthropic.py`: a structured request has only `output_config`, with no tools / `tool_choice`; the reply is read from the text JSON. `-m ollama`: the vectors of `/v1/embeddings` and `/api/embed` are equal |
+| **0.4.0** Prerequisites for lite-agent (implemented 2026-11-21) | `turn()` (§3.1): `ToolSpec`, `AssistantTurn` (ordered blocks), `ToolResults`, `TurnReply`, `ToolModel` / `AsyncToolModel`; the request and reply mapping for both protocols; the `Opaque` replay rule; `supports_tools`; `FakeModel.turn` | `tests/contract/test_turns.py` (sync, async): the request body with tools; calls and results in the history (OpenAI one `tool` message per result, Anthropic one user message); the order and ids of several calls; truncation returns `stop="length"` and its calls; invalid arguments; the fields and values of a thinking block round-trip unchanged, with position unchanged and interleaved order kept; an unknown `finish_reason`; an empty `ToolResults`; a system message in the middle of the history; an `Opaque` of the other protocol is not sent; `EmptyReply` / `Truncated` / `CallFailed` / `ProvenanceUnknown` carry the right usage; no hook call; the `text()` request body is unchanged. `-m ollama`: one real tool round plus its result |
 
-### 阶段记录
+### Stage records
 
-（每个阶段完成后在这里追加：日期、做了什么、review 结论、被拒的 finding 及理由。）
+(After each stage is done, append here: date, what was done, the review conclusion, and rejected findings with reasons.)
 
-- **0.8.0（2026-11-22）**：`cohere`、`gemini` 两个只做 embed 的类型，和它们用的 `rest` 客户端（§3.4）。增量改动。起因：lite-rag 剩下的
-  两个 HTTP embedder 是它自己实现的（重试、对半拆、错误映射各写了一份）。进程内的 embedder 不迁（理由见 §3.4）。
-  - 测试：`tests/contract/test_rest_embed.py`（同步、异步）：两家的 URL、鉴权头（Gemini 不发 Authorization）、请求体、input_type 映射、维度、
-    回复解析和 usage；不传 input_type 时 Gemini 不发 taskType；503 / 429 重试后成功；400 对半拆且不重试；401 不重试、错误只有类型名；
-    条数不对是 BadStructuredReply；chat role 被拒；注入的 http_client 不被关。导入失败时全部红。`tests/live/test_rest_embed.py`
-    （`-m cohere` / `-m gemini`）写好，没有 key，没跑。
-  - /simplify 采纳：sync / async 的重试循环共用 `_outcome`（每次尝试的结论：回复、等多久、还是报错）；`rest.Raw` 替代 openai_compat 里同样的 `_Raw`；
-    两家厂商共用 `rest.connectors(auth)`，没 key 时一律传空串；两处过时的注释（"embed 类型都是 OpenAI 兼容的"）改了。不采纳：`BACKENDS`
-    去掉 `cast`（chat 路径按 `Backend` 写类型，换成联合类型会把 cast 推到每个 chat 调用点）。
-  - Codex 两条都成立，先写失败的测试再修：`retry-after` 是 HTTP 日期时被当成读不懂、用了自己的退避（SDK 会读）；网络错误把原始异常挂在
-    cause 链上，原始异常可能写着请求头（Gemini 的 key 在头里）。现在网络错误换成只有类型名的 `TransportFailure`，并切断 cause 链。
-  - pytest 420 passed；mypy、ruff 干净。
-- **0.7.0（2026-11-22）**：`voyage` 类型、`embed(input_type=)`、`rerank()`（§3.3）。都是增量改动；`EmbedModel` 协议多了一个仅限关键字、
-  有默认值的参数，自己实现这个协议的宿主要跟着加。起因：lite-rag 的 `VoyageEmbedder` 是它自己写的 HTTP 调用，Voyage rerank 没有地方放。
-  - 测试：`tests/contract/test_voyage.py`（同步、异步）：请求的 URL、鉴权、`input_type`、`output_dimension`、不发 `encoding_format: "float"`；
-    base64 向量解码；没有 input_type 就不发；400 时对半拆且子批带同样的 input_type；不接受 input_type 的类型报错且不发请求；chat role
-    配到 voyage 上被拒；rerank 排回输入顺序、`top_k` 之外是 None、请求体、来源和 usage；三种不匹配的回复；rerank role 放在不支持的
-    类型上、chat/embed role 调 rerank 被拒；rerank role 不可路由；fake 和 Bounded 透传。导入失败时全部红；后补的对半拆和 Bounded 两条，
-    分别去掉子批的 input_type、Bounded 不传参数，确认变红后恢复。`tests/live/test_voyage.py`（`-m voyage`）写好，没有 key，这次没跑。
-  - /simplify 采纳：profile 的三个布尔值合成 `serves` 集合，配置检查用一张 `UNUSED` 表（每种 role 不用的字段），`_embed_problems` 并入
-    `_problems`；`embed_encoding_format`；一个 `_RerankOwner` 同时服务 sync / async（看 `post` 的返回值是否 awaitable）；rerank 请求也走
-    `_transport`；条数检查合成一条；`InputType` / `RoleKind` 放到 `types.py`；fake 的 rerank 按 `top_k` 在之外填 None；测试用
-    `local_validate`、`Upstream.body`、`embeddings(b64=)`、`ranked()`。拒绝：dimensions 一律走 `extra_body`（改变 0.6.0 宿主的请求体，规则 13）；
-    测试共用 `Caller`、合并 `with_vectors` / `with_scores`（超出本次范围）。
-  - Codex 三条都成立，都先写了失败的测试：非 dict 的条目被滤掉后不计数（`top_k=1` 时一条坏的加一条好的被当成有效）；布尔值通过了
-    index 和分数的检查；`top_k=0` 被当成没有上限。改为坏条目计入条数并拒绝、排除 bool、`top_k < 1` 在发请求前报 `ValueError`。
-    Codex 也确认了：SDK 不带 `encoding_format` 时请求 base64 并解码；其他类型的请求体不变。
-  - pytest 401 passed；`-m ollama` 6 passed。
-- **0.6.0（2026-11-22）**：embed role 的 `dimensions` / `batch_size` / `max_concurrency`；400/413 时对半拆批；`close()` / `aclose()`
-  （§3.2.1）。都是增量改动。起因是 lite-rag S19 要把它的 ollama / openai embedder 换过来，而 llm-steward 退出时关不掉 SDK 客户端。
-  - 测试：`test_embed.py` 新增 dimensions 进请求体、分批和并发下的顺序、对半拆的完整请求序列、单条仍被拒就失败、chat role 上设
-    embed 字段被拒、close 之后再调用报错、注入的 http_client 不被关、Bounded 和 fake 的 close。都先看到红；把 `TOO_LARGE` 改成空集
-    之后，对半拆的 4 个测试变红。pytest 378 passed；`-m ollama` 6 passed。各宿主（lite-rag、lite-mem、lite-cache、lite-agent、llm-steward）
-    的 mypy 和 pytest 都用新 build 跑过（KB testing-and-ci §15）。
-  - /simplify 采纳：
-    - 线程池和 `Bounded.map` 共用 `in_threads`。
-    - 一个批失败后，排队中的批不再发出：sync 用 `cancel_futures`；async 改用 `TaskGroup`，并解包成第一个错误。先写了失败的测试。
-    - 两处"role 设了用不上的字段"的检查合成 `_set`。
-    - 关闭的逻辑放进 `_Clients.release()`。
-  - /simplify 不采纳：sync 和 async 的拆批逻辑合并（各约 6 行，强行合并反而更乱）；400 不再算作"太大"（Voyage 超 token 时返回的就是 400）。
-  - Codex：没有 finding。
-- **0.5.1（2026-11-22）**：`FakeModel(vectors=)` 改成 `FakeModel.with_vectors(vectors, /, **scripts)`（`AsyncFakeModel` 同）。
-  - 原因：0.5.0 发布后跨 repo 检查时，用 0.5.0 跑各宿主的 mypy，lite-rag `testing.py:93` 和 lite-mem `testing.py:63` 报错。它们用 `FakeModel(**{role: script})` 建 fake，mypy 会拿 dict 的值去匹配每个关键字参数，`vectors` 也不例外。`__init__` 恢复成 0.4.0 的 `**scripts`；向量放到只收位置参数的 classmethod，名叫 `vectors` 的 role 也不冲突。
-  - 测试：`test_embed.py::test_scripts_unpacked_from_a_dict_still_type_check`，用 mypy 检查（修之前 3 个错误，修之后通过）；pytest 363 passed。
-  - 教训：库改了公开签名之后，跨 repo 检查要连宿主的 mypy 一起跑，只跑 pytest 不够。
-- **0.5.0（2026-11-21）**：`embed()`（§3.2）和 Anthropic `structured()` 改用 `output_config.format`（§15）。
-  - 检查：ruff、ruff format、mypy 都通过；pytest 362 passed；`-m ollama` 6 passed（含 `/v1/embeddings` 与 `/api/embed` 向量相等）。
-  - 新测试先红后绿，事后又逐行破坏实现，确认断言会失败：`encoding_format`、按 index 排序、跨批来源、chat 设置清空、embed role 不可路由、条数校验、Anthropic 请求形状、`Bounded.embed`。
-  - 有意改的旧测试：`test_anthropic.py` 里断言强制工具的四个测试，按新请求形状重写。
-  - 删除的旧测试：`test_only_the_forced_tools_input_is_read`。这个测试检查"只读被强制的那个工具"，现在已经没有强制工具了。
-  - `/simplify`（reuse / simplification / efficiency / altitude 四路）采纳：
-    - embed 经 `EmbedBackend` 协议调用，`_send` 改为必须传 endpoint owner（原来是 `owner=None` 的补丁参数）。
-    - `_route` 从方法名推出 role 种类。
-    - `_merged` 单批时直接返回；usage 合计用 `_total`。
-    - 向量和输入不再各复制一份。
-    - 路由别名检查只留一处。
-    - `target()` 真的清掉 embed role 的 chat 设置，docstring 因此成立。
-    - "空向量"单独一条检查。
-    - `Bounded` / `AsyncBounded` 补上 `embed()`，原来漏了。
-    - `embeddings()` 响应构造放到 `tests/upstream.py`。
-    - `FakeReply` 不收向量：放进去会让宿主测试里已有的 `list` 脚本类型推断失败（mypy 在 `test_bounded.py` 上报了）。改成独立的 `vectors=`。
-  - `/simplify` 不采纳：
-    - embed 测试并进 `conftest.Caller`：要把 embed role 加进所有契约测试的 `ROLES`，anthropic / gateway 配置的测试会多出 embed 的错误。
-    - `FakeModel` 的 embed 支持列表脚本：没有用到。
-    - async 的批并行发：设计定为逐批发，失败时不浪费其他批。
-    - `strict_schema` 缓存：不是这次的改动。
-  - Codex（`codex exec -s read-only`）两条都采纳，每条先写了红的回归测试：
-    - 只按 index 排序、不检查 index，重复或缺失的 index 会把向量配给错的输入。现在要求排序后正好是 `0..n-1`。
-    - 端点不报 usage 时，`output` 也成了 `None`。embedding 没有输出 token，现在固定为 0。
-    - 宿主现有的 `text` / `structured` / `turn` / hook / `FakeModel` 调用路径没有发现回退。
+- **0.8.0 (2026-11-22)**: the two embed-only types `cohere` and `gemini`, and the `rest` client they use (§3.4). An incremental change. Reason: the remaining
+  two HTTP embedders in lite-rag were implemented by itself (retries, halving and error mapping each written separately). In-process embedders are not migrated (reasons in §3.4).
+  - Tests: `tests/contract/test_rest_embed.py` (sync, async): both vendors' URLs, auth headers (Gemini sends no Authorization), request bodies, input_type mapping, dimensions,
+    reply parsing and usage; Gemini sends no taskType when input_type is not passed; success after a retry on 503 / 429; 400 is halved and not retried; 401 is not retried and the error has only the type name;
+    a wrong count is BadStructuredReply; a chat role is rejected; an injected http_client is not closed. All red when the import fails. `tests/live/test_rest_embed.py`
+    (`-m cohere` / `-m gemini`) is written, there is no key, and it was not run.
+  - /simplify accepted: the sync / async retry loops share `_outcome` (the verdict of each attempt: a reply, how long to wait, or an error); `rest.Raw` replaces the same `_Raw` in openai_compat;
+    both vendors share `rest.connectors(auth)`, always passing an empty string when there is no key; two outdated comments ("the embed types are all OpenAI-compatible") were changed. Rejected: removing the `cast` from `BACKENDS`
+    (the chat path is typed as `Backend`, and switching to a union type would push the cast to every chat call site).
+  - Both Codex findings were valid, and a failing test was written before each fix: when `retry-after` was an HTTP date it was treated as unreadable and the code's own backoff was used (the SDK reads it); on a network error the original exception was left on the
+    cause chain, and the original exception may contain request headers (Gemini's key is in a header). Now a network error is replaced by a `TransportFailure` with only the type name, and the cause chain is cut.
+  - pytest 420 passed; mypy and ruff clean.
+- **0.7.0 (2026-11-22)**: the `voyage` type, `embed(input_type=)`, `rerank()` (§3.3). All incremental changes; the `EmbedModel` protocol gains one keyword-only parameter
+  with a default, and a host that implements this protocol itself has to add it. Reason: lite-rag's `VoyageEmbedder` was an HTTP call it wrote itself, and Voyage rerank had no place to go.
+  - Tests: `tests/contract/test_voyage.py` (sync, async): the request URL, auth, `input_type`, `output_dimension`, `encoding_format: "float"` not sent;
+    base64 vectors decoded; not sent when there is no input_type; on 400 the batch is halved and the sub-batches carry the same input_type; a type that does not accept input_type raises an error and sends no request; a chat role
+    configured on voyage is rejected; rerank is sorted back into input order, outside `top_k` is None, the request body, provenance and usage; three kinds of mismatched reply; a rerank role on an unsupported
+    type, and a chat/embed role calling rerank, are rejected; a rerank role is not routable; fake and Bounded pass through. All red when the import fails; for the halving and Bounded tests added later,
+    the sub-batch's input_type was removed and Bounded was made not to pass the argument, they were seen to go red, and then restored. `tests/live/test_voyage.py` (`-m voyage`) is written, there is no key, and it was not run this time.
+  - /simplify accepted: the profile's three booleans are merged into the `serves` set, the config check uses one `UNUSED` table (the fields each role kind does not use), and `_embed_problems` is merged into
+    `_problems`; `embed_encoding_format`; one `_RerankOwner` serves both sync / async (checking whether the return value of `post` is awaitable); the rerank request also goes through
+    `_transport`; the count checks are merged into one; `InputType` / `RoleKind` moved to `types.py`; the fake's rerank fills None outside `top_k`; the tests use
+    `local_validate`, `Upstream.body`, `embeddings(b64=)` and `ranked()`. Rejected: sending dimensions always through `extra_body` (it would change the request body of 0.6.0 hosts, rule 13);
+    sharing `Caller` among tests and merging `with_vectors` / `with_scores` (beyond the scope of this change).
+  - All three Codex findings were valid, and a failing test was written first for each: non-dict entries were filtered out and not counted (with `top_k=1`, one bad entry plus one good entry was treated as valid); a boolean passed
+    the index and score checks; `top_k=0` was treated as no limit. Changed so that bad entries count toward the count and are rejected, bool is excluded, and `top_k < 1` raises `ValueError` before the request is sent.
+    Codex also confirmed: when the SDK is not given `encoding_format` it requests base64 and decodes it; the request bodies of other types are unchanged.
+  - pytest 401 passed; `-m ollama` 6 passed.
+- **0.6.0 (2026-11-22)**: the embed role's `dimensions` / `batch_size` / `max_concurrency`; batch halving on 400/413; `close()` / `aclose()`
+  (§3.2.1). All incremental changes. The reason was that lite-rag S19 wants to switch its ollama / openai embedders over, and llm-steward cannot close the SDK clients on exit.
+  - Tests: `test_embed.py` adds dimensions in the request body, order under batching and concurrency, the full request sequence of halving, failure when a single item is still rejected, embed fields set on a chat role
+    being rejected, an error on a call after close, an injected http_client not being closed, and the close of Bounded and fake. All seen red first; after changing `TOO_LARGE` to an empty set,
+    the 4 halving tests went red. pytest 378 passed; `-m ollama` 6 passed. The mypy and pytest of every host (lite-rag, lite-mem, lite-cache, lite-agent, llm-steward)
+    were run with the new build (KB testing-and-ci §15).
+  - /simplify accepted:
+    - The thread pool and `Bounded.map` share `in_threads`.
+    - After one batch fails, queued batches are no longer sent: sync uses `cancel_futures`; async switched to `TaskGroup`, unwrapping to the first error. A failing test was written first.
+    - The two checks for "the role set a field it does not use" are merged into `_set`.
+    - The closing logic is put into `_Clients.release()`.
+  - /simplify rejected: merging the sync and async halving logic (about 6 lines each, and forcing a merge would make it messier); no longer counting 400 as "too large" (when Voyage exceeds the token limit it returns 400).
+  - Codex: no findings.
+- **0.5.1 (2026-11-22)**: `FakeModel(vectors=)` changed to `FakeModel.with_vectors(vectors, /, **scripts)` (the same for `AsyncFakeModel`).
+  - Reason: in the cross-repo check after 0.5.0 was released, running each host's mypy with 0.5.0 reported errors at lite-rag `testing.py:93` and lite-mem `testing.py:63`. They build the fake with `FakeModel(**{role: script})`, and mypy matches the dict's values against every keyword parameter, `vectors` included. `__init__` is restored to 0.4.0's `**scripts`; the vectors go to a classmethod that takes only positional parameters, so a role named `vectors` does not conflict either.
+  - Test: `test_embed.py::test_scripts_unpacked_from_a_dict_still_type_check`, checked with mypy (3 errors before the fix, passing after it); pytest 363 passed.
+  - Lesson: after a library changes a public signature, the cross-repo check must also run the hosts' mypy; running only pytest is not enough.
+- **0.5.0 (2026-11-21)**: `embed()` (§3.2) and Anthropic `structured()` switched to `output_config.format` (§15).
+  - Checks: ruff, ruff format and mypy all pass; pytest 362 passed; `-m ollama` 6 passed (including the equal vectors of `/v1/embeddings` and `/api/embed`).
+  - New tests went red then green, and afterwards the implementation was broken line by line to confirm the assertions fail: `encoding_format`, sorting by index, provenance across batches, clearing of chat settings, an embed role not being routable, the count check, the Anthropic request shape, `Bounded.embed`.
+  - Old tests changed on purpose: the four tests in `test_anthropic.py` that asserted the forced tool were rewritten for the new request shape.
+  - Old test deleted: `test_only_the_forced_tools_input_is_read`. That test checked "only the forced tool is read", and there is no forced tool now.
+  - `/simplify` (four passes: reuse / simplification / efficiency / altitude) accepted:
+    - embed is called through the `EmbedBackend` protocol, and `_send` now must be passed the endpoint owner (before, it was a patch parameter `owner=None`).
+    - `_route` infers the role kind from the method name.
+    - `_merged` returns directly for a single batch; the usage total uses `_total`.
+    - Vectors and inputs are no longer each copied once more.
+    - The routing alias check is kept in only one place.
+    - `target()` really clears the embed role's chat settings, so the docstring now holds.
+    - "Empty vector" is a separate check.
+    - `Bounded` / `AsyncBounded` get `embed()`, which was missing before.
+    - The `embeddings()` response construction moved to `tests/upstream.py`.
+    - `FakeReply` does not take vectors: putting them in made the `list` scripts already in hosts' tests fail type inference (mypy reported it on `test_bounded.py`). Changed to a separate `vectors=`.
+  - `/simplify` rejected:
+    - Merging the embed tests into `conftest.Caller`: it would need the embed role added to the `ROLES` of all contract tests, and the anthropic / gateway config tests would get extra embed errors.
+    - List scripts for `FakeModel`'s embed support: not used.
+    - Sending async batches in parallel: the design says batch by batch, so other batches are not wasted on failure.
+    - A `strict_schema` cache: not part of this change.
+  - Codex (`codex exec -s read-only`): both findings accepted, and a red regression test was written first for each:
+    - Sorting only by index without checking the index meant a duplicate or missing index would pair a vector with the wrong input. Now after sorting it must be exactly `0..n-1`.
+    - When the endpoint reports no usage, `output` also became `None`. An embedding has no output tokens, and it is now fixed at 0.
+    - No regression was found in the hosts' existing `text` / `structured` / `turn` / hook / `FakeModel` call paths.
 
-- **0.4.0（2026-11-21）**：`turn()`（§3.1）。检查：ruff、ruff format、mypy 干净；pytest 全绿；`-m ollama` 5 passed
-  （含一个真实的 tool 轮次，qwen3:1.7b）。新测试先红后绿；事后逐行破坏实现确认断言会失败，其中"回复 block 的顺序"
-  一处最初不红，补了交错顺序的测试。
-  - `/simplify`（reuse / simplification / efficiency / altitude 四路）：采纳——发请求的代码块抽成 `_send` /
-    `_send_async`（原来四份）；两个后端的 `_params` 自己调 `_history`，`request()` 不再另写一遍消息映射；stop 规则
-    抽成 `types.stop_for`，后端和 fake 共用；fake 的 `_reply` 由调用方传入记录列表；测试复用已有的 `Recorder` 和
-    `test_anthropic` 的配置。没采纳——`finish` / `finish_turn` 里重复的三句错误消息（两处检查顺序不同，抽出来更难读）；
-    历史里每个 call 的参数每轮重新 `json.dumps`（代价很小，改法会改变 `raw_arguments` 的含义）；LiteLLM 测试配置复用
-    （会改变断言的值）。
-  - Codex 只读 review（整个阶段的 diff）：1 High、2 Medium、1 Low。修复——Chat Completions 未知的 `finish_reason`
-    被当成正常结束（High，回归测试先红）；空的 `ToolResults` 给 Anthropic 发出内容为空的 user 消息（Medium，回归测试
-    先红）；补了历史中间 system 消息的契约测试（Low）；"逐字节"的说法改成"字段和值原样（字典往返）"。部分否决——
-    "frozen 类型里的 Mapping 可变，应在构造时深拷贝并冻结"：不做深冻结（`Provenance.via` 已是同样的做法，每轮对
-    整段历史深拷贝不值得），改为在类型注释和 §3.1 里写明只冻结一层。
-  - 留给 owner：`supports_tools` 现在五种类型都是 True，拒绝分支只有测试里打补丁才走得到（两路 review 都指出）。
-    它是批准的 plan 里的一项，保留；不需要这个扩展点就删掉。
+- **0.4.0 (2026-11-21)**: `turn()` (§3.1). Checks: ruff, ruff format and mypy clean; pytest all green; `-m ollama` 5 passed
+  (including a real tool round, qwen3:1.7b). New tests went red then green; afterwards the implementation was broken line by line to confirm the assertions fail, and the one for "order of reply blocks"
+  was not red at first, so a test of interleaved order was added.
+  - `/simplify` (four passes: reuse / simplification / efficiency / altitude): accepted — the code block that sends the request was extracted into `_send` /
+    `_send_async` (there were four copies); the `_params` of the two backends call `_history` themselves, and `request()` no longer writes the message mapping again; the stop rule
+    was extracted into `types.stop_for`, shared by the backends and the fake; the fake's `_reply` takes the record list from the caller; the tests reuse the existing `Recorder` and
+    the config of `test_anthropic`. Not accepted — the three repeated error messages in `finish` / `finish_turn` (the two places check in a different order, and extracting them would be harder to read);
+    re-running `json.dumps` on every call's arguments in the history each round (the cost is tiny, and the change would alter the meaning of `raw_arguments`); reusing the LiteLLM test config
+    (it would change the asserted values).
+  - Codex read-only review (the diff of the whole stage): 1 High, 2 Medium, 1 Low. Fixed — an unknown Chat Completions `finish_reason`
+    was treated as a normal end (High, regression test red first); an empty `ToolResults` sent Anthropic a user message with empty content (Medium, regression test
+    red first); a contract test for a system message in the middle of the history was added (Low); the wording "byte by byte" was changed to "fields and values unchanged (dict round trip)". Partly rejected —
+    "Mappings in frozen types are mutable, and should be deep-copied and frozen at construction": no deep freezing (`Provenance.via` already does the same, and deep-copying
+    the whole history every round is not worth it), and instead the type annotation and §3.1 state that only one level is frozen.
+  - Left to the owner: `supports_tools` is now True for all five types, and the rejecting branch can be reached only by patching in tests (both review passes pointed this out).
+    It was an item in the approved plan, so it is kept; delete it if this extension point is not needed.
 
-**S0（2026-11-18）环境与核实。**
-- 骨架：`pyproject.toml`（Python 3.12，uv_build；openai 3.46.0、pydantic 2.14.3、pydantic-settings 2.16.2、
-  typer 0.27.3、extra anthropic 2.6.0，与 lite-mem 相同）、ruff / mypy strict / pytest（marker `ollama`、
-  `litellm` 默认不选）、CI（检查 + `compose run --rm verify`，它也解析并插值 compose 文件）。ruff format 不管 `*.md`
-  （设计里的代码块是排过版的示意）。
-- `deploy/litellm/`：compose（`verify` → `litellm`）、config（分档全 Ollama）、`cosign.pub`、README。
-  `tests/unit/test_deploy_litellm.py` 守住这些配置和 `uv.lock` 里没有 `litellm`；每条断言都改坏对应配置看过
-  一次红。
-- curl 核实结果：§5 参数表、§6.3、§7.2、§7.3、§9 已按结果改写；细节在 `KB/global/litellm/README.md`。
-  与原设计不同的三处：（1）普通别名的响应体 `model` 是别名，实际模型取 `x-litellm-model-name` 头（§6.3）；
-  （2）`context_compaction` 默认开且对 Ollama 模型 500，配置里关掉（§7.2）；（3）端口 4000 → 4400（与 tenderted
-  冲突）。
-- KB：新建 `KB/global/litellm/README.md`；修正 `tech-selection/01b`（`enable_context_window_escalation` 默认
-  false、`classifier_fallback`、供应链一条）；`machine/ports.md` 登记 4400。
-- 收尾 review：
-  - `/simplify`（4 个角度）：LiteLLM 镜像只写一处（YAML anchor `x-litellm-image`；cosign 接受 `tag@digest`，
-    实测）；公钥改为比对 sha256 并检查挂载；loopback 检查改为"所有对外端口"；fallback 检查去掉特例；
-    删去 CI 里多余的 `compose config`、`allowed-confusables`、`restart: "no"`；§7.2 运行细节改为指向 README。
-    跳过：CI `concurrency`（规模太小）、缓存验签结果（每次启动验签正是要的保证）。
-  - Codex（只读）：1 条 P2，S0 记录写着 CI 跑 `compose config` 而 workflow 已去掉，已改记录（不加回：
-    `compose run` 本身解析整份文件）。供应链、测试、设计一致性、版本锁定四个方面无 finding。
+**S0 (2026-11-18) Environment and verification.**
+- Skeleton: `pyproject.toml` (Python 3.12, uv_build; openai 3.46.0, pydantic 2.14.3, pydantic-settings 2.16.2,
+  typer 0.27.3, extra anthropic 2.6.0, the same as lite-mem), ruff / mypy strict / pytest (markers `ollama`,
+  `litellm` not selected by default), CI (checks + `compose run --rm verify`, which also parses and interpolates the compose file). ruff format does not touch `*.md`
+  (the code blocks in the design are formatted sketches).
+- `deploy/litellm/`: compose (`verify` → `litellm`), config (all tiers Ollama), `cosign.pub`, README.
+  `tests/unit/test_deploy_litellm.py` guards these configs and that `uv.lock` has no `litellm`; every assertion was seen red once by breaking the matching
+  config.
+- curl verification results: the §5 parameter table, §6.3, §7.2, §7.3 and §9 were rewritten per the results; the details are in `KB/global/litellm/README.md`.
+  Three points differ from the original design: (1) for a plain alias the response body `model` is the alias, and the actual model is taken from the `x-litellm-model-name` header (§6.3);
+  (2) `context_compaction` is on by default and returns 500 for Ollama models, so it is turned off in the config (§7.2); (3) port 4000 → 4400 (conflict with tenderted).
+- KB: new `KB/global/litellm/README.md`; `tech-selection/01b` corrected (`enable_context_window_escalation` defaults to
+  false, `classifier_fallback`, one supply-chain item); `machine/ports.md` registers 4400.
+- Close-out review:
+  - `/simplify` (4 angles): the LiteLLM image is written in only one place (the YAML anchor `x-litellm-image`; cosign accepts `tag@digest`,
+    measured); the public key is compared by sha256 and the mount is checked; the loopback check was changed to "all published ports"; the fallback check lost its special case;
+    the redundant `compose config` in CI, `allowed-confusables` and `restart: "no"` were removed; the run details in §7.2 now point to the README.
+    Skipped: CI `concurrency` (the scale is too small), caching the signature check result (verifying at every start is exactly the guarantee wanted).
+  - Codex (read-only): 1 P2 finding: the S0 record said CI runs `compose config` while the workflow had dropped it, so the record was changed (not added back:
+    `compose run` itself parses the whole file). No findings on supply chain, tests, design consistency or version pinning.
 
-**S1（2026-11-18）核心。**
-- 模块：`errors`、`types`、`profiles`（五个 type 的参数表）、`config`（命名 backend、`target()` / `resolve()`
-  与 §4 全部启动校验）、`schema`（`strict_schema`，与 lite-mem 相同的变换）、`backends/openai_compat`（同步
-  `text` / `structured`）、`client`（`build()`）、`testing`（`FakeModel`）、`cli`（`dump-config`）。
-- 主人的决定：命名 backend（§4）。我定的：`build(http_client=...)`（§3）；`dump-config` 不跑校验；client 还没写的
-  backend type 在 `build()` 报 `ConfigError`；`max_output_tokens` 不配不发。
-- 测试：单元 + 契约 57 个，`-m ollama` 3 个（text、structured、`Truncated`，qwen3:1.7b，真实 Ollama）。
-  每个测试都见过红：对生产代码做了 45 处单点改动（关掉每条校验、改 profile 值、从配置取 `answered`、错误带上游
-  原文、不重试、`FakeModel` 各分支、关掉网络守卫……），每处至少一个测试失败；为此修了一个测不到东西的测试
-  （`dump-config` 不带 key 时没配 role），删了一个不可能失败的测试和一段死代码（`JSONDecodeError`）。
-- 收尾 review：
-  - `/simplify`（4 个角度）：role 覆盖改用 `model_copy` 合并（去掉 12 行 `_pick` 和永远不会触发的 None 检查）；
-    profile 的 temperature 默认值在 `target()` 里解析（`dump-config` 显示实际发出的值）；"后续阶段的 backend"
-    检查并进 `resolve()`，与其他问题一次列出；`Target.where` 统一错误定位（规则 8）；profile 表改用关键字参数；
-    `_Model` 一个 dict；后端改用 `with_raw_response`，来源和用量在 `_read(target, response, headers)` 里读——S3
-    读响应头只改这一处；测试共用双厂商配置，重试测试带 `retry-after-ms: 1`（套件 1.5 s → 0.5 s）。
-    跳过：失败调用带用量（S4 验收项，留给 S4 连同测试）、按 `protocol` 分发和异步 `FakeModel`（S2）、
-    `strict_schema` 缓存（返回可变 dict，收益是微秒级）。改完重跑 44 处变异，全部被抓住。
-  - Codex（只读）3 条：
-    - P2 空字符串被 `or` 读成默认值：成立（后果不是 Codex 说的绕过 key 检查——`""` 回落到 `OPENAI_API_KEY` 仍被
-      检查——而是"无 key"的意图被悄悄改写）。回归测试先红，修为不接受空字符串。
-    - P2 `temperature` 不限范围：成立，回归测试先红，修为 0–2。
-    - P1 gateway 的 `reasoning_effort` 应由 `X-LLMGW-Ignored-Params` 报 `IgnoredParameter`：**拒绝（属于 S3）**。
-      llm-gateway 修好前在配置时拒绝正是 §5、§15 的要求；gateway 后端 S1 不可用；响应头检查是 S3 验收项。
-  - 待定（未改）：`type: openai` 的 endpoint 没法声明"不需要 key"（本地 vLLM 一类）。真有宿主需要时再加。
+**S1 (2026-11-18) Core.**
+- Modules: `errors`, `types`, `profiles` (the parameter table of five types), `config` (named backends, `target()` / `resolve()`
+  and all the §4 startup validation), `schema` (`strict_schema`, the same transformation as lite-mem), `backends/openai_compat` (sync
+  `text` / `structured`), `client` (`build()`), `testing` (`FakeModel`), `cli` (`dump-config`).
+- The owner's decision: named backends (§4). What I decided: `build(http_client=...)` (§3); `dump-config` does not run validation; a backend type that the client has not written yet
+  raises `ConfigError` in `build()`; `max_output_tokens` is not sent when not configured.
+- Tests: 57 unit + contract tests, 3 `-m ollama` (text, structured, `Truncated`, qwen3:1.7b, real Ollama).
+  Every test was seen red: 45 single-point changes were made to the production code (turning off each validation, changing profile values, taking `answered` from the config, errors carrying upstream
+  text, no retry, each branch of `FakeModel`, turning off the network guard, ...), and at least one test failed for each; for this a test that tested nothing was fixed
+  (`dump-config` had no role configured when no key was given), and a test that could never fail and a piece of dead code (`JSONDecodeError`) were deleted.
+- Close-out review:
+  - `/simplify` (4 angles): role overrides were changed to merge with `model_copy` (removing 12 lines of `_pick` and a None check that could never trigger);
+    the profile's temperature default is resolved in `target()` (`dump-config` shows the value actually sent); the "backend of a later stage"
+    check was merged into `resolve()`, listed at once with the other problems; `Target.where` unifies error location (rule 8); the profile table uses keyword arguments;
+    one dict for `_Model`; the backend switched to `with_raw_response`, and provenance and usage are read in `_read(target, response, headers)` — S3
+    reading response headers changes only this one place; the tests share the two-vendor config, and the retry test carries `retry-after-ms: 1` (suite 1.5 s → 0.5 s).
+    Skipped: usage on failed calls (an S4 acceptance item, left to S4 together with its tests), dispatch by `protocol` and the async `FakeModel` (S2), a
+    `strict_schema` cache (it returns a mutable dict, and the gain is microseconds). After the changes the 44 mutations were re-run, and all were caught.
+  - Codex (read-only) 3 findings:
+    - P2 an empty string is read as the default by `or`: valid (the consequence is not what Codex said, bypassing the key check — `""` falling back to `OPENAI_API_KEY` is still
+      checked — but that the intent of "no key" is silently rewritten). The regression test went red first, and the fix is to not accept empty strings.
+    - P2 `temperature` has no range limit: valid, the regression test went red first, and the fix limits it to 0–2.
+    - P1 the gateway's `reasoning_effort` should raise `IgnoredParameter` from `X-LLMGW-Ignored-Params`: **rejected (belongs to S3)**.
+      Until llm-gateway is fixed, rejecting it at config time is exactly what §5 and §15 require; the gateway backend is not usable in S1; the response header check is an S3 acceptance item.
+  - Undecided (not changed): an endpoint of `type: openai` cannot declare "needs no key" (something like a local vLLM). To be added when a host really needs it.
+**S2 (2026-11-18) Anthropic and async.**
+- Structure: one module per protocol (`openai_compat`, `anthropic_messages`), with only the `request()` / `reply()` that do not touch the network,
+  plus `connect` / `connect_async` / `endpoint`; the shared provenance and error judgment are in `backends/__init__.py` (`provenance`,
+  `finish`); `client.py` has only one sync executor and one async executor, looking up by `profile.protocol` in a table. `build_async()`,
+  `AsyncModel`, `AsyncFakeModel`.
+- The Anthropic request body is the same as what lite-mem / lite-rag send now (§5). The owner's decision: `anthropic` must be configured with `max_output_tokens`.
+  A new startup check: an `anthropic` `base_url` must not end in `/v1` (found while writing tests: giving the same URL to both vendors' SDKs would request
+  `/v1/v1/messages`). SDK clients are shared by (type, endpoint, key variable, timeout, retries), not across protocols.
+- SDK measurements (recorded in `KB/global/llm-evals/providers/`): anthropic 2.6.0 sends the key with `authorization: Bearer`, with no
+  `x-api-key`; anthropic's async `raw.parse()` is a coroutine and openai's is not (`inspect.isawaitable` in the executor);
+  anyio's async transport connects inside a TaskGroup, so the network guard's error is wrapped in an `ExceptionGroup` (the tests unwrap it).
+- Tests: 115 unit + contract tests (the contract tests run once sync and once async), 4 `-m ollama` (one async structured added).
+  Anthropic has only contract tests (a paid API, AGENTS.md rule 11). Mutations: 21 in the new S2 code and the 44 of S1 (re-pointed after the refactor)
+  were all caught.
+- Close-out review (S2):
+  - `/simplify` (4 angles): building the request was moved outside `try` (local errors are no longer wrapped into `CallFailed`); the two backends share
+    `sdk_client()` (both vendors' SDK `Timeout` is `httpx2.Timeout`); `finish()` takes `answered` and builds the provenance itself;
+    anthropic's two checks go by `profile.protocol` instead of `type`; the tests' `Caller` lost its branches, and `Connect` is a typed
+    Protocol; `_causes` was replaced by `traceback.format_exception`. Skipped: a `strict_schema` cache (microseconds, and it would share a mutable
+    dict), a `_Routes` base class (harmless), splitting the executor for S4's hook (to be split in S4). After the changes 65 mutations were all caught.
+  - Codex (read-only) 3 findings:
+    - High: only `max_tokens` counted as truncation, the partial text of `refusal` / `pause_turn` was treated as a successful reply,
+      and `model_context_window_exceeded` did not count as truncation. Valid, and the same gap exists on the OpenAI side with `content_filter`. The regression tests went red first
+      (14 of them), and the fix: `model_context_window_exceeded` is added to the truncation set; a stop_reason outside the complete set, and OpenAI's
+      `content_filter`, report `EmptyReply("no usable reply (stop reason …)")` (carrying only the enum value, not the upstream text). No new
+      exception class was added (the public API is unchanged).
+    - Medium: a structured reply took the first `tool_use` without looking at the name. Valid; only the forced tool is read; the regression test went red first.
+    - Medium: the SDK client should be shared by the key's value and not the variable name. **Rejected**: by variable name is intentional (no secret value goes into the sharing key); the gain
+      is only one fewer client built when "two variables hold the same key". "key" in the record was changed to "key variable".
 
-**S2（2026-11-18）Anthropic 与异步。**
-- 结构：每个协议一个模块（`openai_compat`、`anthropic_messages`），只有不碰网络的 `request()` / `reply()`
-  加 `connect` / `connect_async` / `endpoint`；共用的来源和错误判定在 `backends/__init__.py`（`provenance`、
-  `finish`）；`client.py` 只有一个同步执行器和一个异步执行器，按 `profile.protocol` 查表。`build_async()`、
-  `AsyncModel`、`AsyncFakeModel`。
-- Anthropic 请求体与 lite-mem / lite-rag 现在的相同（§5）。主人的决定：`anthropic` 必须配 `max_output_tokens`。
-  新的启动检查：`anthropic` 的 `base_url` 不能以 `/v1` 结尾（写测试时发现：同一个 URL 给两家 SDK 用会请求
-  `/v1/v1/messages`）。SDK client 按 (type, endpoint, key 变量, 超时, 重试) 共享，不跨协议。
-- SDK 实测（记进 `KB/global/llm-evals/providers/`）：anthropic 2.6.0 用 `authorization: Bearer` 发 key，没有
-  `x-api-key`；anthropic 的异步 `raw.parse()` 是协程，openai 的不是（执行器里 `inspect.isawaitable`）；
-  anyio 的异步 transport 在 TaskGroup 里连接，网络守卫的错误包在 `ExceptionGroup` 里（测试会展开它）。
-- 测试：单元 + 契约 115 个（契约测试同步、异步各一遍），`-m ollama` 4 个（新增一个异步 structured）。
-  Anthropic 只有契约测试（付费 API，AGENTS.md 规则 11）。变异：S2 新代码 21 处、S1 的 44 处（重构后重新
-  指向）全部被抓住。
-- 收尾 review（S2）：
-  - `/simplify`（4 个角度）：构造请求移到 `try` 外（本地错误不再被包成 `CallFailed`）；两个后端共用
-    `sdk_client()`（两家 SDK 的 `Timeout` 都是 `httpx2.Timeout`）；`finish()` 收 `answered`，自己建来源；
-    anthropic 的两条检查按 `profile.protocol` 而非 `type`；测试的 `Caller` 去掉分支，`Connect` 是有类型的
-    Protocol；`_causes` 换成 `traceback.format_exception`。跳过：`strict_schema` 缓存（微秒级，且会共享可变
-    dict）、`_Routes` 基类（无害）、为 S4 hook 拆执行器（S4 再拆）。改后 65 处变异全部被抓住。
-  - Codex（只读）3 条：
-    - High：只有 `max_tokens` 算截断，`refusal` / `pause_turn` 的部分文字被当成功回复，
-      `model_context_window_exceeded` 不算截断。成立，而且 OpenAI 侧 `content_filter` 同样的缺口。回归测试先红
-      （14 个），修为：截断集合加 `model_context_window_exceeded`；完整集合以外的 stop_reason 和 OpenAI 的
-      `content_filter` 报 `EmptyReply("no usable reply (stop reason …)")`（只带枚举值，不带上游文字）。没有加新的
-      异常类（公共 API 不变）。
-    - Medium：结构化回复取第一个 `tool_use`，不看名字。成立，只读被强制的那个工具；回归测试先红。
-    - Medium：SDK client 应按 key 的值共享而不是变量名。**拒绝**：按变量名是有意的（共享键里不放密钥值）；收益
-      只是"两个变量存了同一个 key"时少建一个 client。记录里的"key"改为"key 变量"。
+**S3 (2026-11-18) gateway and litellm.**
+- The two types use the same OpenAI-compatible module, and the differences are all `BackendProfile` data (the §5 table): `answered_header`,
+  `via_headers`, `ignored_params_header`, `request_headers`, `role_tag`. The owner's decision: `Provenance` gets `via`.
+- Provenance: §6.2, §6.3 (litellm reads headers and raises `ProvenanceUnknown` when it cannot get them; gateway reads the profile name, and a routing alias is rejected at build).
+  `IgnoredParameter` applies only to fields lite-model actually sent. Every litellm request carries `x-litellm-num-retries: 0` and
+  `metadata.tags: ["role:<role>"]`. The S1 gate "only available in a later stage" was removed (the corresponding tests were replaced by two: "can build" and "a routing alias
+  on the gateway is rejected" — that gate was only temporary anyway).
+- Tests: 156 unit + contract tests; 4 `-m ollama`; 3 `-m litellm` (local proxy, Ollama alias, `channel: local`).
+  The expectation of one live test was changed: the router sent "新西兰最大城市" (the largest city in New Zealand) to qwen3:1.7b, which answered Wellington — the test measures the path and not the model's
+  knowledge, so it was changed to an arithmetic question. Mutations: 15 in S3, 43 in S1, 21 in S2 were all caught.
+- Close-out review:
+  - `/simplify` (4 angles): the three response-header rules (read answered, record `via`, `IgnoredParameter`) moved from `openai_compat` into the
+    protocol-independent `finish()`, and use the same parameter-table data as the startup checks (otherwise an anthropic-protocol
+    profile configured with `answered_header` would let routing through and then record the alias on the reply); `reply()` receives the request actually sent, and `IgnoredParameter` checks against it (no longer recomputing
+    "what was sent", nor computing `strict_schema` again; S4's hook needs it too); the header names in the parameter table are all lower-case; the live tests read
+    `.env` with `python-dotenv`. Skipped: moving the test config factories into `tests/configs.py` (only one file uses them).
+  - Codex (read-only):
+    - P1 for a plain alias, when the value of `x-litellm-model-name` is the alias itself it was also taken as the actual model: valid, the regression test went red first, and it now raises
+      `ProvenanceUnknown`; the cost is that in the proxy config an alias must not have the same name as its model string, and a deployment test was added to guard it (§6.3).
+    - P2 looking up the header depends on the SDK's case-insensitive mapping: valid (actual runs are not affected), `finish()` now lower-cases the header names first, and the unit test with a
+      plain dict went red first.
+    - Docs: §8's `ProvenanceUnknown` mentioned only routed calls, and it now covers any litellm call.
+  - Ollama stopped during the close-out (not stopped by lite-model); after the owner agreed it was restarted with `brew services run ollama`, and the re-run:
+    `-m ollama` 4 and `-m litellm` 3 passed; the 5 live mutations (with Ollama stopped they only fail to connect, which does not count) were all caught by the matching
+    assertions.
 
-**S3（2026-11-18）gateway 与 litellm。**
-- 两个 type 用同一个 OpenAI-compatible 模块，差异全是 `BackendProfile` 数据（§5 表）：`answered_header`、
-  `via_headers`、`ignored_params_header`、`request_headers`、`role_tag`。主人的决定：`Provenance` 加 `via`。
-- 来源：§6.2、§6.3（litellm 读头、拿不到抛 `ProvenanceUnknown`；gateway 读 profile 名，路由别名在 build 拒绝）。
-  `IgnoredParameter` 只对 lite-model 实际发出的字段。每个 litellm 请求带 `x-litellm-num-retries: 0` 和
-  `metadata.tags: ["role:<role>"]`。去掉了 S1 的"后续阶段才有"关卡（对应的测试换成"能 build"和"gateway
-  上的路由别名被拒"两条——那个关卡本来就是临时的）。
-- 测试：单元 + 契约 156 个；`-m ollama` 4 个；`-m litellm` 3 个（本机 proxy，Ollama 别名，`channel: local`）。
-  一个 live 测试的期望改过：路由器把"新西兰最大城市"分给 qwen3:1.7b，它答 Wellington——测的是路径不是模型
-  知识，改为算术题。变异：S3 15 处、S1 43 处、S2 21 处全部被抓住。
-- 收尾 review：
-  - `/simplify`（4 个角度）：三条响应头规则（读 answered、记 `via`、`IgnoredParameter`）从 `openai_compat` 移进
-    与协议无关的 `finish()`，和启动检查用同一份参数表数据（否则一个配了 `answered_header` 的 anthropic 协议
-    profile 会放行路由、回复时却记别名）；`reply()` 收到实际发出的请求，`IgnoredParameter` 对照它（不再重算
-    一遍"发了什么"，也不再重复算 `strict_schema`；S4 的 hook 也要它）；参数表里的头名全小写；live 测试读
-    `.env` 用 `python-dotenv`。跳过：测试配置工厂挪进 `tests/configs.py`（只有一个文件用）。
-  - Codex（只读）：
-    - P1 普通别名时，`x-litellm-model-name` 的值就是别名本身也被当作实际模型：成立，回归测试先红，改为抛
-      `ProvenanceUnknown`；代价是 proxy 配置里别名不能与它的模型串同名，加了部署测试守着（§6.3）。
-    - P2 查头依赖 SDK 的大小写不敏感映射：成立（实际运行不受影响），`finish()` 先把头名转小写，单元测试用
-      普通 dict 先红。
-    - 文档：§8 的 `ProvenanceUnknown` 只写了路由调用，改为包括任何 litellm 调用。
-  - Ollama 在收尾期间停了（不是 lite-model 停的）；主人同意后用 `brew services run ollama` 重新启动，重跑：
-    `-m ollama` 4 个、`-m litellm` 3 个通过；5 条 live 变异（Ollama 停着时只是连接失败，不算数）全部被对应的
-    断言抓住。
+**S4 (2026-11-18) Usage, cost, concurrency, hooks.**
+- Usage: the exceptions for rejected answers all carry `usage` (including cost), and `CallFailed` has `None`. Cost: the cost header the endpoint reports > `prices` (by the model that actually
+  answered) > `None`; subscription is `None`. `Price`, `ModelsConfig.prices`, `BackendProfile.cost_header`.
+- `Bounded` / `AsyncBounded`; `hooks.py` (`Call`, `Hook`, `Hooks`, `Registration`); `LiteModel` /
+  `AsyncLiteModel`; the reply gets `cached` (the owner's decision: put it on the reply).
+- Tests: 202 unit + contract tests, 4 `-m ollama`, 3 `-m litellm`. While writing tests one test that tested nothing was found:
+  `Bounded`'s concurrency limit was tested only through `map()`, and the thread pool of `map()` itself has only `concurrency` threads, so it passed even with the semaphore removed; a test with
+  8 external threads sharing one `Bounded` was added. Mutations: 20 in S4, and 43 in S1, 21 in S2, 18 in S3 (after re-pointing) were all caught.
+- Close-out review:
+  - `/simplify` (4 angles): a hook returning a reply of the wrong type raises `TypeError` (a `cast` would have hidden the error until much later);
+    `schema_hash` uses the same rules as lite-eval's `canonical.py` (NFC, `ensure_ascii=False`, `allow_nan=False`),
+    copied and not imported (rule 9), with the test checking against the written-out lite-eval algorithm; `Hooks` lost the `__iter__` / `__len__` that had no basis in the design
+    (the test now asserts the `KeyError` of `hooks[name]`), and `Registration` goes through `Hooks._remove`; the triple of `_before` in the executor was split into
+    `call = ... if hooks else None` plus `_hit()`; `_awaited` was removed (the function of `map` is a coroutine); `_number` was
+    simplified. Another test that tested nothing was found: with `concurrency=1`, `map()` is a plain loop and "one at a time" always holds — changed to 8 external
+    threads, parameterized with 1 and 2 slots. Skipped: a hook snapshot, a `Call.params` cache, a shared thread pool (all microseconds). Recorded in §15:
+    `Call` lacks lite-cache's scope / policy; a hit also takes a `Bounded` slot. §9 states that the `usage` of a hit is what was saved.
+  - Codex (read-only) 5 findings:
+    - High: `Call.request` is the very dict later sent to the SDK, so a hook that changes it can make the cache key differ from the actual request. Valid, the regression test
+      went red first; a hook now gets a read-only deep copy (copied only when there is a hook).
+    - High: when a hook's reply type is wrong, the `TypeError` used `hit!r`, which would include the reply content (rule 8). Valid, red first; only the type name is written.
+    - Medium: `Price` accepts `inf`, and the product can overflow to `inf`. Valid, red first; `allow_inf_nan=False`, and a non-finite result is recorded as `None`.
+    - Medium: when `after()` raises, or reply parsing raises a non-`ModelError`, `usage` is lost. **Rejected**: by design a hook's exception is raised as it is, and attaching an attribute to an arbitrary
+      exception is not clean; `after` should not raise, which is written into §10. A shape error in reply parsing is guaranteed by the SDK's types.
+    - Medium: `Call` lacks scope / policy. **Already in §15**, to be decided when lite-cache is connected.
+  - After the changes 112 mutations (S4 30, S1 43, S2 21, S3 18) were all caught; `-m ollama` 4 and `-m litellm` 3 passed.
 
-**S4（2026-11-18）用量、成本、并发、hook。**
-- 用量：答案被拒的异常都带 `usage`（含成本），`CallFailed` 为 `None`。成本：端点报的成本头 > `prices`（按实际
-  回答的模型）> `None`；订阅为 `None`。`Price`、`ModelsConfig.prices`、`BackendProfile.cost_header`。
-- `Bounded` / `AsyncBounded`；`hooks.py`（`Call`、`Hook`、`Hooks`、`Registration`）；`LiteModel` /
-  `AsyncLiteModel`；回复加 `cached`（主人的决定：放回复上）。
-- 测试：单元 + 契约 202 个，`-m ollama` 4 个、`-m litellm` 3 个。写测试时发现一个测不到东西的测试：
-  `Bounded` 的并发上限只经 `map()` 测，而 `map()` 的线程池本身就只有 `concurrency` 个线程，去掉信号量也过；加了
-  8 个外部线程共用一个 `Bounded` 的测试。变异：S4 20 处，S1 43、S2 21、S3 18 处（重新指向后）全部被抓住。
-- 收尾 review：
-  - `/simplify`（4 个角度）：hook 返回的回复类型不对时抛 `TypeError`（`cast` 本会把错藏到很后面）；
-    `schema_hash` 改用与 lite-eval `canonical.py` 相同的规则（NFC、`ensure_ascii=False`、`allow_nan=False`），
-    照抄不 import（规则 9），测试对照写出的 lite-eval 算法；`Hooks` 去掉没有设计依据的 `__iter__` / `__len__`
-    （测试改为断言 `hooks[name]` 的 `KeyError`），`Registration` 走 `Hooks._remove`；执行器里 `_before` 的
-    三元组拆成 `call = ... if hooks else None` 加 `_hit()`；去掉 `_awaited`（`map` 的函数是协程）；`_number`
-    简化。又发现一个测不到东西的测试：`concurrency=1` 时 `map()` 是普通循环，"一次一个"永远成立——改为外部
-    8 线程，参数化 1 和 2 个槽位。跳过：hook 快照、`Call.params` 缓存、共享线程池（都是微秒级）。记进 §15：
-    `Call` 缺 lite-cache 的 scope / policy；命中也占 `Bounded` 槽位。§9 写明命中的 `usage` 是省下的。
-  - Codex（只读）5 条：
-    - High：`Call.request` 就是随后发给 SDK 的那个 dict，hook 改它就能让缓存键和实际请求不一致。成立，回归测试
-      先红；hook 拿到只读深拷贝（只在有 hook 时拷贝）。
-    - High：hook 回复类型不对时 `TypeError` 用了 `hit!r`，会带上回复内容（规则 8）。成立，先红；只写类型名。
-    - Medium：`Price` 接受 `inf`、乘积可能溢出成 `inf`。成立，先红；`allow_inf_nan=False`，非有限的结果记 `None`。
-    - Medium：`after()` 抛错或回复解析抛非 `ModelError` 时丢了 `usage`。**拒绝**：hook 异常按设计原样抛出，给任意
-      异常挂属性不干净；`after` 不应抛错，写进 §10。回复解析的形状错误由 SDK 的类型保证。
-    - Medium：`Call` 缺 scope / policy。**已在 §15**，lite-cache 接入时定。
-  - 改后变异 112 处（S4 30、S1 43、S2 21、S3 18）全部被抓住；`-m ollama` 4、`-m litellm` 3 通过。
+**S5 (2026-11-18) Release and whole-library close-out.**
+- Packaging: version `0.1.0`; `license-files = ["LICENSE"]` (the packaging test went red first: both the wheel and the sdist lacked the LICENSE text);
+  `tests/unit/test_packaging.py` checks the LICENSE, `License-Expression`, `py.typed`, the `litemodel` entry point, that `testing.py`
+  is present and `tests/` is not. CI: actions are pinned by commit (the same set as lite-eval); the `package` job builds, checks that the tag version
+  matches the wheel, and in a clean venv installs the wheel and `wheel[anthropic]` and runs `dump-config` and `scripts/smoke.py`; the `release` job runs only on
+  `v*` tags, is the only one with `contents: write`, and publishes the very artifact the `package` job built and tested (the owner chose CI release by tag).
+- The README is written in full (install, quick start, config, backend table, provenance, routing, errors, usage, concurrency, hooks, testing hosts);
+  `tests/unit/test_readme.py` makes the README's config example and quick start follow the code (during mutation it was found not to test the default backend, and that was added).
+- Whole-library close-out (the scope is all the code since `f13239a`, not only S5):
+  - `/simplify` (4 angles) settled the public API before release (two decisions by the owner, see the decision log): `call_context()` passes per-call
+    values to the hook (the `Model` protocol gets no parameter); `ModelsConfig.backend` / `model` are required. Also: `LiteModel.target(role)`;
+    top-level exports were narrowed (hook types are imported from `lite_model.hooks`, and `Reply` and `call_context` are public); `Reply` is defined in only one place
+    (the one in `testing` was renamed `FakeReply`); the two sets of "transport fields" were merged into one; `Call.role` comes from the target; anthropic's two
+    checks became parameter-table fields (`extra`, `base_url_is_root`); comments in the code that refer to review rounds were deleted; §6.1 states how lite-mem's
+    `provider:model` format is kept (the backend is named `openai` with `type: ollama`, with a test). The CLI reports a clear
+    error instead of a traceback when backend / model is missing. Skipped: import time, a `strict_schema` cache, building twice in CI (all milliseconds or parallel).
+  - Codex (read-only, whole library) 2 findings:
+    - Medium: an unknown anthropic `stop_reason` went as it was into the message of `EmptyReply` (rule 8). Valid, red first; only the known
+      `refusal` / `pause_turn` are written, and the rest are written as `unexpected`.
+    - Medium: the packaging test runs `uv build` in a subprocess, which the network guard cannot see. Valid, changed to `uv build --offline` (the build backend
+      is already in the cache after `uv sync`). This one has no test that went red first: this machine's cache has `uv_build`, so it would pass even without `--offline`;
+      what `--offline` guarantees is failing when the cache is missing, rather than going online.
+    - The status in the first line of the design was outdated: changed. No other findings on supply chain, provenance, secrets, the public API, the release process or the host migration path.
+- Checks: 226 unit + contract tests, 4 `-m ollama`, 3 `-m litellm`; 136 mutations (S1 43, S2 21, S3 18, S4 30,
+  S5 13+2, including 5 live ones, with Ollama online) were all caught.
+- Release: when `main` was first pushed (`131c850`) the CI `package` job failed — its `dump-config` smoke step was written before
+  backend / model became required, and was run locally at that time; the two variables were added (`767473d`), the CI packaging steps were re-run locally from a clean `env -i` environment
+  before pushing again, and CI was all green (the lesson was recorded in the KB). Then the tag `v0.1.0` was pushed: all four jobs of CI on the tag passed, and `release` published
+  `lite_model-0.1.0-py3-none-any.whl` and `lite_model-0.1.0.tar.gz`
+  (https://github.com/ArthurGao/lite-model/releases/tag/v0.1.0).
+- Acceptance "a host can install from the wheel": a new project points `[tool.uv.sources]` at the release wheel URL and installs
+  `lite-model[anthropic]` (lite-model 0.1.0, openai 3.46.0, anthropic 2.6.0); against the local Ollama: `text` returned `pong`,
+  the provenance was `ollama:qwen3:1.7b`, with usage; `structured` through `build_async` + `call_context` returned `result=42`.
 
-**S5（2026-11-18）发布与整库收尾。**
-- 打包：版本 `0.1.0`；`license-files = ["LICENSE"]`（打包测试先红：wheel 和 sdist 都缺 LICENSE 原文）；
-  `tests/unit/test_packaging.py` 检查 LICENSE、`License-Expression`、`py.typed`、`litemodel` 入口、`testing.py`
-  在、`tests/` 不在。CI：action 按 commit 锁定（与 lite-eval 同一组）；`package` 任务构建、tag 版本与 wheel
-  一致、干净 venv 里装 wheel 和 `wheel[anthropic]` 跑 `dump-config` 与 `scripts/smoke.py`；`release` 任务只在
-  `v*` tag 上、只有它有 `contents: write`，发布 `package` 任务构建并测过的那一份（主人选择 CI 按 tag 发布）。
-- README 写全（安装、快速上手、配置、后端表、来源、路由、错误、用量、并发、hook、测试宿主）；
-  `tests/unit/test_readme.py` 让 README 的配置示例和快速上手跟着代码走（变异时发现它没测默认 backend，补上）。
-- 整库收尾（范围是 `f13239a` 以来的全部代码，不只 S5）：
-  - `/simplify`（4 个角度）定了发布前的公共 API（主人的两个决定，见决定记录）：`call_context()` 传每次调用的
-    值给 hook（`Model` 协议不加参数）；`ModelsConfig.backend` / `model` 必填。另外：`LiteModel.target(role)`；
-    顶层导出收窄（hook 类型从 `lite_model.hooks` 导入，`Reply`、`call_context` 公开）；`Reply` 只定义一处
-    （`testing` 里的改名 `FakeReply`）；两份"传输字段"集合合成一份；`Call.role` 取自 target；anthropic 的两条
-    检查改为参数表字段（`extra`、`base_url_is_root`）；删去代码里引用 review 轮次的注释；§6.1 写明 lite-mem 的
-    `provider:model` 格式怎么保持（backend 起名 `openai`、`type: ollama`，有测试）。CLI 缺 backend / model 时报清楚
-    的错而不是 traceback。跳过：导入耗时、`strict_schema` 缓存、CI 里构建两次（都是毫秒级或并行）。
-  - Codex（只读，整库）2 条：
-    - Medium：未知的 anthropic `stop_reason` 原样进了 `EmptyReply` 的消息（规则 8）。成立，先红；只写已知的
-      `refusal` / `pause_turn`，其余写 `unexpected`。
-    - Medium：打包测试在子进程里 `uv build`，网络守卫看不到子进程。成立，改为 `uv build --offline`（构建后端
-      在 `uv sync` 后已在缓存）。这一条没有先红的测试：本机缓存里有 `uv_build`，去掉 `--offline` 也会通过；
-      `--offline` 保证的是缓存缺失时失败而不是联网。
-    - 设计首行状态过期：已改。供应链、来源、密钥、公共 API、发布流程、宿主迁移路径其余均无 finding。
-- 检查：单元 + 契约 226 个，`-m ollama` 4 个，`-m litellm` 3 个；变异 136 处（S1 43、S2 21、S3 18、S4 30、
-  S5 13+2，含 live 5 处，Ollama 在线）全部被抓住。
-- 发布：第一次推 main（`131c850`）时 CI 的 `package` 任务失败——它的 `dump-config` 冒烟步骤是在
-  backend / model 改为必填之前写的、本机也是那时跑的；补上两个变量（`767473d`），本机从 `env -i` 的干净环境重跑
-  CI 的打包步骤后再推，CI 全绿（教训记进 KB）。然后推 tag `v0.1.0`：tag 上的 CI 四个任务全过，`release` 发布了
-  `lite_model-0.1.0-py3-none-any.whl` 和 `lite_model-0.1.0.tar.gz`
-  （https://github.com/ArthurGao/lite-model/releases/tag/v0.1.0）。
-- 验收"宿主可以从 wheel 安装"：一个新项目用 `[tool.uv.sources]` 指向 release 的 wheel URL，装
-  `lite-model[anthropic]`（lite-model 0.1.0、openai 3.46.0、anthropic 2.6.0），对本机 Ollama：`text` 回 `pong`，
-  来源 `ollama:qwen3:1.7b`，有用量；`build_async` + `call_context` 的 `structured` 回 `result=42`。
+**0.1.1 (2026-11-18) `keyless` backend.** Needed by the lite-mem migration (its S12): it now connects to Ollama with the OpenAI protocol, sends no temperature
+and needs no key; `type: ollama` would additionally send `temperature: 0.0`, and `type: openai` needs `OPENAI_API_KEY`. The owner chose to add `BackendConfig.keyless`
+(rather than accept a change in the request body). Tests went red first (config parsing, a request with the placeholder key and no temperature sent, the conflict with `api_key_env`), and both mutations were caught.
+About 12 lines of production code in one file: under the global rules this is a small change, so no `/simplify` or Codex close-out was done.
 
-**0.1.1（2026-11-18）`keyless` backend。** lite-mem 迁移（它的 S12）需要：它现在用 OpenAI 协议连 Ollama，不发 temperature、
-不要 key；`type: ollama` 会多发 `temperature: 0.0`，`type: openai` 要 `OPENAI_API_KEY`。主人选择加 `BackendConfig.keyless`
-（而不是接受请求体变化）。测试先红（配置解析、占位 key 和不发 temperature 的请求、与 `api_key_env` 冲突），变异 2 处都被抓住。
-生产代码约 12 行、一个文件：按全局规则这是小改动，不做 `/simplify` 和 Codex 收尾。
+**0.2.1 (2026-11-19) The source of the key is one choice.** When lite-mem switched to 0.2.0 `host_backends` it was found that: the host's `openai` is keyless, and when the config writes only
+`api_key_env` the two stack, and startup reports "keyless and api_key_env cannot both be set". Now when stacking, if the config writes `api_key_env` or
+`keyless` the host's two are removed; writing both in the same entry still raises an error. The tests went red first; about 6 lines of production code in one file, and under the global rules no close-out was done.
 
-**0.2.1（2026-11-19）key 的来源是一个选择。** lite-mem 改用 0.2.0 `host_backends` 时发现：宿主的 `openai` 是 keyless，配置只写
-`api_key_env` 时两者叠在一起，启动报 "keyless and api_key_env cannot both be set"。现在叠加时，配置写了 `api_key_env` 或
-`keyless` 就去掉宿主的这两个；同一个条目里两个都写仍然报错。测试先红；生产代码约 6 行、一个文件，按全局规则不做收尾。
+## 15. Open questions
 
-## 15. 待确认
+- **`turn()` and hooks** (0.4.0): it does not go through hooks now. When a host wants to cache or observe an agent's rounds, extend the `Hook` protocol then.
+- **Reasoning content of Chat Completions endpoints** (0.4.0): Ollama, DeepSeek and others return thinking content in non-standard fields, and some require it
+  to be passed back between tool rounds. 0.4.0 neither collects nor passes it back (these backends produce no `Opaque`); when connecting such a model for an agent, it must first be verified and added.
+- ~~**The Anthropic backend's `structured()` uses a forced tool**~~: 0.5.0 switched to `output_config.format` (json_schema, with the schema still the
+  strict schema; the reply is read from the JSON made of the joined text blocks). Reason: the Claude API reference states that on Opus 5.5, Sonnet 5.5, Fable 5.1 and later
+  models a forced `tool_choice` is a 400; structured output works on all current models (including the 4.6 series). The hosts' Anthropic structured request bodies therefore
+  change (lite-mem `tests/unit/test_llm_requests.py` was changed to follow). Only contract tests, not verified on a real endpoint (paid APIs are not called).
+- **400 for preserved thinking** (§3.1): it currently lands in `CallFailed`, and the caller cannot tell it apart from other failures. Add a dedicated error when needed.
 
-- **`turn()` 与 hook**（0.4.0）：现在不经过 hook。有宿主要缓存或观测 agent 的轮次时，再扩 `Hook` 协议。
-- **Chat Completions 端点的 reasoning 内容**（0.4.0）：Ollama、DeepSeek 等在非标准字段里返回思考内容，有的要求
-  在 tool 轮次之间传回。0.4.0 不采集、不回传（这些后端不产生 `Opaque`）；接入这样的模型做 agent 时要先核实并补上。
-- ~~**Anthropic 后端的 `structured()` 用强制 tool**~~：0.5.0 改用 `output_config.format`（json_schema，schema 仍是
-  strict schema；回复读 text block 拼成的 JSON）。原因：Claude API 参考写明 Opus 5.5、Sonnet 5.5、Fable 5.1 及之后的
-  模型上强制 `tool_choice` 是 400；结构化输出在当前所有模型（含 4.6 系列）上可用。宿主的 Anthropic 结构化请求体因此
-  改变（lite-mem `tests/unit/test_llm_requests.py` 跟着改）。只有契约测试，未在真实端点上验证（不调用付费 API）。
-- **preserved thinking 的 400**（§3.1）：现在落在 `CallFailed` 里，调用方分不出它和别的失败。需要时加一种专门的错误。
+- **Two changes to llm-gateway** (made in the llm-gateway repo, not in this repo):
+  1. `reasoning_effort` pass-through (currently dropped; the `"none"` set by lite-rag graph and lite-mem eval does not take effect through the gateway,
+     and results produced through the gateway actually have thinking on).
+  2. Pass-through of the actual upstream model (a suggested response header `X-LLMGW-Upstream-Model`, with the response body `model` unchanged).
+  Until then, lite-model for the gateway backend: rejects a configured `reasoning_effort` (§5), and rejects gateway + a routing alias (§6.2).
+- Whether embedding is brought in in v2 (lite-rag and lite-mem each have an httpx2 embedding client). An embedding is tied to the index
+  and is never routed.
+- ~~Whether the lite-eval judge migrates later~~: decided by the owner on 2026-11-21, no migration. The judge is a measuring instrument and stays on a direct connection, written as an explicit
+  exception of the workspace (lite-eval design §9, lite-eval AGENTS.md rule 9).
+- ~~Hooks have only `before` / `after`, and failed calls do not go through hooks~~: decided on 2026-11-19, no `failed()` is added. lite-cache plugs in as a hook instead,
+  does not count failed calls, and `skip:<reason>` comes only from its own `accept` predicate (lite-cache design §0, §3.4).
+- ~~`Call` lacks lite-cache's scope / policy~~: S5 settled it as `call_context()` (§10). lite-cache's hook must not cache when there is no
+  scope (otherwise one tenant's answer would be given to another tenant).
+- ~~`Bounded` wraps outside the model: a hook hit also waits for a slot~~: 0.3.0 moved the slot into the executor (§10, 2026-11-20).
+- ~~**Hooks for async hosts**~~: 0.3.0 added `AsyncHook` (§10, 2026-11-20).
+- **LiteLLM Proxy cache hits** (2026-11-19): the Proxy's cache is not turned on (§7.2); 0.3.0 reads `x-litellm-cache-key` to mark
+  `cached=True`. Verified against the source and measured against the Proxy on 2026-11-20: 1.108.9 carries this header only on a hit, and on a hit `x-litellm-model-name`
+  is still the model that originally answered (§7.2).
+- ~~The effect of automatic routing~~: **measured** (2026-11-18, lite-rag S14, `KB/global/llm-evals/evals/2026-11-18-lite-rag-auto-routing.md`).
+  lite-rag's 32 golden questions × 2 runs, "correct" = key fact and grounded: fixed qwen3:8b 0.938 (p50 12 s), the same model through the Proxy 0.938,
+  qwen3:1.7b 0.750 (3.8 s), `smart-router` (heuristic, small = 1.7b, the rest = 8b) 0.844 (5.2 s). The heuristic classifier tiers **by language and not by difficulty**:
+  all Chinese questions go to 1.7b. Conclusion: the current §7.2 config is not worth turning on for mixed Chinese-English RAG; for routing, first measure the `llm` classifier or
+  `keyword_tier_rules` on real traffic. The Proxy itself does not change answer quality.
+- Whether each module drops its adapter and depends directly on `lite_model.Model` when it migrates (§12.1).
+- ~~**A host cannot change a built-in backend**~~ (found in lite-mem S12, 2026-11-18): done in 0.2.0 (§4, the host's own defaults). lite-mem switched to
+  `host_backends` on 2026-11-19 and deleted its own validator (`be5269f`).
+- ~~**keyless conflicts with `api_key_env` when stacked**~~ (found when lite-mem switched to 0.2.0, 2026-11-19): done in 0.2.1 (§4).
+- **Constrained decoding for structured output** (lite-rag S16, 2026-11-19): when qwen3:8b on Ollama outputs JSON freely, 7 of 10 runs on the same chunk missed a quote;
+  through `structured()` (strict JSON schema) all 10 were valid. When a host wants JSON it should use `structured()` and not parse text itself.
 
-- **llm-gateway 的两处修改**（在 llm-gateway repo 里做，不在本 repo）：
-  1. `reasoning_effort` 透传（现在被丢弃；lite-rag graph 和 lite-mem eval 设的 `"none"` 经过 gateway 时不生效，
-     经过 gateway 跑出的结果其实开着思考）。
-  2. 透传上游实际模型（建议响应头 `X-LLMGW-Upstream-Model`，响应体 `model` 不变）。
-  在这之前，lite-model 对 gateway 后端：配置了 `reasoning_effort` 就拒绝（§5），gateway + 路由别名拒绝（§6.2）。
-- embedding 是否在 v2 收进来（lite-rag、lite-mem 各有一份 httpx2 embedding 客户端）。embedding 和索引绑定，
-  永远不路由。
-- ~~lite-eval 的 judge 以后是否迁移~~：2026-11-21 owner 定，不迁移。judge 是测量仪器，保持直连，写成工作区的
-  明确例外（lite-eval 设计 §9、lite-eval AGENTS.md 规则 9）。
-- ~~hook 只有 `before` / `after`，失败的调用不经过 hook~~：2026-11-19 定，不加 `failed()`。lite-cache 改为 hook
-  接入，失败的调用不计数，`skip:<reason>` 只来自它自己的 `accept` 谓词（lite-cache 设计 §0、§3.4）。
-- ~~`Call` 缺 lite-cache 的 scope / policy~~：S5 定为 `call_context()`（§10）。lite-cache 的 hook 必须在没有
-  scope 时不缓存（否则会把一个租户的答案给另一个租户）。
-- ~~`Bounded` 包在模型外面：hook 命中也要等一个槽位~~：0.3.0 把槽位移进执行器（§10，2026-11-20）。
-- ~~**异步宿主的 hook**~~：0.3.0 加了 `AsyncHook`（§10，2026-11-20）。
-- **LiteLLM Proxy 的 cache 命中**（2026-11-19）：Proxy 的 cache 不开（§7.2）；0.3.0 读 `x-litellm-cache-key` 标
-  `cached=True`。2026-11-20 源码核实并 Proxy 实测：1.108.9 只在命中时带这个头，命中时 `x-litellm-model-name`
-  仍是当初回答的模型（§7.2）。
-- ~~自动路由的效果~~：**已测**（2026-11-18，lite-rag S14，`KB/global/llm-evals/evals/2026-11-18-lite-rag-auto-routing.md`）。
-  lite-rag 32 道金标题 × 2 次，"对" = 关键事实且 grounded：固定 qwen3:8b 0.938（p50 12 s），经 Proxy 的同一模型 0.938，
-  qwen3:1.7b 0.750（3.8 s），`smart-router`（启发式，small = 1.7b，其余 = 8b）0.844（5.2 s）。启发式分类器**按语言而不是难度**
-  分档：中文题全部去 1.7b。结论：现在的 §7.2 配置不值得在中英混合的 RAG 上打开；要路由，先在实际流量上测 `llm` 分类器或
-  `keyword_tier_rules`。Proxy 本身不改变答案质量。
-- 各模块迁移时是否去掉 adapter、直接依赖 `lite_model.Model`（§12.1）。
-- ~~**宿主改不了内置 backend**~~（lite-mem S12 发现，2026-11-18）：0.2.0 已做（§4 宿主自己的默认值）。lite-mem 2026-11-19 已改用
-  `host_backends`、删掉自己的 validator（`be5269f`）。
-- ~~**keyless 与 `api_key_env` 叠加时冲突**~~（lite-mem 改用 0.2.0 时发现，2026-11-19）：0.2.1 已做（§4）。
-- **结构化输出约束解码**（lite-rag S16，2026-11-19）：qwen3:8b 在 Ollama 上自由输出 JSON 时，同一个 chunk 10 次里 7 次漏引号；
-  经 `structured()`（strict JSON schema）10 次全部合法。宿主要 JSON 时应当用 `structured()`，不要自己解析文本。
+### Decision log
 
-### 决定记录
-
-| 日期 | 决定 | 理由 |
+| Date | Decision | Reason |
 | --- | --- | --- |
-| 2026-11-18 | 新建共享库 lite-model，lite 模块依赖它，消除 4 份重复的 LLM 客户端 | 引入路由支持时不再每个模块各写一遍 |
-| 2026-11-18 | LiteLLM 只用 Proxy 模式，作为可选后端；库不 import `litellm` | 2026 年两次供应链攻击；依赖会传给 llm-steward；路由配置共用 |
-| 2026-11-18 | 没有 LiteLLM 时走原来的直连方式；配了 LiteLLM 而它不可用时报错，不退回 | lite 模块要能单独使用；no silent fallback |
-| 2026-11-18 | llm-gateway 不依赖 lite-model；调用链是 app → lite-model → llm-gateway | gateway 是服务端，lite-model 是客户端 |
-| 2026-11-18 | 名字 `lite-model`（不叫 `lite-router` / `lite-llm`） | 主要是客户端而非路由；`lite-llm` 与 `litellm` 易混 |
-| 2026-11-18 | GitHub `ArthurGao/lite-model`，公开，Apache-2.0 | 与其他 lite 模块一致 |
-| 2026-11-18 | 模块迁移后删除自己的 LLM 客户端，只留 role 声明、prompt、业务解析和一个薄 adapter（§12.1） | 共享库的目的就是消除重复；新旧两份并存会再次分叉 |
-| 2026-11-18 | LiteLLM Proxy 端口 4400 | 4000–4010、4080–4090 已登记给 tenderted |
-| 2026-11-18 | cosign 以容器运行，作为 compose 的 `verify` 服务，`litellm` 依赖它成功退出 | 主人的选择：本机不装 cosign，一条 `compose up` 先验签再启动 |
-| 2026-11-18 | LiteLLM 的 `answered` 取响应头 `x-litellm-model-name`，响应体 `model` 只做一致性检查（§6.3） | S0 实测：普通别名的响应体 `model` 是别名，头才是实际模型 |
-| 2026-11-18 | 命名 backend：`backends.<name>: {type, base_url, api_key_env, channel, router_aliases}`，role 用名字引用（§4） | 主人的选择：一个宿主要能同时用两个 OpenAI-compatible 厂商；endpoint 和 key 只写一处 |
-| 2026-11-18 | `anthropic` 必须配 `max_output_tokens`，启动时检查，不猜默认值（§4） | 主人的选择：宿主迁移时写自己的旧值（lite-mem 2048、lite-rag 1024），请求体不变 |
-| 2026-11-18 | `Provenance.via`：端点自己的来源头（参数表里的允许列表，名字小写）；`tag` 不变 | 主人的选择：§6.2、§6.3 要求另记 deployment id、别名、gateway backend |
-| 2026-11-18 | hook 命中的回复 `cached=True` 放在回复上，`Provenance` 不变（§10） | 主人的选择：是否缓存属于这次调用，来源属于当初回答的模型 |
-| 2026-11-18 | `build()` 返回 `LiteModel`（`Model` + `.hooks`）；`Model` 协议不含 hooks（§3、§10） | `FakeModel` 和宿主 adapter 不必实现 hook；`model.hooks.register` 照设计可用 |
-| 2026-11-18 | 调用上下文用 contextvar：`call_context(**values)` → `Call.context`；`Model` 协议不加参数（§10） | 主人的选择：三个宿主马上要照 `Model` 写 adapter，加参数以后就是破坏性改动 |
-| 2026-11-18 | `ModelsConfig.backend` / `model` 必填，没有默认值（§4） | 主人的选择：宿主嵌入时不会悄悄继承默认值，lite-model 的版本不会改宿主的模型 |
-| 2026-11-18 | 公开 API 收窄：`Call`、`Hook`、`Hooks`、`Registration` 从 `lite_model.hooks` 导入；`Reply`、`call_context`、`LiteModel.target()` 公开 | 发布后导出的名字都是承诺；宿主迁移要在调用前拿到 target |
-| 2026-11-18 | 不在中英混合的 RAG 上打开启发式自动路由（§15 实测：0.844 对 0.938，按语言分档） | lite-rag S14 两次真实运行；要路由先测分类器 |
-| 2026-11-18 | `build(..., http_client=...)` 是公开参数（§3） | 宿主迁移的契约测试要用真 SDK 记录请求体（§12.2）；lite-model 自己的契约测试也这样做 |
-| 2026-11-18 | 0.2.0：宿主在 `ModelsConfig` 子类上设 `host_backends` / `host_roles`，配置逐字段叠在上面；只有另一个 `type` 才替换 backend | lite-mem S12 的默认 role 曾被内置 `openai` 顶到 api.openai.com；lite-rag 的 graph 默认值会被 `__ROLES` 整个顶掉。审查：同样的 `type` 照写一遍不能丢宿主的值；role 的 null 仍是"用顶层的值"（和 0.1 一样） |
-| 2026-11-19 | 缓存选 lite-cache 作为 hook、存 PostgreSQL；LiteLLM Proxy 的 cache 不开，不用 Redis（§7.2，lite-cache 设计 §0） | 默认调用不经过 Proxy；Proxy 命中时 lite-model 标不出 `cached`，用量算错；没有必填 scope；Redis 对 1–20 s 的模型调用没有速度上的意义，又是新的基础设施 |
-| 2026-11-19 | 0.3.0 计划：`AsyncHook`、`Bounded` 槽位移进执行器、读 `x-litellm-cache-key`；不加 `failed()` hook（§10、§15） | lite-cache 接入 async 的 llm-steward 和 lite-rag 之前需要；lite-cache 不统计失败的调用 |
-| 2026-11-20 | 0.3.0：`Bounded` 包 `LiteModel` 时槽位只包请求（`limited(slot)`），包别的 `Model` 时照旧整个调用；同步模型拒绝 `AsyncHook`；`x-litellm-cache-key` 按 1.108.9 源码判命中（§7.2、§10） | 只改 `LiteModel` 的执行器，`FakeModel` 和宿主 adapter 不必实现槽位；L2 verifier 要在 hook 里经同一个 `Bounded` 调模型，整个调用占槽位会死锁 |
+| 2026-11-18 | Create the shared library lite-model, which lite modules depend on, removing the 4 duplicate LLM clients | Routing support should not be written again in every module |
+| 2026-11-18 | LiteLLM is used only in Proxy mode, as an optional backend; the library does not import `litellm` | Two supply-chain attacks in 2026; the dependency would pass on to llm-steward; the routing config is shared |
+| 2026-11-18 | Without LiteLLM the original direct connection is used; when LiteLLM is configured and unavailable it raises an error and does not fall back | The lite modules must be usable alone; no silent fallback |
+| 2026-11-18 | llm-gateway does not depend on lite-model; the call chain is app → lite-model → llm-gateway | The gateway is a server, and lite-model is a client |
+| 2026-11-18 | The name is `lite-model` (not `lite-router` / `lite-llm`) | It is mainly a client and not a router; `lite-llm` is easily confused with `litellm` |
+| 2026-11-18 | GitHub `ArthurGao/lite-model`, public, Apache-2.0 | Consistent with the other lite modules |
+| 2026-11-18 | After migration a module deletes its own LLM client, keeping only the role declarations, prompts, business parsing and a thin adapter (§12.1) | The purpose of a shared library is to remove duplication; having the old and new copies side by side would diverge again |
+| 2026-11-18 | LiteLLM Proxy port 4400 | 4000–4010 and 4080–4090 are already registered to tenderted |
+| 2026-11-18 | cosign runs as a container, as the compose `verify` service, and `litellm` depends on it exiting successfully | The owner's choice: cosign is not installed on this machine, and one `compose up` verifies the signature before starting |
+| 2026-11-18 | LiteLLM's `answered` takes the response header `x-litellm-model-name`, and the response body `model` is used only for a consistency check (§6.3) | Measured in S0: the response body `model` of a plain alias is the alias, and the header is the actual model |
+| 2026-11-18 | Named backends: `backends.<name>: {type, base_url, api_key_env, channel, router_aliases}`, and roles refer to them by name (§4) | The owner's choice: one host must be able to use two OpenAI-compatible vendors at the same time; the endpoint and key are written in one place |
+| 2026-11-18 | `anthropic` must be configured with `max_output_tokens`, checked at startup, with no guessed default (§4) | The owner's choice: a host writes its own old value when migrating (lite-mem 2048, lite-rag 1024), and the request body is unchanged |
+| 2026-11-18 | `Provenance.via`: the endpoint's own provenance headers (the allow list in the parameter table, lower-case names); `tag` unchanged | The owner's choice: §6.2 and §6.3 require recording the deployment id, alias and gateway backend separately |
+| 2026-11-18 | The `cached=True` of a hook-hit reply is put on the reply, and `Provenance` is unchanged (§10) | The owner's choice: whether it was cached belongs to this call, and the provenance belongs to the model that originally answered |
+| 2026-11-18 | `build()` returns `LiteModel` (`Model` + `.hooks`); the `Model` protocol has no hooks (§3, §10) | `FakeModel` and hosts' adapters need not implement hooks; `model.hooks.register` is usable as designed |
+| 2026-11-18 | Call context uses a contextvar: `call_context(**values)` → `Call.context`; the `Model` protocol gets no parameter (§10) | The owner's choice: three hosts are about to write adapters against `Model`, and adding a parameter later would be a breaking change |
+| 2026-11-18 | `ModelsConfig.backend` / `model` are required, with no default (§4) | The owner's choice: when a host embeds it, it does not silently inherit a default, and a lite-model version never changes a host's model |
+| 2026-11-18 | The public API is narrowed: `Call`, `Hook`, `Hooks`, `Registration` are imported from `lite_model.hooks`; `Reply`, `call_context`, `LiteModel.target()` are public | After release, every exported name is a promise; a host migration needs the target before the call |
+| 2026-11-18 | Heuristic automatic routing is not turned on for mixed Chinese-English RAG (§15 measured: 0.844 versus 0.938, tiering by language) | Two real runs in lite-rag S14; to route, first measure the classifier |
+| 2026-11-18 | `build(..., http_client=...)` is a public parameter (§3) | The host migration contract tests need the real SDK to record the request body (§12.2); lite-model's own contract tests do the same |
+| 2026-11-18 | 0.2.0: the host sets `host_backends` / `host_roles` on a `ModelsConfig` subclass, and the config is laid on top field by field; only a different `type` replaces a backend | lite-mem S12's default role was once pushed to api.openai.com by the built-in `openai`; lite-rag's graph default would be overridden wholesale by `__ROLES`. Review: writing the same `type` again must not lose the host's values; a role's null still means "use the top-level value" (the same as 0.1) |
+| 2026-11-19 | For caching, lite-cache is chosen as a hook, storing in PostgreSQL; the LiteLLM Proxy cache is not turned on and Redis is not used (§7.2, lite-cache design §0) | Default calls do not go through the Proxy; on a Proxy hit lite-model cannot mark `cached` and the usage is counted wrongly; there is no required scope; Redis gives no speed benefit for 1–20 s model calls, and is new infrastructure |
+| 2026-11-19 | The 0.3.0 plan: `AsyncHook`, moving the `Bounded` slot into the executor, reading `x-litellm-cache-key`; no `failed()` hook (§10, §15) | Needed before lite-cache is connected to async llm-steward and lite-rag; lite-cache does not count failed calls |
+| 2026-11-20 | 0.3.0: when `Bounded` wraps `LiteModel` the slot wraps only the request (`limited(slot)`), and when it wraps another `Model` the whole call as before; a sync model rejects `AsyncHook`; `x-litellm-cache-key` decides a hit per the 1.108.9 source (§7.2, §10) | Only the `LiteModel` executor changes, and `FakeModel` and hosts' adapters need not implement slots; the L2 verifier has to call a model inside a hook through the same `Bounded`, and having the whole call take a slot would deadlock |
