@@ -1,12 +1,13 @@
 """Shared test setup. Unit and contract tests never open a socket (AGENTS.md rule 11): only tests
-marked `ollama` or `litellm` (opt-in) may reach a real server."""
+under an opt-in marker may reach a real server — `ollama`, `litellm`, and the paid vendor APIs
+`voyage`, `cohere`, `gemini` (0.7.0 / 0.8.0)."""
 
 import socket
 from typing import Any
 
 import pytest
 
-LIVE_MARKERS = {"ollama", "litellm"}
+LIVE_MARKERS = {"ollama", "litellm", "voyage", "cohere", "gemini"}
 
 
 @pytest.fixture(autouse=True)

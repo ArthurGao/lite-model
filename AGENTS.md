@@ -62,8 +62,9 @@ If a change must contradict the design, update the design in the same change and
    lite-model. lite-cache plugs in through hooks (design §10).
 10. **Secrets only from environment variables.** Never commit `.env*` except `.env.example`.
 11. **Tests never call a paid API or a subscription.** Unit and contract tests use `FakeModel` or fake SDK
-    clients. Real models run only under opt-in markers: `-m ollama` (local Ollama) and `-m litellm` (local proxy,
-    Ollama-backed aliases only). Test config sets `forbid_channels: [subscription, api]`. Never call llm-gateway
+    clients. Real models run only under opt-in markers: `-m ollama` (local Ollama), `-m litellm` (local proxy,
+    Ollama-backed aliases only), and `-m voyage` / `-m cohere` / `-m gemini` (paid vendor APIs: only when the owner
+    asks, with the key read inline from `~/.config/lite-ai/<vendor>.key`). Test config sets `forbid_channels: [subscription, api]`. Never call llm-gateway
     subscription profiles from tests or on your own initiative.
 12. **Pinned dependencies**: exact versions for the SDKs (`openai`, `anthropic`, `pydantic`), the same as lite-mem
     unless a stage records why not. An upgrade re-runs the contract tests and `-m ollama`.
